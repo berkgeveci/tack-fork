@@ -1,0 +1,11 @@
+dataset tests with 64-bit ids (3/3)	UNKNOWN STEP	2026-11-01T15:38:52.1953879Z FAILED packages/tack-vis/tests/test_polylines.py::test_averages_and_extraction[cpu] - AssertionError: 
+dataset tests with 64-bit ids (3/3)	UNKNOWN STEP	2026-11-01T15:38:55.1328713Z ##[error]Process completed with exit code 1.
+dataset tests with L2 cell-fastest (2/2)	UNKNOWN STEP	2026-11-01T15:44:56.4673543Z FAILED packages/tack-vis/tests/test_polylines.py::test_averages_and_extraction[cpu] - AssertionError: 
+dataset tests with L2 cell-fastest (2/2)	UNKNOWN STEP	2026-11-01T15:44:56.5296691Z ##[error]Process completed with exit code 1.
+metal (3/4)	UNKNOWN STEP	2026-11-01T15:53:32.1155290Z ##[error]Process completed with exit code 1.
+tests (py3.11, 2/3)	UNKNOWN STEP	2026-11-01T15:40:34.5840685Z FAILED packages/tack-vis/tests/test_polylines.py::test_averages_and_extraction[cpu] - AssertionError: 
+tests (py3.11, 2/3)	UNKNOWN STEP	2026-11-01T15:40:37.5624728Z ##[error]Process completed with exit code 1.
+tests (py3.12, 2/3)	UNKNOWN STEP	2026-11-01T15:58:27.6148362Z FAILED packages/tack-vis/tests/test_polylines.py::test_averages_and_extraction[cpu] - AssertionError: 
+tests (py3.12, 2/3)	UNKNOWN STEP	2026-11-01T15:58:30.9879715Z ##[error]Process completed with exit code 1.
+tests (py3.13, 2/3)	UNKNOWN STEP	2026-11-01T16:04:24.4509270Z FAILED packages/tack-vis/tests/test_polylines.py::test_averages_and_extraction[cpu] - AssertionError: 
+tests (py3.13, 2/3)	UNKNOWN STEP	2026-11-01T16:04:28.6206722Z ##[error]Process completed with exit code 1.

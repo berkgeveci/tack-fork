@@ -1,0 +1,4 @@
+tests (py3.11)	UNKNOWN STEP	2026-10-24T18:31:30.9734803Z FAILED packages/tack-core/tests/test_cpu_threading.py::test_timing_a_cheap_prefix_does_not_stall_the_rechecks - AssertionError: 2 recheck(s) re-ran the whole range serially: [(0, 131072), (0, 131072)]; estimate 286 ns/elem, parallel 89, threads 4, load 0.5
+tests (py3.11)	UNKNOWN STEP	2026-10-24T18:31:33.0725566Z ##[error]Process completed with exit code 1.
+tests (py3.12)	UNKNOWN STEP	2026-10-24T18:31:39.8076031Z FAILED packages/tack-core/tests/test_cpu_threading.py::test_timing_a_cheap_prefix_does_not_stall_the_rechecks - AssertionError: 1 recheck(s) re-ran the whole range serially: [(0, 131072)]; estimate 283 ns/elem, parallel 90, threads 4, load 0.6
+tests (py3.12)	UNKNOWN STEP	2026-10-24T18:31:42.2380966Z ##[error]Process completed with exit code 1.

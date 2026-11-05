@@ -1,0 +1,1 @@
+metal	Run the suite with Metal required	2026-10-25T19:51:40.8037370Z ##[error]Process completed with exit code 1.

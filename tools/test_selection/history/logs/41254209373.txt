@@ -1,0 +1,10 @@
+dataset tests with 64-bit ids (1/3)	UNKNOWN STEP	2026-11-01T00:24:11.4176577Z FAILED packages/tack-vis/tests/test_polyhedra.py::test_split_reads_shapes_and_polyhedra_over_one_set_of_points[True] - NameError: name '_cell_field_name' is not defined
+dataset tests with 64-bit ids (1/3)	UNKNOWN STEP	2026-11-01T00:24:11.4178319Z FAILED packages/tack-vis/tests/test_polyhedra.py::test_split_reads_shapes_and_polyhedra_over_one_set_of_points[False] - NameError: name '_cell_field_name' is not defined
+dataset tests with 64-bit ids (1/3)	UNKNOWN STEP	2026-11-01T00:24:14.2933215Z ##[error]Process completed with exit code 1.
+dataset tests with L2 cell-fastest (2/2)	UNKNOWN STEP	2026-11-01T00:16:01.0515171Z FAILED packages/tack-vis/tests/test_polyhedra.py::test_split_reads_shapes_and_polyhedra_over_one_set_of_points[True] - NameError: name '_cell_field_name' is not defined
+dataset tests with L2 cell-fastest (2/2)	UNKNOWN STEP	2026-11-01T00:16:01.0516501Z FAILED packages/tack-vis/tests/test_polyhedra.py::test_split_reads_shapes_and_polyhedra_over_one_set_of_points[False] - NameError: name '_cell_field_name' is not defined
+dataset tests with L2 cell-fastest (2/2)	UNKNOWN STEP	2026-11-01T00:16:01.1372512Z ##[error]Process completed with exit code 1.
+metal (1/4)	UNKNOWN STEP	2026-11-01T00:08:25.5746040Z ##[error]Process completed with exit code 1.
+tests (py3.13, 3/3)	UNKNOWN STEP	2026-11-01T00:30:28.6534651Z FAILED packages/tack-vis/tests/test_polyhedra.py::test_split_reads_shapes_and_polyhedra_over_one_set_of_points[True] - NameError: name '_cell_field_name' is not defined
+tests (py3.13, 3/3)	UNKNOWN STEP	2026-11-01T00:30:28.6536841Z FAILED packages/tack-vis/tests/test_polyhedra.py::test_split_reads_shapes_and_polyhedra_over_one_set_of_points[False] - NameError: name '_cell_field_name' is not defined
+tests (py3.13, 3/3)	UNKNOWN STEP	2026-11-01T00:30:31.7495536Z ##[error]Process completed with exit code 1.

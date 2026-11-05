@@ -1,0 +1,2 @@
+dataset tests with 64-bit ids	Run the dataset tests with i64 ids	2026-10-26T17:39:06.1461320Z FAILED packages/tack-vis/tests/test_implicit_topology.py::test_one_shape_cells_share_their_connectivity_as_rows - assert (<tack.lang.array.NumpyBuffer object at 0x7fef6b5f9130> is <tack.lang.array.NumpyBuffer object at 0x7fef5bff0050>)
+dataset tests with 64-bit ids	Run the dataset tests with i64 ids	2026-10-26T17:39:09.9464233Z ##[error]Process completed with exit code 1.

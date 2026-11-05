@@ -1,0 +1,2 @@
+lint	UNKNOWN STEP	2026-10-24T19:33:15.9072392Z ##[error]packages/tack-core/tests/test_communication.py:358:13: C420 Unnecessary dict comprehension for iterable; use `dict.fromkeys` instead
+lint	UNKNOWN STEP	2026-10-24T19:33:15.9089308Z ##[error]Process completed with exit code 1.

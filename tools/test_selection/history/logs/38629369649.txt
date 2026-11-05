@@ -1,0 +1,16 @@
+##[error]Process completed with exit code 1.
+docs	Check tutorial results on CPU	2026-10-14T20:07:29.7382413Z ##[error]Process completed with exit code 1.
+lint	Ruff	2026-10-14T20:07:27.0303548Z ##[error]packages/tack-core/src/tack/runtime/cpu_pool.py:660:50: RUF005 Consider `[*ptypes, _i64, _i64]` instead of concatenation
+lint	Ruff	2026-10-14T20:07:27.0311845Z ##[error]packages/tack-core/src/tack/runtime/cpu_pool.py:671:20: RUF005 Consider `[*args, start, end]` instead of concatenation
+lint	Ruff	2026-10-14T20:07:27.0316133Z ##[error]Process completed with exit code 1.
+metal	Run the suite with Metal required	2026-10-14T20:15:27.1599760Z ##[error]Process completed with exit code 1.
+tests (py3.11)	Run the suite	2026-10-14T20:14:40.2448724Z FAILED packages/tack-core/tests/test_cpu_pool.py::test_a_failed_worker_start_stops_the_started_workers - AssertionError: Traceback (most recent call last):
+tests (py3.11)	Run the suite	2026-10-14T20:14:40.2482052Z ##[error]      raise OSError('could not get source code')
+tests (py3.11)	Run the suite	2026-10-14T20:14:44.1032119Z FAILED packages/tack-core/tests/test_cpu_pool.py::test_a_run_uses_only_the_first_k_workers - AttributeError: 'NoneType' object has no attribute 'run'
+tests (py3.11)	Run the suite	2026-10-14T20:14:45.3994395Z ##[error]Process completed with exit code 1.
+tests (py3.12)	Run the suite	2026-10-14T20:13:11.0194223Z FAILED packages/tack-core/tests/test_cpu_pool.py::test_a_failed_worker_start_stops_the_started_workers - AssertionError: Traceback (most recent call last):
+tests (py3.12)	Run the suite	2026-10-14T20:13:11.0223910Z ##[error]      raise OSError('could not get source code')
+tests (py3.12)	Run the suite	2026-10-14T20:13:13.4099603Z FAILED packages/tack-core/tests/test_cpu_pool.py::test_a_run_uses_only_the_first_k_workers - AttributeError: 'NoneType' object has no attribute 'run'
+tests (py3.12)	Run the suite	2026-10-14T20:13:14.0112708Z ##[error]Process completed with exit code 1.
+tests (py3.13)	Run the suite	2026-10-14T20:17:35.6868695Z FAILED packages/tack-core/tests/test_cpu_pool.py::test_a_run_uses_only_the_first_k_workers - AttributeError: 'NoneType' object has no attribute 'run'
+tests (py3.13)	Run the suite	2026-10-14T20:17:36.7823734Z ##[error]Process completed with exit code 1.

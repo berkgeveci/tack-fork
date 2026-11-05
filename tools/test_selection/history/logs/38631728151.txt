@@ -1,0 +1,7 @@
+##[error]Process completed with exit code 1.
+tests (py3.11)	UNKNOWN STEP	2026-10-14T20:30:42.3155671Z FAILED packages/tack-core/tests/test_cpu_pool.py::test_a_failed_worker_start_stops_the_started_workers - AssertionError: Traceback (most recent call last):
+tests (py3.11)	UNKNOWN STEP	2026-10-14T20:30:42.3183162Z ##[error]      raise OSError('could not get source code')
+tests (py3.11)	UNKNOWN STEP	2026-10-14T20:30:46.3654557Z ##[error]Process completed with exit code 1.
+tests (py3.12)	UNKNOWN STEP	2026-10-14T20:29:20.3605871Z FAILED packages/tack-core/tests/test_cpu_pool.py::test_a_failed_worker_start_stops_the_started_workers - AssertionError: Traceback (most recent call last):
+tests (py3.12)	UNKNOWN STEP	2026-10-14T20:29:20.3642602Z ##[error]      raise OSError('could not get source code')
+tests (py3.12)	UNKNOWN STEP	2026-10-14T20:29:20.6899676Z ##[error]Process completed with exit code 1.

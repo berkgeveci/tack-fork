@@ -1,0 +1,4 @@
+dataset tests with 64-bit ids	UNKNOWN STEP	2026-10-15T14:04:34.2950628Z FAILED packages/tack-vis/tests/test_shapes.py::test_the_contour_tables_are_the_generators - FileNotFoundError: [Errno 2] No such file or directory: '/home/runner/work/tack/tack/packages/tack-vis/src/tack/data/_contour_tables.py'
+dataset tests with 64-bit ids	UNKNOWN STEP	2026-10-15T14:04:35.0534308Z ##[error]Process completed with exit code 1.
+tests (py3.13)	UNKNOWN STEP	2026-10-15T14:03:59.1738435Z FAILED packages/tack-vis/tests/test_shapes.py::test_the_contour_tables_are_the_generators - FileNotFoundError: [Errno 2] No such file or directory: '/home/runner/work/tack/tack/packages/tack-vis/src/tack/data/_contour_tables.py'
+tests (py3.13)	UNKNOWN STEP	2026-10-15T14:04:00.0873681Z ##[error]Process completed with exit code 1.

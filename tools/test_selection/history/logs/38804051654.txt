@@ -1,0 +1,2 @@
+GPU install needs no llvmlite	Run the isolation guards against that install	2026-10-15T20:42:09.3194023Z ##[error]Process completed with exit code 4.
+metal	Run the suite with Metal required	2026-10-15T20:46:32.9464590Z ##[error]Process completed with exit code 1.

@@ -1,0 +1,9 @@
+dataset tests with 64-bit ids (3/4)	UNKNOWN STEP	2026-11-04T00:49:22.9725785Z FAILED packages/tack-vis/tests/test_vtk_higher_order.py::test_each_higher_order_cell_cuts_as_vtk[cpu-23] - assert 0.8234642616430687 == 0.8232959251742913 ± 8.2e-08
+dataset tests with 64-bit ids (3/4)	UNKNOWN STEP	2026-11-04T00:49:22.9727921Z FAILED packages/tack-vis/tests/test_vtk_higher_order.py::test_each_higher_order_cell_cuts_as_vtk[cpu-28] - assert 0.8234918697887474 == 0.8233235343666611 ± 8.2e-08
+dataset tests with 64-bit ids (3/4)	UNKNOWN STEP	2026-11-04T00:49:25.3228929Z ##[error]Process completed with exit code 1.
+dataset tests with L2 cell-fastest (1/2)	UNKNOWN STEP	2026-11-04T00:41:28.9196570Z FAILED packages/tack-vis/tests/test_vtk_higher_order.py::test_each_higher_order_cell_cuts_as_vtk[cpu-23] - assert 0.8234642616430687 == 0.8232959251742913 ± 8.2e-08
+dataset tests with L2 cell-fastest (1/2)	UNKNOWN STEP	2026-11-04T00:41:28.9197819Z FAILED packages/tack-vis/tests/test_vtk_higher_order.py::test_each_higher_order_cell_cuts_as_vtk[cpu-28] - assert 0.8234918697887474 == 0.8233235343666611 ± 8.2e-08
+dataset tests with L2 cell-fastest (1/2)	UNKNOWN STEP	2026-11-04T00:41:28.9581971Z ##[error]Process completed with exit code 1.
+tests (py3.13, 3/4)	UNKNOWN STEP	2026-11-04T01:00:05.1309487Z FAILED packages/tack-vis/tests/test_vtk_higher_order.py::test_each_higher_order_cell_cuts_as_vtk[cpu-23] - assert 0.8234642616430687 == 0.8232959251742913 ± 8.2e-08
+tests (py3.13, 3/4)	UNKNOWN STEP	2026-11-04T01:00:05.1312244Z FAILED packages/tack-vis/tests/test_vtk_higher_order.py::test_each_higher_order_cell_cuts_as_vtk[cpu-28] - assert 0.8234918697887474 == 0.8233235343666611 ± 8.2e-08
+tests (py3.13, 3/4)	UNKNOWN STEP	2026-11-04T01:00:08.1920098Z ##[error]Process completed with exit code 1.

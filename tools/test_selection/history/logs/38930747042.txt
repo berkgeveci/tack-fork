@@ -1,0 +1,22 @@
+tests (py3.11)	Run the suite	2026-10-16T16:21:20.1961455Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_cuda_works_in_each_devices_context[two-devices] - AssertionError: Traceback (most recent call last):
+tests (py3.11)	Run the suite	2026-10-16T16:21:20.1993036Z ##[error]      raise OSError('could not get source code')
+tests (py3.11)	Run the suite	2026-10-16T16:21:20.2015581Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_cuda_works_in_each_devices_context[adopts-a-framework-context] - AssertionError: Traceback (most recent call last):
+tests (py3.11)	Run the suite	2026-10-16T16:21:20.2022166Z ##[error]      raise OSError('could not get source code')
+tests (py3.11)	Run the suite	2026-10-16T16:21:24.6015651Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_cuda_works_in_each_devices_context[second-only] - AssertionError: Traceback (most recent call last):
+tests (py3.11)	Run the suite	2026-10-16T16:21:24.6025124Z ##[error]      raise OSError('could not get source code')
+tests (py3.11)	Run the suite	2026-10-16T16:21:24.6037652Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_hip_works_on_each_device[two-devices] - AssertionError: Traceback (most recent call last):
+tests (py3.11)	Run the suite	2026-10-16T16:21:24.6044147Z ##[error]      raise OSError('could not get source code')
+tests (py3.11)	Run the suite	2026-10-16T16:21:24.6055843Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_hip_works_on_each_device[second-only] - AssertionError: Traceback (most recent call last):
+tests (py3.11)	Run the suite	2026-10-16T16:21:24.6062658Z ##[error]      raise OSError('could not get source code')
+tests (py3.11)	Run the suite	2026-10-16T16:21:25.9740899Z ##[error]Process completed with exit code 1.
+tests (py3.12)	Run the suite	2026-10-16T16:20:46.3731569Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_cuda_works_in_each_devices_context[two-devices] - AssertionError: Traceback (most recent call last):
+tests (py3.12)	Run the suite	2026-10-16T16:20:46.3756228Z ##[error]      raise OSError('could not get source code')
+tests (py3.12)	Run the suite	2026-10-16T16:20:46.3770661Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_cuda_works_in_each_devices_context[adopts-a-framework-context] - AssertionError: Traceback (most recent call last):
+tests (py3.12)	Run the suite	2026-10-16T16:20:46.3774527Z ##[error]      raise OSError('could not get source code')
+tests (py3.12)	Run the suite	2026-10-16T16:20:46.3783017Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_cuda_works_in_each_devices_context[second-only] - AssertionError: Traceback (most recent call last):
+tests (py3.12)	Run the suite	2026-10-16T16:20:46.3786752Z ##[error]      raise OSError('could not get source code')
+tests (py3.12)	Run the suite	2026-10-16T16:20:51.2767842Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_hip_works_on_each_device[two-devices] - AssertionError: Traceback (most recent call last):
+tests (py3.12)	Run the suite	2026-10-16T16:20:51.2774979Z ##[error]      raise OSError('could not get source code')
+tests (py3.12)	Run the suite	2026-10-16T16:20:51.2787864Z FAILED packages/tack-core/tests/test_multi_device_switching.py::test_hip_works_on_each_device[second-only] - AssertionError: Traceback (most recent call last):
+tests (py3.12)	Run the suite	2026-10-16T16:20:51.2792419Z ##[error]      raise OSError('could not get source code')
+tests (py3.12)	Run the suite	2026-10-16T16:20:52.7523879Z ##[error]Process completed with exit code 1.

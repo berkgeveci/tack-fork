@@ -1,0 +1,2 @@
+lint	Ruff	2026-10-26T19:14:55.9044781Z ##[error]benchmarks/vtk_compare/memory.py:37:17: F401 `numpy` imported but unused
+lint	Ruff	2026-10-26T19:14:55.9065164Z ##[error]Process completed with exit code 1.
