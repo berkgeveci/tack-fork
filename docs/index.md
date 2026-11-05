@@ -187,3 +187,5 @@ written in a subset of Python. Tack is not on PyPI yet, so you
 - [Install](install.md) gets Tack running on your device.
 - [Where to start](#where-to-start) above picks the first page for what you
   want to do.
+
+<!-- CI path-filter test: a docs-only change. Not to merge. -->
