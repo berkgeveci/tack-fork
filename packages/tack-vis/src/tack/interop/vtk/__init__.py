@@ -1852,16 +1852,15 @@ class _Staging:
             what, name, kind, width = key
             whole = tack.empty(sum(n for _, n in boxes),
                                kind if width == 1 else tack.vec(width, kind))
-            start = 0
-            for k, n in boxes:
-                self._views[k, what, name] = (whole[start:start + n], kind, width)
-                start += n
+            views = whole._row_views(list(itertools.accumulate((n for _, n in boxes),
+                                                               initial=0)))
+            for (k, _), view in zip(boxes, views):
+                self._views[k, what, name] = (view, kind, width)
         for what in ("points", "cells"):
             if has_ghosts[what]:
                 n = ghost_counts[what]
                 whole = tack.zeros(sum(n), tack.u8)
-                starts = itertools.accumulate(n, initial=0)
-                self._marks[what] = [whole[a:a + m] for a, m in zip(starts, n)]
+                self._marks[what] = whole._row_views(list(itertools.accumulate(n, initial=0)))
 
     def _key(self, what, name, array):
         """``(what, name, element type, components)`` of an array the stage copies, or

@@ -483,7 +483,7 @@ def _with_marks(amr, levels):
                             continue
                         found = _box_pairs.pairs(extents[ks[here]], boxes, d, closed)
                         _mark(whole, bit, found, d, closed, lower, level_ids, level_starts)
-            views[kind] = [whole[int(a):int(b)] for a, b in itertools.pairwise(starts)]
+            views[kind] = whole._row_views(starts)
         for i, k in enumerate(ks):
             ghosts[k] = Ghosts(cells=views["cells"][i], points=views["points"][i])
     out, k = [], 0
@@ -572,11 +572,10 @@ def in_device_buffers(levels):
                 continue
             with device:
                 whole = tack.concat([f.values for f in fields])
-            start = 0
-            for field in fields:
-                n = field.values.shape[0]
-                field.values = whole[start:start + n]
-                start += n
+            views = whole._row_views(list(itertools.accumulate(
+                (f.values.shape[0] for f in fields), initial=0)))
+            for field, view in zip(fields, views):
+                field.values = view
     return levels
 
 

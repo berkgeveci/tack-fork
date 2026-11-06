@@ -132,6 +132,55 @@ def test_a_view_of_a_view_is_a_view_of_the_root(backend):
     np.testing.assert_array_equal(a.numpy(), [0, 1, 2, 30, 40, 5, 6, 7, 8, 9])
 
 
+def _same_view(a, b):
+    """Two arrays alike in every attribute, their buffers too (but the buffer)."""
+    assert type(a) is type(b) and type(a._buffer) is type(b._buffer)
+    left, right = dict(vars(a)), dict(vars(b))
+    left.pop("_buffer"), right.pop("_buffer")
+    left.pop("_sig", None), right.pop("_sig", None)
+    assert left == right
+    keys = set(vars(a._buffer)) | set(vars(b._buffer))
+    for k in keys:
+        x, y = vars(a._buffer).get(k), vars(b._buffer).get(k)
+        if isinstance(x, np.ndarray):
+            assert x.__array_interface__ == y.__array_interface__, k
+        elif hasattr(x, "ptr"):             # Warp's array over the view's memory
+            assert (x.ptr, x.shape, x.dtype) == (y.ptr, y.shape, y.dtype), k
+        elif k != "_view":                  # Metal's NumPy view of its memory
+            assert x == y or x is y, k
+
+
+@pytest.mark.parametrize("kind", ["scalars", "rows", "vectors", "matrices", "view"])
+def test_many_views_at_once_are_the_views_one_at_a_time(backend, kind):
+    base = np.arange(48, dtype=np.float32)
+    whole = {"scalars": lambda: tack.array(base),
+             "rows": lambda: tack.array(base.reshape(12, 4)),
+             "vectors": lambda: tack.array(base.reshape(16, 3), tack.vec3(tack.f32)),
+             "matrices": lambda: tack.array(base.reshape(12, 2, 2), tack.mat2(tack.f32)),
+             "view": lambda: tack.array(base)[5:45]}[kind]()
+    n = whole.shape[0]
+    offsets = [0, 1, 1, 4, n - 2, n]
+    views = whole._row_views(np.array(offsets))
+    assert len(views) == len(offsets) - 1
+    for view, a, b in zip(views, offsets[:-1], offsets[1:]):
+        one = whole[a:b]
+        np.testing.assert_array_equal(view.numpy(), one.numpy())
+        assert view.shape == one.shape and view.dtype == one.dtype
+        if b > a:
+            _same_view(view, one)
+    tack.copyto(views[2], np.full(views[2].numpy().shape, -1, np.float32))
+    assert (whole.numpy()[1:4] == -1).all()
+
+
+def test_many_views_refuse_offsets_out_of_order_or_range():
+    x = _floats(6)
+    for offsets in ([0, 3, 2], [-1, 2], [0, 7]):
+        with pytest.raises(ValueError, match="nondecreasing"):
+            x._row_views(offsets)
+    s = tack.soa(_floats(4), _floats(4))
+    np.testing.assert_array_equal(s._row_views([0, 1, 4])[1].numpy(), s[1:4].numpy())
+
+
 def test_refused_forms():
     a = _floats(10)
     with pytest.raises(ValueError, match="no step"):

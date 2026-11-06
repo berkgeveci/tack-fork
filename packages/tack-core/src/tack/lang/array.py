@@ -15,6 +15,7 @@ transfers copy values into or out of backend storage. On CUDA transfers
 can go over PCIe.
 """
 
+import itertools
 import math
 from dataclasses import dataclass
 
@@ -653,6 +654,63 @@ class Array:
         hold = getattr(self, '_dlpack_hold', None)
         if hold is not None:
             out._dlpack_hold = hold
+        return out
+
+    def _row_views(self, offsets) -> list:
+        """``[self[offsets[k]:offsets[k + 1]] for k in range(len(offsets) - 1)]``,
+        made in one pass: ``offsets`` are row indices, nondecreasing, within the
+        first dimension. Each view is what `_rows` makes, but the view class,
+        the root's fields and the element layout are worked out once, not per
+        view: about 1.5 us a view rather than 9, for what makes thousands of
+        pieces of one array (an AMR hierarchy's boxes)."""
+        offsets = [int(v) for v in (offsets.tolist() if hasattr(offsets, "tolist")
+                                    else offsets)]
+        if type(self) is not Array:         # an SoA array slices each component
+            return [self[a:b] for a, b in itertools.pairwise(offsets)]
+        shape = self.shape
+        if not shape:
+            raise TypeError("a zero-dimensional array has no rows to slice")
+        if offsets and (offsets[0] < 0 or offsets[-1] > shape[0] or
+                        any(b < a for a, b in itertools.pairwise(offsets))):
+            raise ValueError(f"row offsets are nondecreasing within 0 and {shape[0]}")
+        per_row = int(math.prod(self._host_shape[1:]))
+        rest = shape[1:]
+        dtype, writable, device = self.dtype, self._writable, self._device
+        buffer = self._buffer
+        root = getattr(buffer, "_root", buffer)
+        base = getattr(buffer, "_start", 0)
+        cls = _view_class(type(root))
+        shared = {k: v for k, v in vars(root).items() if k not in _NOT_VIEWED}
+        element = isinstance(dtype, ElementType)
+        scalar = dtype.scalar_dtype if element else dtype
+        width = dtype.size if element else 1
+        matrix = dtype.shape if element and len(dtype.shape) == 2 else None
+        hold = getattr(self, '_dlpack_hold', None)
+        out = []
+        for a, b in itertools.pairwise(offsets):
+            count = b - a
+            if count == 0:
+                out.append(empty((0, *rest), dtype, device=self._backend))
+                continue
+            start = base + a * per_row
+            view = object.__new__(cls)
+            fields = view.__dict__
+            fields.update(shared)
+            fields.update(root._view_fields(start, count * per_row))
+            fields["_root"], fields["_start"] = root, start
+            array = object.__new__(Array)
+            array._dtype, array._buffer = scalar, view
+            array._writable, array._device = writable, device
+            if element:
+                array._shape = (count * per_row,)
+                array._vector_n, array._logical_shape = width, (count, *rest)
+                if matrix is not None:
+                    array._matrix_shape = matrix
+            else:
+                array._shape = (count, *rest)
+            if hold is not None:
+                array._dlpack_hold = hold
+            out.append(array)
         return out
 
     def _scalar_view(self):
