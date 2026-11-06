@@ -593,10 +593,11 @@ def _unmarked(box):
 
 def _is_view_of_one(arrays):
     """Whether every array is a view of one root buffer, end to end in order."""
-    roots = {id(getattr(a._buffer, "_root", None)) for a in arrays}
+    roots = [getattr(a._buffer, "_root", None) for a in arrays]
+    if None in roots or len({id(r) for r in roots}) != 1:
+        return False
     starts = [a._buffer._start for a in arrays]
-    return (None not in [getattr(a._buffer, "_root", None) for a in arrays]
-            and len(roots) == 1 and starts == sorted(starts))
+    return starts == sorted(starts)
 
 
 def test_a_hierarchy_is_one_array_a_device():
@@ -888,3 +889,43 @@ def test_a_hierarchy_given_to_vtk_without_copies_shares_its_arrays(kind):
         for block, view in zip(_vtk_blocks(copied), views):
             at = np.asarray(getattr(block, data)().GetArray(name)).ctypes.data
             assert at != root.address + view._buffer._start * size
+
+
+@needs_vtk
+def test_blocks_lying_end_to_end_come_back_as_one_shared_array():
+    """``vtk_to_dataset(amr, copy=False)`` of a ``vtkOverlappingAMR`` whose blocks' arrays
+    lie end to end in memory (a field read into one array, each block a view of it,
+    as ``dataset_to_vtk(amr, copy=False)`` and a NumPy reader lay them out) shares
+    them as one array a field, each box's values a view of it, over the same memory;
+    it outlives the VTK and Tack objects it came from. Blocks that do not abut (a
+    copy), or values converted to another type, are taken box by box, alike."""
+    import gc
+
+    from tack.interop.vtk import dataset_to_vtk, vtk_to_dataset
+
+    amr = amr_of(_three_levels("image"), [2, 2])
+    expected = {name: [box.fields[name].values.numpy() for _, box in amr]
+                for name in ("c", "p")}
+    roots = {name: next(iter(amr))[1].fields[name].values._buffer._root for name in expected}
+    vtk = dataset_to_vtk(amr, copy=False)
+    back = vtk_to_dataset(vtk, copy=False, dtype=None)
+    for name, values in expected.items():
+        views = [box.fields[name].values for _, box in back]
+        assert _is_view_of_one(views)
+        assert views[0]._buffer._root.address == roots[name].address    # the same memory
+        for view, want in zip(views, values):
+            np.testing.assert_array_equal(view.numpy(), want)
+    del amr, vtk, roots
+    gc.collect()
+    for name, values in expected.items():
+        for (_, box), want in zip(back, values):
+            np.testing.assert_array_equal(box.fields[name].values.numpy(), want)
+
+    apart = vtk_to_dataset(dataset_to_vtk(amr_of(_three_levels("image"), [2, 2])),
+                           copy=False, dtype=None)
+    converted = vtk_to_dataset(dataset_to_vtk(amr_of(_three_levels("image"), [2, 2]),
+                                              copy=False), copy=False, dtype=tack.f64)
+    for other in (apart, converted):
+        assert not _is_view_of_one([box.fields["c"].values for _, box in other])
+        for (_, box), want in zip(other, expected["c"]):
+            np.testing.assert_array_equal(box.fields["c"].values.numpy(), want)

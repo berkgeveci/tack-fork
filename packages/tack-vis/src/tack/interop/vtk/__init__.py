@@ -1789,9 +1789,15 @@ def _amr_to_dataset(amr, options, world=None):
     blocks = [entry for entry in blocks if entry[2] is not None]    # None: another rank's
     # Copied (the default): each box's values go straight into its view of one array
     # a field and a kind of mark, the form algorithms that work a level at a time
-    # take as it is. Shared memory (copy=False) stays VTK's, a box at a time.
-    stage = _Staging([block for _, _, block in blocks], options["dtype"]) \
-        if options.get("copy", True) else None
+    # take as it is. Shared (copy=False) on the CPU: a field whose blocks' arrays lie
+    # end to end in memory is one array over them, each box's values a view
+    # (_SharedSpans); any other stays VTK's a box at a time.
+    if options.get("copy", True):
+        stage = _Staging([block for _, _, block in blocks], options["dtype"])
+    elif tack.get_default_device().type == "cpu":
+        stage = _SharedSpans([block for _, _, block in blocks], options["dtype"])
+    else:
+        stage = None
     levels = [[] for _ in range(amr.GetNumberOfLevels())]
     for k, (level, index, block) in enumerate(blocks):
         boxes = levels[level]
@@ -1917,6 +1923,99 @@ class _Staging:
         if array is not None and view.shape[0]:
             tack.copyto(view, np.asarray(array, np.uint8).reshape(-1))
         return view
+
+
+class _SharedSpans:
+    """``copy=False``'s counterpart of ``_Staging``: a field whose blocks' VTK arrays lie
+    end to end in memory, in block order -- one buffer, as a reader that reads each
+    field into one array and hands each block a view of it lays them out
+    (``~/Work/amrex-reader``) -- shared as one CPU array over all of it, each box's
+    values a view of it: the single-array form, without a copy. Found from each
+    block's address (about 1 us a block; the blocks are visited anyway). The array
+    holds every block's VTK array, so it lives as long as they do: abutting arrays
+    leave no gap, so every byte of it is one of theirs, however they were
+    allocated. A field some block lacks, of another type or width somewhere, that
+    ``_shared`` would not share (a type ``float_dtype`` converts), or whose blocks
+    do not abut, is shared box by box as before; so are the ghost marks
+    (``vtkAMRUtilities::BlankCells`` gives each block an array of its own)."""
+
+    def __init__(self, blocks, float_dtype):
+        self.box = 0
+        self._views = {}
+        found = {}
+        for k, block in enumerate(blocks):
+            for what, attributes in (("points", block.GetPointData()),
+                                     ("cells", block.GetCellData())):
+                ids = attributes.GetGlobalIds()
+                ids = ids.GetName() if ids is not None else None
+                for name, array in _arrays_of(attributes):
+                    if name not in (ids, _GHOST_ARRAY):
+                        found.setdefault((what, name), []).append((k, array))
+        for (what, name), entries in found.items():
+            if [k for k, _ in entries] != list(range(len(blocks))):
+                continue                        # not every block, in order
+            whole = self._spanned(entries, float_dtype)
+            if whole is None:
+                continue
+            counts = [array.GetNumberOfTuples() for _, array in entries]
+            views = whole._row_views(list(itertools.accumulate(counts, initial=0)))
+            for (k, _), view in zip(entries, views):
+                self._views[k, what, name] = view
+
+    @staticmethod
+    def _spanned(entries, float_dtype):
+        """One CPU array over the blocks' arrays (``entries``, ``(box, array)``) where
+        they abut in memory and ``_shared`` would share each; else None."""
+        import numpy as np
+        from vtkmodules.vtkCommonCore import vtkBitArray, vtkDataArray
+
+        from tack.lang.types import from_numpy_dtype
+
+        first = entries[0][1]
+        if not isinstance(first, vtkDataArray) or isinstance(first, vtkBitArray):
+            return None
+        width = first.GetNumberOfComponents()
+        hosts = []
+        for _, array in entries:
+            if (not isinstance(array, vtkDataArray) or isinstance(array, vtkBitArray)
+                    or not array.HasStandardMemoryLayout()
+                    or array.GetNumberOfComponents() != width
+                    or array.GetDataType() != first.GetDataType()):
+                return None
+            hosts.append(np.asarray(array))
+        dtype = hosts[0].dtype
+        if dtype.kind not in "iuf" or any(not h.flags.c_contiguous for h in hosts):
+            return None
+        kind = float_dtype if dtype.kind == "f" and float_dtype is not None else \
+            from_numpy_dtype(dtype)
+        if np.dtype(kind.numpy_dtype) != dtype:
+            return None                         # converted: copied, box by box
+        at = hosts[0].ctypes.data
+        for host in hosts:
+            if host.ctypes.data != at:
+                return None                     # a gap, or out of order
+            at += host.nbytes
+        total = sum(h.shape[0] for h in hosts)
+        shape = (total,) if width == 1 else (total, width)
+        span = np.asarray(_Span(hosts[0].ctypes.data, shape, dtype, hosts))
+        return _shared(span, kind if width == 1 else tack.vec(width, kind))
+
+    def take(self, what, name, array):
+        """The current box's view for its array ``name`` of ``what``, or None."""
+        return self._views.get((self.box, what, name))
+
+    def has_marks(self, what):
+        return False
+
+
+class _Span:
+    """The memory of arrays that lie end to end, as one NumPy array (its base): it
+    holds their views, and so them."""
+
+    def __init__(self, address, shape, dtype, held):
+        self.__array_interface__ = {"data": (address, False), "shape": shape,
+                                    "typestr": dtype.str, "version": 3}
+        self._held = held
 
 
 def _bits(array):
