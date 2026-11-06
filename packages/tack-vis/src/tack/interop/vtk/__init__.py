@@ -2063,10 +2063,12 @@ def _to_bits(values):
     return out
 
 
-def _amr_to_vtk(amr):
+def _amr_to_vtk(amr, copy=True):
     """An ``AMRDataSet`` of images and rectilinear grids as a ``vtkOverlappingAMR``, or
     None if VTK's model cannot hold it: a curvilinear box, ratios that differ
-    between axes, or image levels off one lattice."""
+    between axes, or image levels off one lattice. With ``copy`` false each box's
+    arrays share Tack's memory, as ``dataset_to_vtk(box, copy=False)``'s do: views
+    of one array a field, at their offsets in it."""
     import numpy as np
     from vtkmodules.vtkCommonDataModel import vtkAMRBox, vtkOverlappingAMR
 
@@ -2113,7 +2115,8 @@ def _amr_to_vtk(amr):
     for level, pieces in enumerate(amr.levels):
         for k, box in enumerate(pieces):
             # VTK's AMR blocks start their extents at 0 (the AMR box places them).
-            out.SetDataSet(level, amr._first[level] + k, _from_zero(dataset_to_vtk(box)))
+            out.SetDataSet(level, amr._first[level] + k,
+                           _from_zero(dataset_to_vtk(box, copy=copy)))
     return out
 
 
@@ -2485,19 +2488,19 @@ def _dataset_to_vtk(data, copy=True):
     )
 
     if isinstance(data, dict):
-        return _datasets_to_collection(data)
+        return _datasets_to_collection(data, copy)
     from tack.dataset import OctreeDataSet
 
     if isinstance(data, OctreeDataSet):
         return _octree_to_htg(data)
     if isinstance(data, AMRDataSet):
-        out = _amr_to_vtk(data)
+        out = _amr_to_vtk(data, copy)
         if out is not None:
             return out
         # VTK's AMR holds images and rectilinear grids: a level per partitioned
         # dataset of a collection, "level<l>".
         return _datasets_to_collection({f"level{level}": pieces
-                                        for level, pieces in enumerate(data.levels)})
+                                        for level, pieces in enumerate(data.levels)}, copy)
     if isinstance(data, PartitionedDataSet):
         from vtkmodules.vtkCommonDataModel import vtkPartitionedDataSet
 
@@ -2609,7 +2612,7 @@ def _dataset_to_vtk(data, copy=True):
     return grid
 
 
-def _datasets_to_collection(datasets):
+def _datasets_to_collection(datasets, copy=True):
     """A ``dict`` of name to ``PartitionedDataSet`` as a
     ``vtkPartitionedDataSetCollection``, each partitioned dataset named."""
     from vtkmodules.vtkCommonDataModel import (
@@ -2625,7 +2628,7 @@ def _datasets_to_collection(datasets):
         if not isinstance(pieces, PartitionedDataSet):
             raise TypeError(f"collection entry {name!r} is a {type(pieces).__name__}, not "
                             "a PartitionedDataSet")
-        out.SetPartitionedDataSet(i, dataset_to_vtk(pieces))
+        out.SetPartitionedDataSet(i, dataset_to_vtk(pieces, copy=copy))
         out.GetMetaData(i).Set(vtkCompositeDataSet.NAME(), str(name))
     return out
 

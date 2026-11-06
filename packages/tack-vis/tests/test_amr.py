@@ -851,3 +851,40 @@ def test_staged_boxes_are_the_boxes_converted_one_by_one(source):
         assert (a.origin, a.unit, a.time, a.time_unit, a.dtype) == \
             (b.origin, b.unit, b.time, b.time_unit, b.dtype)
         assert a.global_ids is None and b.global_ids is None
+
+
+def _vtk_blocks(out):
+    """A VTK export's blocks in the hierarchy's order: a ``vtkOverlappingAMR``'s, or
+    the levels' partitions of a collection."""
+    if out.class_name == "vtkOverlappingAMR":
+        return [out.GetDataSetAsCartesianGrid(level, i)
+                for level in range(out.GetNumberOfLevels())
+                for i in range(out.GetNumberOfBlocks(level))]
+    return [out.GetPartitionedDataSet(level).GetPartition(i)
+            for level in range(out.number_of_partitioned_data_sets)
+            for i in range(out.GetPartitionedDataSet(level).number_of_partitions)]
+
+
+@needs_vtk
+@pytest.mark.parametrize("kind", ["image", "curvilinear"])
+def test_a_hierarchy_given_to_vtk_without_copies_shares_its_arrays(kind):
+    """``dataset_to_vtk(amr, copy=False)`` hands VTK the boxes' own memory, as it does
+    any dataset's: each block's arrays point at the box's views, at their offsets in
+    the one array of the field, for a ``vtkOverlappingAMR`` (images) and for the
+    collection of levels a curvilinear hierarchy becomes. ``copy=True`` copies."""
+    amr = amr_of(_three_levels(kind), [2, 2])
+    boxes = [box for _, box in amr]
+    shared, copied = dataset_to_vtk(amr, copy=False), dataset_to_vtk(amr)
+    assert shared.class_name == ("vtkOverlappingAMR" if kind == "image"
+                                 else "vtkPartitionedDataSetCollection")
+    for name, data in (("c", "GetCellData"), ("p", "GetPointData")):
+        views = [box.fields[name].values for box in boxes]
+        root = views[0]._buffer._root
+        assert all(v._buffer._root is root for v in views)
+        size = views[0].dtype.numpy_dtype.itemsize
+        for block, view in zip(_vtk_blocks(shared), views):
+            at = np.asarray(getattr(block, data)().GetArray(name)).ctypes.data
+            assert at == root.address + view._buffer._start * size
+        for block, view in zip(_vtk_blocks(copied), views):
+            at = np.asarray(getattr(block, data)().GetArray(name)).ctypes.data
+            assert at != root.address + view._buffer._start * size
