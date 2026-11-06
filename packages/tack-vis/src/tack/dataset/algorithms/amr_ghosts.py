@@ -635,8 +635,9 @@ def _ghost_points_of(same, coarse, has_coarse, r0, r1, r2, den, scale, ids, offs
                             k0 = c0 + a0
                             k1 = c1 + a1 if coarse.d > 1 else c1
                             k2 = c2 + a2 if coarse.d > 2 else c2
-                            owner = coarse.find(k0, k1, k2, 1, -1, big + coarse.lo.shape[0])
                             if write == 1:
+                                # The corner's owner: only the writing pass needs it.
+                                owner = coarse.find(k0, k1, k2, 1, -1, big + coarse.lo.shape[0])
                                 groups[at + count] = coarse.group[owner]
                                 places[at + count] = coarse.place(owner, k0, k1, k2, 1)
                                 weights[at + count] = w * scale
@@ -1026,11 +1027,25 @@ def amr_ghost_cells(amr, layers, fields):
         any(not isinstance(piece.geometry.values, UniformCoordinates) for piece in pieces)))
     grown_boxes, arrays_by_kind, positions = [], [], []
     grown = _GroupArrays(groups, fills)
+    # A device's boxes' values in one launch where they are views of one array.
+    placed = [{} for _ in pieces]
+    for name in names:
+        for g in groups.blocks.local:
+            members = groups.members[g]
+            if members:
+                with groups.blocks.device(g):
+                    views = grown.placed(g, name, _kind(pieces[members[0]].fields[name]),
+                                         [pieces[i].fields[name].values for i in members],
+                                         amr, extents)
+                for i, view in zip(members, views or ()):
+                    placed[i][name] = view
     for i, ((level, k), piece) in enumerate(zip(groups.local, pieces)):
         box, ext = amr._boxes[level][k], extents[level][k]
         with groups.devices[i]:
-            assembled = {}
+            assembled = placed[i]
             for name in names:
+                if name in assembled:
+                    continue
                 kind = _kind(piece.fields[name])
                 assembled[name] = _placed(piece.fields[name].values, kind, box, ext, d,
                                           functools.partial(grown.view, i, name, kind))
@@ -1089,21 +1104,64 @@ class _GroupArrays:
                               for i, start in zip(groups.members[g], groups.starts(g, kind))}
                        for kind in ("cells", "points")}
 
+    def buffer(self, g, name, kind, dtype):
+        """Group ``g``'s zeroed buffer for ``name``, made when first asked, with room
+        for the fill's staged sources after the boxes'."""
+        key = (g, name)
+        if key not in self.buffers:
+            extra = self.fills[kind].boxes[g]["m"]
+            self.buffers[key] = tack.zeros((self.groups.size(g, kind) + extra,), dtype)
+        return self.buffers[key]
+
     def view(self, i, name, kind, values, n):
         """Box ``i``'s zeroed array of ``n`` entries for ``name``: its stretch of the
         group's buffer, made at the group's first box; a new array where a box's
         type differs from the group's."""
-        g, groups = self.group_of[i], self.groups
-        key = (g, name)
-        buffer = self.buffers.get(key)
-        if buffer is None:
-            extra = self.fills[kind].boxes[g]["m"]
-            buffer = self.buffers[key] = tack.zeros((groups.size(g, kind) + extra,),
-                                                    values.dtype)
+        buffer = self.buffer(self.group_of[i], name, kind, values.dtype)
         if buffer.dtype != values.dtype:
             return tack.zeros((n,), values.dtype)
         start = self.starts[kind][i]
         return buffer[start:start + n]
+
+    def placed(self, g, name, kind, values, amr, extents):
+        """Group ``g``'s boxes' ``values`` (of ``name``, its members' in order) placed
+        in their grown extents, zeros elsewhere, by one launch (`_place_rows`), as
+        views of the group's buffer: where the values are one stretch of an array
+        (`arrays._joined_view`, as `vtk_to_dataset` and `in_device_buffers` lay a
+        hierarchy out), each box's its own entries; else None, for `_placed` box by
+        box (one launch a box was 1.3 s of AMR-Wind's five levels)."""
+        if kind is None or any(type(v) is not tack.Array or v.ndim != 1 for v in values):
+            return None
+        groups, d = self.groups, amr.dimension
+        members = groups.members[g]
+        where = [groups.local[i] for i in members]
+        own = np.stack([amr._boxes[level][k] for level, k in where])
+        grown = np.stack([extents[level][k] for level, k in where])
+        extra = int(kind == "points")
+        sizes = np.ones((len(where), 3), np.int64)
+        sizes[:, :d] = own[:, 1, :d] - own[:, 0, :d] + extra
+        spans = np.ones((len(where), 3), np.int64)
+        spans[:, :d] = grown[:, 1, :d] - grown[:, 0, :d] + extra
+        if any(int(v.shape[0]) != int(n) for v, n in zip(values, sizes.prod(axis=1))):
+            return None                     # an order-2 field's values go past its points
+        joined = arrays._joined_view(values)
+        if joined is None:
+            return None
+        buffer = self.buffer(g, name, kind, joined.dtype)
+        if buffer.dtype != joined.dtype:
+            return None
+        offset = np.zeros((len(where), 3), np.int64)
+        offset[:, :d] = own[:, 0, :d] - grown[:, 0, :d]
+        starts = groups.starts(g, kind).astype(np.int64)
+        sources = np.concatenate([[0], np.cumsum(sizes.prod(axis=1))]).astype(np.int64)
+        row_starts = np.concatenate([[0], np.cumsum(sizes[:, 1] * sizes[:, 2])]).astype(np.int64)
+        table = np.ascontiguousarray(np.concatenate([spans[:, :2], offset, sizes[:, :2]],
+                                                    axis=1))
+        if row_starts[-1]:
+            _place_rows(int(row_starts[-1]), len(where), tack.array(row_starts, tack.i64),
+                        tack.array(starts, tack.i64), tack.array(table, tack.i64),
+                        tack.array(sources[:-1], tack.i64), joined, buffer)
+        return buffer._row_views(np.append(starts, groups.size(g, kind)))
 
 
 def _placed(values, kind, box, ext, d, out_of=None):
@@ -1123,6 +1181,33 @@ def _placed(values, kind, box, ext, d, out_of=None):
     if values.shape[0]:
         _place_into(values, out, *map(int, own[:2]), *map(int, grown[:2]), *map(int, start))
     return out
+
+
+@tack.kernel
+def _place_rows(rows, count, row_starts, starts, table, sources, values, out):
+    # One thread a row (along x) of the boxes' own entries: box b's rows from
+    # row_starts[b] (count boxes, rows in all), its values from sources[b] of
+    # ``values``, its grown array from starts[b] of ``out``. table[b]: the grown
+    # extent along x and y, where the box starts in it (x, y, z), and the box's
+    # extent along x and y.
+    for r in range(rows):
+        a = 0
+        b = count - 1
+        while a < b:
+            m = (a + b + 1) // 2
+            if row_starts[m] <= r:
+                a = m
+            else:
+                b = m - 1
+        local = r - row_starts[a]
+        nx = table[a, 5]
+        y = local % table[a, 6]
+        z = local // table[a, 6]
+        at = starts[a] + table[a, 2] + table[a, 0] * ((y + table[a, 3]) +
+                                                      table[a, 1] * (z + table[a, 4]))
+        source = sources[a] + local * nx
+        for x in range(nx):
+            out[at + x] = values[source + x]
 
 
 @tack.kernel

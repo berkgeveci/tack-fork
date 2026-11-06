@@ -15,3 +15,7 @@
   or rank holds come to the host, to make the exchange. On AMR-Wind's five
   levels `ghost_cells` went from 9.0 to 5.8 s, the values bit for bit the
   same.
+- `ghost_cells` of an `AMRDataSet` places a device's boxes' own values in their
+  grown arrays by one launch where they are views of one array (as
+  `vtk_to_dataset` makes them), not one launch a box: on AMR-Wind's five
+  levels 1.3 to 0.09 s, `ghost_cells` 5.8 to 4.4 s.
