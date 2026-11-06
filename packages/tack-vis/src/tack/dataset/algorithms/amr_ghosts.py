@@ -28,7 +28,7 @@ from tack.arrays import CartesianProduct, UniformCoordinates
 from tack.dataset import _box_pairs, _matching
 from tack.dataset.amr import AMRDataSet, _mark
 from tack.dataset.carry import _point_values
-from tack.dataset.dataset import DataSet, Field
+from tack.dataset.dataset import DataSet, Field, _split_key
 from tack.dataset.ghosts import Ghosts
 from tack.dataset.partitioned import common_origin
 from tack.dataset.spaces import H1, Constant, Values
@@ -1324,17 +1324,19 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden_p
     (``ghosts``, `_grown_ghosts`'); ``hidden_points`` its points nothing filled."""
     from tack.dataset.algorithms.ghost_cells import _kind
 
-    dims = tuple(int(v) + 1 for v in (ext[1, :d] - ext[0, :d]))
+    # Plain Python numbers, not NumPy's: a box is a few dozen of them, and NumPy's
+    # small-array calls were a good part of a box's cost.
+    own, (low, high) = box[0].tolist(), ext.tolist()
+    dims = tuple(high[a] - low[a] + 1 for a in range(d))
     with device:
         topology = StructuredTopology(dims, id_dtype=piece.topology.id_dtype,
-                                      offset=tuple(int(v) for v in ext[0, :d]))
+                                      offset=tuple(low[:d]))
     coordinates = piece.geometry.values
     if isinstance(coordinates, UniformCoordinates):
-        spacing = np.asarray(coordinates._spacing, np.float64)
-        shift = np.zeros(3)
-        shift[:d] = (box[0, :d] - ext[0, :d]) * spacing[:d]
-        geometry = UniformCoordinates(dims, np.asarray(coordinates._origin) - shift,
-                                      coordinates._spacing, dtype=coordinates.dtype,
+        spacing = coordinates._spacing
+        origin = tuple(o - (own[a] - low[a]) * spacing[a] if a < d else o - 0.0
+                       for a, o in enumerate(coordinates._origin))
+        geometry = UniformCoordinates(dims, origin, spacing, dtype=coordinates.dtype,
                                       device=device)
     else:
         grid = positions.numpy().reshape(-1, 3).astype(np.float64)
@@ -1354,17 +1356,20 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden_p
         else:
             with device:
                 geometry = tack.array(grid.astype(piece.dtype.numpy_dtype), tack.vec3(piece.dtype))
-    with device:
-        out = DataSet(topology, geometry, dtype=piece.dtype, ghosts=ghosts, **piece._frame())
-        for name in names:
-            field = piece.fields[name]
-            if _kind(field) == "points":
-                space = H1(out) if isinstance(field.space, H1) else Values(out, "points")
-            else:
-                space = Constant(out) if isinstance(field.space, Constant) else \
-                    Values(out, "cells")
-            out.fields[name] = Field(space, assembled[name], field.unit)
-    return out
+    # Every part is made here, consistent: assembled without the constructor's checks
+    # of each (12 us a box; AMR-Wind's grown boxes are 15,598).
+    entries = []
+    for name in names:
+        field = piece.fields[name]
+        if _kind(field) == "points":
+            space = H1(topology) if isinstance(field.space, H1) else Values(topology, "points")
+        else:
+            space = Constant(topology) if isinstance(field.space, Constant) else \
+                Values(topology, "cells")
+        entries.append((_split_key(name)[0], Field(space, assembled[name], field.unit)))
+    return DataSet._assembled(topology, Field(H1(topology), geometry, piece.unit), entries,
+                              ghosts, origin=piece.origin, time=piece.time,
+                              time_unit=piece.time_unit)
 
 
 _DUPLICATE = {"cells": Ghosts.DUPLICATECELL, "points": Ghosts.DUPLICATEPOINT}

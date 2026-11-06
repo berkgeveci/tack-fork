@@ -75,7 +75,15 @@ def canonical(unit):
     if not unit.strip():
         raise ValueError("an empty unit: give 'dimensionless' for a pure number, or None "
                          "for unknown")
-    return str(_parsed(unit))
+    return _spelled(unit)
+
+
+@lru_cache(maxsize=1024)
+def _spelled(text):
+    """``text``'s canonical spelling, kept: unyt spells a unit through sympy's
+    printer, about 5 us, and every field made (thousands for an AMR hierarchy's
+    boxes) asks."""
+    return str(_parsed(text))
 
 
 def conversion(source, target):

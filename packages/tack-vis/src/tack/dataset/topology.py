@@ -24,6 +24,8 @@ Every id a topology stores or derives has its ``id_dtype`` (``tack.dataset.ids``
 ``i32``, or ``i64`` for a topology too large for it or asked to use it.
 """
 
+import math
+
 import numpy as np
 
 import tack
@@ -531,8 +533,8 @@ class StructuredTopology(_Topology):
                              f"{offset}")
         self.point_dims = point_dims
         self.offset = offset
-        self.num_cells = int(np.prod([d - 1 for d in point_dims]))
-        self.num_points = int(np.prod(point_dims))
+        self.num_cells = math.prod(d - 1 for d in point_dims)
+        self.num_points = math.prod(point_dims)
         self.id_dtype = ids.choose(id_dtype, max(self.num_points, 12 * self.num_cells))
         kind, shape = self._KINDS[len(point_dims)]
         dims = point_dims + (1,) * (3 - len(point_dims))

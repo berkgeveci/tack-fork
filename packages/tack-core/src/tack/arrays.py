@@ -355,10 +355,19 @@ def _point_dims(dims):
 
 def _three(values, fill, what):
     """Up to three numbers as three floats, the missing ones ``fill``."""
-    values = tuple(float(v) for v in np.asarray(values, float).reshape(-1))
+    if type(values) in (tuple, list) and all(type(v) in (int, float) for v in values):
+        values = tuple(float(v) for v in values)        # plain numbers: no NumPy
+    else:
+        values = tuple(float(v) for v in np.asarray(values, float).reshape(-1))
     if not 1 <= len(values) <= 3:
         raise ValueError(f"an image's {what} has one to three values, not {len(values)}")
     return values + (fill,) * (3 - len(values))
+
+
+#: An unoriented image's direction matrix, one for every image (read only): an AMR
+#: hierarchy has an image a box.
+_EYE3 = np.eye(3)
+_EYE3.flags.writeable = False
 
 
 def _identity(dtype, device):
@@ -398,8 +407,9 @@ class UniformCoordinates(_Implicit):
         origin, spacing = _three(origin, 0.0, "origin"), _three(spacing, 1.0, "spacing")
         self.ox, self.oy, self.oz = origin
         self.sx, self.sy, self.sz = spacing
-        matrix = np.eye(3)
+        matrix = _EYE3
         if direction is not None:
+            matrix = np.eye(3)
             given = np.asarray(direction, float)
             if given.shape == (2, 2):
                 matrix[:2, :2] = given

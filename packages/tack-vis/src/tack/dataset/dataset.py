@@ -30,6 +30,7 @@ such space among ``args``, and the kernel runs once per subgroup, each
 launch specialized to its keys.
 """
 
+import math
 from collections.abc import MutableMapping
 
 import numpy as np
@@ -197,6 +198,9 @@ def as_origin(origin):
     anything else that is not three finite numbers."""
     if origin is None:
         return (0.0, 0.0, 0.0)
+    if (type(origin) is tuple and len(origin) == 3
+            and all(type(v) is float and math.isfinite(v) for v in origin)):
+        return origin               # a dataset's own, as filters pass it: no NumPy
     try:
         values = np.asarray(origin, np.float64).reshape(-1)
     except (TypeError, ValueError):
@@ -822,6 +826,37 @@ class DataSet:
             same_device("DataSet", (self.topology, ghosts))
         out._ghosts_lost = False
         out._ghosts = ghosts
+        return out
+
+    @classmethod
+    def _assembled(cls, topology, geometry, fields=(), ghosts=None, global_ids=None,
+                   origin=(0.0, 0.0, 0.0), time=None, time_unit=None):
+        """The dataset ``DataSet(...)`` makes of these parts, made without checking
+        them: for code that has just made them consistent and makes thousands of
+        datasets at once (an AMR hierarchy's boxes, which ``vtk_to_dataset`` and
+        ``ghost_cells`` make), where the checks cost more than the rest (about 12 us
+        a box). ``geometry`` is a ``Field`` of 3-vectors in ``H1`` or ``L2`` on
+        ``topology``; ``fields`` ``(name, Field)`` pairs on ``topology``, no two of a
+        name in one space; ``ghosts`` and ``global_ids`` sized for ``topology`` or
+        None; every part on one device; ``origin`` three floats; ``time`` a float or
+        None, in ``time_unit``, a canonical unit of time or None.
+        ``test_assembled_datasets_are_constructed_ones`` holds the two alike."""
+        out = cls.__new__(cls)
+        out.topology = topology
+        out._geometry = geometry
+        out._origin = origin
+        out._time = time
+        out._time_unit = time_unit
+        held = Fields.__new__(Fields)
+        held._topology = topology
+        held._entries = [[name, field] for name, field in fields]
+        out._fields = held
+        sets = Sets.__new__(Sets)
+        sets._topology = topology
+        out._sets = sets
+        out._ghosts_lost = False
+        out._ghosts = ghosts
+        out._global_ids = global_ids
         return out
 
     @property

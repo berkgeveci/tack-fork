@@ -1653,6 +1653,15 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
                      _global_ids(point_data, share, device))
     global_ids = None if cells is None and points is None else GlobalIds(cells=cells,
                                                                          points=points)
+    if _stage is not None and isinstance(geometry, UniformCoordinates):
+        # An AMR box, one of thousands, of parts made here: assembled without the
+        # constructor's checks of each (12 us a box), as the constructor would make it.
+        from tack.dataset import Field
+        from tack.dataset.dataset import _split_key
+
+        return DataSet._assembled(topology, Field(H1(topology), geometry, unit),
+                                  [(_split_key(key)[0], field) for key, field in fields.items()],
+                                  ghosts, global_ids, origin=as_origin(origin))
     return DataSet(topology, geometry, fields=fields, dtype=geometry_dtype, ghosts=ghosts,
                    global_ids=global_ids, origin=origin, unit=unit)
 

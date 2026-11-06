@@ -761,3 +761,93 @@ def test_rows_meeting_more_boxes_than_they_keep_search_entry_by_entry(kind, d, m
         for name in a.fields:
             np.testing.assert_array_equal(a.fields[name].values.numpy(),
                                           b.fields[name].values.numpy())
+
+
+def _same_part(a, b):
+    """Whether two datasets' attribute values are alike: the same object where the
+    constructor keeps what it was given, else equal (containers by content)."""
+    from tack.dataset.dataset import Fields
+    from tack.dataset.sets import Sets
+
+    if isinstance(a, Fields):
+        return (type(b) is Fields and a._topology is b._topology
+                and [(n, f) for n, f in a._entries] == [(n, f) for n, f in b._entries])
+    if isinstance(a, Sets):
+        return type(b) is Sets and a._topology is b._topology and dict(a) == dict(b)
+    if isinstance(a, td.Field):
+        return (type(b) is td.Field and a.space is b.space and a.values is b.values
+                and a.unit == b.unit and a.gradient is b.gradient)
+    return a is b or (type(a) is type(b) and a == b)
+
+
+@pytest.mark.parametrize("parts", ["all", "none"])
+def test_assembled_datasets_are_constructed_ones(parts):
+    """``DataSet._assembled`` (what makes an AMR hierarchy's boxes by the thousand,
+    in ``ghost_cells`` and ``vtk_to_dataset``) makes, without checking, the dataset
+    ``DataSet(...)`` makes of the same parts: attribute for attribute, so a part the
+    constructor sets is not one ``_assembled`` forgets."""
+    from tack.dataset import GlobalIds
+    from tack.dataset.dataset import DataSet
+
+    box = image((2, 4), (4, 6), 0.5)
+    topology = box.topology
+    geometry = td.Field(td.H1(topology), box.geometry.values, "m")
+    p = td.Field(td.H1(topology), box.fields["p"].values, "K")
+    c = td.Field(td.Constant(topology), box.fields["c"].values)
+    shared = td.Field(td.Constant(topology), box.fields["c"].values, "s")
+    if parts == "all":
+        ghosts = Ghosts(cells=tack.zeros(topology.num_cells, tack.u8),
+                        points=tack.zeros(topology.num_points, tack.u8))
+        ids = GlobalIds(cells=tack.arange(topology.num_cells, dtype=tack.i64),
+                        points=tack.arange(topology.num_points, dtype=tack.i64))
+        frame = {"origin": (1.0, 2.0, 3.0), "time": 0.5, "time_unit": "s"}
+        entries = [("p", p), ("c", c), ("p", shared)]
+    else:
+        ghosts = ids = None
+        frame = {"origin": (0.0, 0.0, 0.0), "time": None, "time_unit": None}
+        entries = []
+    made = DataSet(topology, geometry, fields=[((n, f.space), f) for n, f in entries],
+                   ghosts=ghosts, global_ids=ids, **frame)
+    assembled = DataSet._assembled(topology, geometry, entries, ghosts, ids, **frame)
+    assert vars(assembled).keys() == vars(made).keys()
+    for key, value in vars(made).items():
+        assert _same_part(vars(assembled)[key], value), key
+    assert assembled.unit == made.unit == "m" and assembled.dtype == made.dtype
+
+
+@needs_vtk
+@pytest.mark.parametrize("source", ["pulse", "hierarchy"])
+def test_staged_boxes_are_the_boxes_converted_one_by_one(source):
+    """``vtk_to_dataset`` copying a ``vtkOverlappingAMR`` stages its boxes' values in
+    one array a field and assembles each box without the constructor's checks
+    (``DataSet._assembled``); with ``copy=False`` each box is converted alone, by
+    the constructor. The boxes are alike: attributes, topology, geometry, fields
+    (name, space, unit, values), marks and frame."""
+    from tack.interop.vtk import dataset_to_vtk, vtk_to_dataset
+
+    amr = td.amr_gaussian_pulse() if source == "pulse" else hierarchy("image", 3)
+    if source == "hierarchy":
+        for _, box in amr:
+            box.fields["p"] = td.Field(box.fields["p"].space, box.fields["p"].values, "K")
+    vtk = dataset_to_vtk(amr)
+    staged, alone = vtk_to_dataset(vtk), vtk_to_dataset(vtk, copy=False)
+    for (_, a), (_, b) in zip(staged, alone):
+        assert vars(a).keys() == vars(b).keys()
+        assert (a.topology.point_dims, a.topology.offset, a.topology.id_dtype) == \
+            (b.topology.point_dims, b.topology.offset, b.topology.id_dtype)
+        ga, gb = a.geometry, b.geometry
+        assert type(ga.space) is type(gb.space) and ga.unit == gb.unit
+        assert (ga.values._origin, ga.values._spacing, ga.values.dtype) == \
+            (gb.values._origin, gb.values._spacing, gb.values.dtype)
+        assert [(n, type(f.space), f.unit) for n, f in a.fields.entries()] == \
+            [(n, type(f.space), f.unit) for n, f in b.fields.entries()]
+        for (_, fa), (_, fb) in zip(a.fields.entries(), b.fields.entries()):
+            np.testing.assert_array_equal(fa.values.numpy(), fb.values.numpy())
+        for kind in ("cells", "points"):
+            ma, mb = getattr(a.ghosts, kind), getattr(b.ghosts, kind)
+            assert (ma is None) == (mb is None)
+            if ma is not None:
+                np.testing.assert_array_equal(ma.numpy(), mb.numpy())
+        assert (a.origin, a.unit, a.time, a.time_unit, a.dtype) == \
+            (b.origin, b.unit, b.time, b.time_unit, b.dtype)
+        assert a.global_ids is None and b.global_ids is None
