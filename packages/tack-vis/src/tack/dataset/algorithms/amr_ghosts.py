@@ -24,8 +24,8 @@ import tack
 from tack import arrays
 from tack import communication as tc
 from tack.arrays import CartesianProduct, UniformCoordinates
-from tack.dataset import _matching
-from tack.dataset.amr import AMRDataSet
+from tack.dataset import _box_pairs, _matching
+from tack.dataset.amr import AMRDataSet, _mark
 from tack.dataset.carry import _point_values
 from tack.dataset.dataset import DataSet, Field
 from tack.dataset.ghosts import Ghosts
@@ -922,16 +922,11 @@ def amr_ghost_cells(amr, layers, fields):
     if need:
         fills["points"].run(positions)
 
-    # What a finer level covers, each level's grown boxes at once.
-    refined = {}
-    for level in range(amr.num_levels):
-        ks = [k for _, lvl, k, *_ in grown_boxes if lvl == level]
-        refined.update(zip(((level, k) for k in ks),
-                           amr._refined_boxes(level, extents[level][ks])))
+    marks = _grown_ghosts(amr, groups, extents, hidden)
     out = [[] for _ in range(amr.num_levels)]
     for i, level, k, piece, box, ext in grown_boxes:
         out[level].append(_grown_box(piece, groups.devices[i], box, ext, d, arrays_by_kind[i],
-                                     names, positions[i], hidden[i], refined[level, k]))
+                                     names, positions[i], hidden[i][1], marks[i]))
     return AMRDataSet._grown(amr, out, extents, int(layers), fills)
 
 
@@ -1011,8 +1006,9 @@ def _place_into(values, out, nx, ny, gx, gy, sx, sy, sz):
         out[(i + sx) + gx * ((j + sy) + gy * (m + sz))] = values[k]
 
 
-def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden, refined):
-    """The box grown to ``ext``: its topology, geometry, fields and marks."""
+def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden_points, ghosts):
+    """The box grown to ``ext``: its topology, geometry and fields, with its marks
+    (``ghosts``, `_grown_ghosts`'); ``hidden_points`` its points nothing filled."""
     from tack.dataset.algorithms.ghost_cells import _kind
 
     dims = tuple(int(v) + 1 for v in (ext[1, :d] - ext[0, :d]))
@@ -1020,7 +1016,6 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden, 
         topology = StructuredTopology(dims, id_dtype=piece.topology.id_dtype,
                                       offset=tuple(int(v) for v in ext[0, :d]))
     coordinates = piece.geometry.values
-    hidden_cells, hidden_points = hidden
     if isinstance(coordinates, UniformCoordinates):
         spacing = np.asarray(coordinates._spacing, np.float64)
         shift = np.zeros(3)
@@ -1046,10 +1041,8 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden, 
         else:
             with device:
                 geometry = tack.array(grid.astype(piece.dtype.numpy_dtype), tack.vec3(piece.dtype))
-    cells, points = _grown_marks(piece, box, ext, d, hidden_cells, hidden_points, refined)
     with device:
-        out = DataSet(topology, geometry, dtype=piece.dtype,
-                      ghosts=Ghosts(cells=cells, points=points), **piece._frame())
+        out = DataSet(topology, geometry, dtype=piece.dtype, ghosts=ghosts, **piece._frame())
         for name in names:
             field = piece.fields[name]
             if _kind(field) == "points":
@@ -1061,22 +1054,126 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden, 
     return out
 
 
-def _grown_marks(piece, box, ext, d, hidden_cells, hidden_points, refined):
-    """The grown box's marks: its own, then ``DUPLICATECELL`` and ``DUPLICATEPOINT``
-    on the ghosts, hidden where nothing filled them, refined where a finer box
-    covers them (``refined``, ``AMRDataSet._refined_boxes``' for the grown box)."""
-    cells = _placed_host(piece.ghosts.cells.numpy(), "cells", box, ext, d)
-    points = _placed_host(piece.ghosts.points.numpy(), "points", box, ext, d)
-    own_cells = _placed_host(np.ones(piece.num_cells, bool), "cells", box, ext, d)
-    own_points = _placed_host(np.ones(piece.num_points, bool), "points", box, ext, d)
-    refined_cells, refined_points = refined
-    cells[~own_cells] |= Ghosts.DUPLICATECELL
-    cells[~own_cells & refined_cells.reshape(-1)] |= Ghosts.REFINEDCELL
-    cells[hidden_cells] |= Ghosts.HIDDENCELL
-    points[~own_points] |= Ghosts.DUPLICATEPOINT
-    points[~own_points & refined_points.reshape(-1)] |= Ghosts.REFINEDPOINT
-    points[hidden_points] |= Ghosts.HIDDENPOINT
-    return cells, points
+_DUPLICATE = {"cells": Ghosts.DUPLICATECELL, "points": Ghosts.DUPLICATEPOINT}
+_HIDDEN = {"cells": Ghosts.HIDDENCELL, "points": Ghosts.HIDDENPOINT}
+
+
+def _grown_ghosts(amr, groups, extents, hidden):
+    """Each local box's grown marks, ``{place: Ghosts}``, made on its group's device:
+    each kind of mark one array a group, its boxes' views of it in the group's
+    order, as the constructor lays them out. One launch a kind places the boxes'
+    own marks and marks their ghosts duplicates (`_grown_own_marks`); the refined
+    bits are set where a finer box, coarsened, meets a grown box, by the
+    constructor's pairs and rows (`_box_pairs.pairs`, `amr._mark`; on a box's own
+    entries they are set already, so setting them again changes nothing); the
+    hidden bits where the fills found no source (``hidden``, each box's own
+    indices). Only the box lists and the hidden indices are on the host."""
+    d = amr.dimension
+    out = {}
+    for g in groups.blocks.local:
+        members = groups.members[g]
+        if not members:
+            continue
+        where = [groups.local[i] for i in members]
+        own = np.stack([amr._boxes[level][k] for level, k in where])
+        grown = np.stack([extents[level][k] for level, k in where])
+        levels = np.asarray([level for level, _ in where])
+        views = {}
+        with groups.blocks.device(g):
+            for c, kind in enumerate(("cells", "points")):
+                extra = int(kind == "points")
+                sizes = np.ones((len(where), 3), np.int64)
+                sizes[:, :d] = own[:, 1, :d] - own[:, 0, :d] + extra
+                spans = np.ones((len(where), 3), np.int64)
+                spans[:, :d] = grown[:, 1, :d] - grown[:, 0, :d] + extra
+                offset = np.zeros((len(where), 3), np.int64)
+                offset[:, :d] = own[:, 0, :d] - grown[:, 0, :d]
+                starts = np.concatenate([[0], np.cumsum(spans.prod(axis=1))]).astype(np.int64)
+                sources = np.concatenate([[0], np.cumsum(sizes.prod(axis=1))]).astype(np.int64)
+                whole = tack.empty(int(starts[-1]), tack.u8)
+                if len(whole):
+                    given = _joined_marks([getattr(groups.pieces[i].ghosts, kind, None)
+                                           for i in members], sources)
+                    table = np.ascontiguousarray(np.concatenate([spans[:, :2], offset, sizes],
+                                                                axis=1))
+                    row_starts = np.concatenate([[0], np.cumsum(spans[:, 1] * spans[:, 2])])
+                    _grown_own_marks(int(row_starts[-1]), len(where),
+                                     tack.array(row_starts.astype(np.int64), tack.i64),
+                                     tack.array(starts, tack.i64), tack.array(table, tack.i64),
+                                     tack.array(sources, tack.i64), given, _DUPLICATE[kind],
+                                     whole)
+                for level in np.unique(levels):
+                    here = np.flatnonzero(levels == level)
+                    level_starts = tack.array(starts[here], tack.i64)
+                    for bit, what, boxes, closed, lower in amr._covers(int(level)):
+                        if what != kind or lower:
+                            continue        # the siblings' DUPLICATEPOINT: a ghost has it
+                        found = _box_pairs.pairs(grown[here], boxes, d, closed)
+                        # ``lower`` is false: _part_rows reads no global ids.
+                        _mark(whole, bit, found, d, closed, False, level_starts, level_starts)
+                at = [hidden[i][c] + starts[n] for n, i in enumerate(members)]
+                at = np.concatenate(at).astype(np.int64) if at else np.zeros(0, np.int64)
+                if len(at):
+                    _set_bits(tack.array(at, tack.i64), _HIDDEN[kind], whole)
+                views[kind] = whole._row_views(starts)
+        for n, i in enumerate(members):
+            out[i] = Ghosts(cells=views["cells"][n], points=views["points"][n])
+    return out
+
+
+def _joined_marks(given, sources):
+    """The boxes' own marks of a kind end to end: one stretch of the array they are
+    views of, as the constructor makes them, without a copy; else joined in a
+    new array, zeros for a box without (``sources`` their CSR starts)."""
+    if all(g is not None for g in given):
+        joined = arrays._joined_view(given)
+        if joined is not None:
+            return joined
+    parts = [g if g is not None else tack.zeros(int(b - a), tack.u8)
+             for g, a, b in zip(given, sources[:-1], sources[1:])]
+    return tack.concat(parts) if len(parts) > 1 else parts[0]
+
+
+@tack.kernel
+def _grown_own_marks(rows, count, row_starts, starts, table, sources, own, bit, marks):
+    # One thread a row (along x) of the grown boxes' marks: box b's rows from
+    # row_starts[b] (count boxes, rows in all), its marks from starts[b]. Each
+    # mark is the box's own where it holds the entry, else ``bit``. table[b]: the
+    # grown box's extent along x and y, where the box starts in it (x, y, z) and
+    # its extent (x, y, z); its own marks start at sources[b] of ``own``. (A
+    # thread a mark searched for its box 280M times on AMR-Wind: 2.2 s.)
+    for r in range(rows):
+        a = 0
+        b = count - 1
+        while a < b:
+            m = (a + b + 1) // 2
+            if row_starts[m] <= r:
+                a = m
+            else:
+                b = m - 1
+        local = r - row_starts[a]
+        gx = table[a, 0]
+        nx = table[a, 5]
+        x0 = table[a, 2]
+        y = local % table[a, 1] - table[a, 3]
+        z = local // table[a, 1] - table[a, 4]
+        at = starts[a] + local * gx
+        if y >= 0 and y < table[a, 6] and z >= 0 and z < table[a, 7]:
+            source = sources[a] + nx * (y + table[a, 6] * z) - x0
+            for x in range(gx):
+                if x >= x0 and x < x0 + nx:
+                    marks[at + x] = own[source + x]
+                else:
+                    marks[at + x] = bit
+        else:
+            for x in range(gx):
+                marks[at + x] = bit
+
+
+@tack.kernel
+def _set_bits(at, bit, marks):
+    for i in range(at.shape[0]):
+        marks[at[i]] = marks[at[i]] | bit
 
 
 def _extrapolated(grid, hidden, dims):

@@ -123,36 +123,6 @@ class AMRDataSet:
         lo, hi = (np.asarray(c, np.int64) for c in self.domain)
         return lo * scale, hi * scale
 
-    def _refined(self, level, lo, hi):
-        """Which cells and points of the cell-index box ``[lo, hi)`` of ``level`` a
-        finer level covers: two bool arrays shaped z, y, x (``dimension`` axes)."""
-        box = np.stack([np.asarray(lo, np.int64), np.asarray(hi, np.int64)])[None]
-        return self._refined_boxes(level, box)[0]
-
-    def _refined_boxes(self, level, boxes):
-        """``_refined`` of each cell-index box of ``boxes`` (``(n, 2, 3)``), every box
-        at once: the boxes and the finer level's that meet them are found by
-        ``_meeting``, so the work is in the pairs that meet, not in every pair (a
-        loop over all the children for each box took 129 s for AMR-Wind's 6,436
-        boxes)."""
-        d = self.dimension
-        lo, hi = boxes[:, 0, :d], boxes[:, 1, :d]
-        out = [(np.zeros(tuple(int(v) for v in (b - a)[::-1]), bool),
-                np.zeros(tuple(int(v) + 1 for v in (b - a)[::-1]), bool))
-               for a, b in zip(lo, hi)]
-        if level + 1 < self.num_levels:
-            ratio = np.asarray(self.ratios[level], np.int64)[:d]
-            children = self._boxes[level + 1][:, :, :d]
-            # A cell refined: a child, coarsened, covers it.
-            clo, chi = children[:, 0] // ratio, -(-children[:, 1] // ratio)
-            for i, a, b in _cut(lo, hi, clo, chi, closed=False):
-                out[i][0][_slices(a - lo[i], b - lo[i])] = True
-            # A point refined: its location p * ratio is one of the child's points.
-            plo, phi = -(-children[:, 0] // ratio), children[:, 1] // ratio
-            for i, a, b in _cut(lo, hi, plo, phi, closed=True):
-                out[i][1][_slices(a - lo[i], b - lo[i] + 1)] = True
-        return out
-
     # -- what it holds ---------------------------------------------------
 
     @property
@@ -588,79 +558,6 @@ def _box(piece, dimension):
     lo[:n] = topology.offset
     hi[:n] = np.asarray(topology.offset) + np.asarray(topology.point_dims) - 1
     return lo, hi
-
-
-def _meeting(alo, ahi, blo, bhi, closed):
-    """Every pair ``(i, j)`` of box ``i`` of ``a`` and box ``j`` of ``b`` that meet, as
-    two arrays ordered by ``i``, then ``j``: ``[lo, hi)`` boxes sharing a cell, or
-    with ``closed``, ``[lo, hi]`` boxes sharing a point. Arrays ``(n, axes)``.
-
-    The boxes are put in bins of a lattice whose cells are the median box of ``b``,
-    and only boxes sharing a bin are tested, so the work is in the pairs that are
-    near each other. (A sweep along x tested every box of a slab through the whole
-    domain: on AMR-Wind's five levels 15.3M candidates for 0.40M pairs that meet,
-    against the bins' 0.92M.)"""
-    empty = np.zeros(0, np.int64)
-    if not len(alo) or not len(blo):
-        return empty, empty
-    alo, ahi, blo, bhi = (np.asarray(v, np.int64) for v in (alo, ahi, blo, bhi))
-    size = np.maximum(np.median(bhi - blo, axis=0).astype(np.int64), 1)
-    origin = np.minimum(alo.min(axis=0), blo.min(axis=0))
-    last = 0 if closed else 1           # a box's last cell, or with closed its last point
-
-    def binned(lo, hi):
-        first = (lo - origin) // size
-        return first, np.maximum((hi - last - origin) // size, first)
-
-    afirst, alast = binned(alo, ahi)
-    bfirst, blast = binned(blo, bhi)
-    shape = np.maximum(alast.max(axis=0), blast.max(axis=0)) + 1
-    ia, abin = _bin_entries(afirst, alast, shape)
-    jb, bbin = _bin_entries(bfirst, blast, shape)
-    order = np.argsort(bbin, kind="stable")
-    bbin, jb = bbin[order], jb[order]
-    first = np.searchsorted(bbin, abin, side="left")
-    counts = np.searchsorted(bbin, abin, side="right") - first
-    i = np.repeat(ia, counts)
-    within = np.arange(int(counts.sum())) - np.repeat(np.cumsum(counts) - counts, counts)
-    j = jb[np.repeat(first, counts) + within]
-    pairs = np.unique(i * len(blo) + j)
-    i, j = pairs // len(blo), pairs % len(blo)
-    low = np.maximum(alo[i], blo[j])
-    high = np.minimum(ahi[i], bhi[j])
-    meet = (low <= high).all(axis=1) if closed else (low < high).all(axis=1)
-    return i[meet], j[meet]
-
-
-def _bin_entries(first, last, shape):
-    """``(box, bin)`` for each bin of each box, a box covering the bins ``first`` to
-    ``last`` along each axis of a lattice of ``shape`` bins."""
-    extent = last - first + 1
-    counts = extent.prod(axis=1)
-    box = np.repeat(np.arange(len(first)), counts)
-    local = np.arange(int(counts.sum())) - np.repeat(np.cumsum(counts) - counts, counts)
-    index = np.zeros_like(local)
-    stride = 1
-    for axis in range(first.shape[1]):
-        e = extent[box, axis]
-        index += (first[box, axis] + local % e) * stride
-        local //= e
-        stride *= int(shape[axis])
-    return box, index
-
-
-def _cut(alo, ahi, blo, bhi, closed):
-    """For each pair ``_meeting`` finds, ``(i, low, high)``: box ``i`` of ``a`` and
-    where it meets the other box."""
-    i, j = _meeting(alo, ahi, blo, bhi, closed)
-    low = np.maximum(alo[i], blo[j])
-    high = np.minimum(ahi[i], bhi[j])
-    return zip(i.tolist(), low, high)
-
-
-def _slices(a, b):
-    """Index slices of an array shaped z, y, x for ``[a, b)`` given x first."""
-    return tuple(slice(int(s), int(e)) for s, e in zip(a[::-1], b[::-1]))
 
 
 def _lattice(piece, dimension):
