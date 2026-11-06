@@ -10,7 +10,7 @@ import os
 
 import numpy as np
 import pytest
-from test_amr import SPACING, _SecondCPU, hierarchy, needs_vtk
+from test_amr import SPACING, _SecondCPU, amr_of, hierarchy, needs_vtk
 
 import tack
 import tack.dataset as td
@@ -89,9 +89,9 @@ def test_a_probe_onto_an_image_resamples_as_vtk_does():
 def test_ghosts_and_probes_on_two_devices():
     second = dispatch.as_device(_SecondCPU())
     amr = hierarchy()
-    moved = td.AMRDataSet([[box.to_device(second) if k % 2 else box
-                            for k, box in enumerate(level)] for level in
-                           (list(lv) for lv in amr.levels)], amr.ratios)
+    moved = amr_of([[box.to_device(second) if k % 2 else box
+                     for k, box in enumerate(level)] for level in
+                    (list(lv) for lv in amr.levels)], amr.ratios)
     for (_, a), (_, b) in zip(td.ghost_cells(moved), td.ghost_cells(amr)):
         assert a.device == a.fields["c"].values.device
         for name in ("c", "p"):

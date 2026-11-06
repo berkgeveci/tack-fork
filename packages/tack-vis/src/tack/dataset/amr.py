@@ -31,6 +31,8 @@ The boxes of every rank are gathered when the hierarchy is made
 so the marks need no other communication.
 """
 
+import itertools
+
 import numpy as np
 
 from tack.dataset.dataset import DataSet
@@ -303,7 +305,7 @@ class AMRDataSet:
                 lower[k].append((a, b))
         cleared_cells = 0xFF & ~Ghosts.REFINEDCELL
         cleared_points = 0xFF & ~(Ghosts.REFINEDPOINT | Ghosts.DUPLICATEPOINT)
-        out = []
+        marked = []
         for k, piece in enumerate(pieces):
             refined_cells, refined_points = refined[k]
             cells = refined_cells.astype(np.uint8) * np.uint8(Ghosts.REFINEDCELL)
@@ -315,12 +317,88 @@ class AMRDataSet:
                 cells |= (marks.cells.numpy() & cleared_cells).reshape(cells.shape)
             if marks is not None and marks.points is not None:
                 points |= (marks.points.numpy() & cleared_points).reshape(points.shape)
-            with piece.device:
-                ghosts = Ghosts(cells=cells.reshape(-1), points=points.reshape(-1))
-            out.append(DataSet(piece.topology, piece.geometry, fields=dict(piece.fields),
-                               sets=dict(piece.sets), dtype=piece.dtype, ghosts=ghosts,
-                               global_ids=piece.global_ids, **piece._frame()))
-        return out
+            marked.append((cells.reshape(-1), points.reshape(-1)))
+        # The level's marks of each kind in one array per device, each box's a view
+        # of it: one upload a level, and one buffer for algorithms over the level.
+        ghosts = [None] * len(pieces)
+        for device, ks in _by_device(pieces):
+            with device:
+                cells = _level_views(np.concatenate([marked[k][0] for k in ks]),
+                                     [marked[k][0].size for k in ks])
+                points = _level_views(np.concatenate([marked[k][1] for k in ks]),
+                                      [marked[k][1].size for k in ks])
+            for k, c, p in zip(ks, cells, points):
+                ghosts[k] = Ghosts(cells=c, points=p)
+        return [DataSet(piece.topology, piece.geometry, fields=dict(piece.fields),
+                        sets=dict(piece.sets), dtype=piece.dtype, ghosts=ghosts[k],
+                        global_ids=piece.global_ids, **piece._frame())
+                for k, piece in enumerate(pieces)]
+
+
+def _by_device(pieces):
+    """``[(device, [k, ...])]``: the indices of ``pieces`` on each device, in order."""
+    groups = []
+    for k, piece in enumerate(pieces):
+        device = piece.device
+        for d, ks in groups:
+            if d == device:
+                ks.append(k)
+                break
+        else:
+            groups.append((device, [k]))
+    return groups
+
+
+def _level_views(host, sizes):
+    """``host`` (the boxes' values end to end) as one array on the current device,
+    and each box's ``sizes`` entries of it as a view, in order."""
+    import tack
+
+    level = tack.array(host)
+    starts = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+    return [level[int(a):int(b)] for a, b in itertools.pairwise(starts)]
+
+
+def in_level_buffers(levels):
+    """Put each level's fields in one array per device, in place: each box's
+    values become a view (``array[i:j]``) of its level's array, the boxes end to
+    end in order. One copy now, and algorithms that work a level at a time
+    (reductions, ghost fills) take the level's values without another; the
+    marks ``AMRDataSet`` makes are kept the same way (``_marked``). A field is
+    taken where every box on the device has it, at the same place among its
+    fields, in one kind of space, as a stored array of one element type; any
+    other is left as it is. ``levels`` are lists of ``DataSet``s, as
+    ``AMRDataSet`` takes them; returned for chaining."""
+    import tack
+    from tack.dataset.dataset import _same_space
+    from tack.lang.array import Array
+
+    for pieces in levels:
+        for device, ks in _by_device(pieces):
+            boxes = [pieces[k] for k in ks]
+            entries = [box.fields.entries() for box in boxes]
+            for i, (name, first) in enumerate(entries[0]):
+                fields = []
+                for listed in entries:
+                    if i >= len(listed):
+                        break
+                    other_name, field = listed[i]
+                    values = field.values
+                    if (other_name != name or not _same_space(field.space, first.space)
+                            or type(values) is not Array or values.ndim != 1
+                            or values.dtype != first.values.dtype):
+                        break
+                    fields.append(field)
+                if len(fields) != len(boxes):
+                    continue
+                with device:
+                    level = tack.concat([f.values for f in fields])
+                start = 0
+                for field in fields:
+                    n = field.values.shape[0]
+                    field.values = level[start:start + n]
+                    start += n
+    return levels
 
 
 def _box(piece, dimension):

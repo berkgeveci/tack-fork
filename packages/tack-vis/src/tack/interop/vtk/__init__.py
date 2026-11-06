@@ -1750,6 +1750,7 @@ def _amr_to_dataset(amr, options, world=None):
     VTK's by default)."""
     from tack.communication import World
     from tack.dataset import AMRDataSet, StructuredTopology
+    from tack.dataset.amr import in_level_buffers
     from tack.interop.vtk import world as vtk_world
 
     if world is None:
@@ -1784,6 +1785,11 @@ def _amr_to_dataset(amr, options, world=None):
         levels.append(boxes)
         if level + 1 < amr.GetNumberOfLevels():
             ratios.append(int(amr.GetRefinementRatio(level)))
+    if options.get("copy", True):
+        # Copied anyway: copied into one array a level, each box's values a view of
+        # it, the form algorithms that work a level at a time take as it is. Shared
+        # memory (copy=False) stays VTK's, a box at a time.
+        in_level_buffers(levels)
     return AMRDataSet(levels, ratios, world=world)
 
 

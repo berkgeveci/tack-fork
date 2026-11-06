@@ -20,6 +20,7 @@ import pytest
 import tack
 import tack.dataset as td
 from tack.dataset import Ghosts
+from tack.dataset.amr import in_level_buffers
 from tack.runtime import dispatch
 from tack.runtime.cpu import CPUBackend
 from tack.runtime.dispatch import env_flag
@@ -73,6 +74,13 @@ def image(lo, cells, spacing, origin=(0.0, 0.0, 0.0), values=None):
     return box
 
 
+def amr_of(levels, ratios=(), **kwargs):
+    """``td.AMRDataSet`` of ``levels`` with each level's fields in one array, each
+    box's values a view of it, as ``vtk_to_dataset`` and the sources give a
+    hierarchy: every algorithm here is tested on that form."""
+    return td.AMRDataSet(in_level_buffers(levels), ratios, **kwargs)
+
+
 def hierarchy(kind="image", d=2):
     """Three levels in 2D (or 3D): a root of two abutting boxes, three level-1 boxes
     (two abutting, one across the root boxes' seam), and a level-2 box; as
@@ -88,8 +96,8 @@ def hierarchy(kind="image", d=2):
     spacings = [1.0, 0.5, 0.25]
     boxes = [[image(lo, cells, h) for lo, cells in level] for level, h in zip(levels, spacings)]
     if kind == "image":
-        return td.AMRDataSet(boxes, ratios=[2, 2])
-    return td.AMRDataSet([[_as(kind, box) for box in level] for level in boxes], ratios=[2, 2])
+        return amr_of(boxes, ratios=[2, 2])
+    return amr_of([[_as(kind, box) for box in level] for level in boxes], ratios=[2, 2])
 
 
 def _as(kind, box):
@@ -216,7 +224,7 @@ def test_marks_already_given_are_recomputed_and_others_kept():
     cells[0] |= Ghosts.HIDDENCELL
     cells[1] |= Ghosts.REFINEDCELL          # stale: recomputed away
     first.ghosts = Ghosts(cells=cells, points=first.ghosts.points.numpy())
-    again = td.AMRDataSet([list(amr.levels[0]), *map(list, amr.levels[1:])], amr.ratios)
+    again = amr_of([list(amr.levels[0]), *map(list, amr.levels[1:])], amr.ratios)
     got = again.levels[0][0].ghosts.cells.numpy()
     assert got[0] & Ghosts.HIDDENCELL
     assert not got[1] & Ghosts.REFINEDCELL
@@ -238,13 +246,13 @@ def test_hierarchies_that_vtks_model_cannot_hold_are_refused():
         td.AMRDataSet([[image((0, 0), (4, 4), 1.0)], [image((0, 0, 0), (2, 2, 2), 0.5)]], [2])
     with pytest.raises(ValueError, match="axis-aligned"):
         turned = td.uniform_grid((5, 5), direction=[[0.0, -1.0], [1.0, 0.0]])
-        td.AMRDataSet([[turned]])
+        amr_of([[turned]])
     with pytest.raises(ValueError, match="ghost cells"):
         td.AMRDataSet([list(td.split(td.uniform_grid((9, 9)), 2, ghost_layers=1))])
     with pytest.raises(TypeError, match="StructuredTopology"):
         td.AMRDataSet([[td.point_cloud(np.zeros((3, 3)))]])
     # Anisotropic ratios are Tack's: VTK's AMR takes one per level.
-    flat = td.AMRDataSet([[image((0, 0), (4, 4), 1.0)],
+    flat = amr_of([[image((0, 0), (4, 4), 1.0)],
                           [image((2, 0), (2, 4), 0.5).rebased((0.0, 0.0, 0.0))]], [(2, 1)])
     assert flat.ratios == ((2, 1, 1),)
 
@@ -267,7 +275,7 @@ def test_filters_leave_refined_cells_out():
 def test_boxes_on_two_devices():
     second = dispatch.as_device(_SecondCPU())
     amr = hierarchy()
-    moved = td.AMRDataSet([[box.to_device(second) if k % 2 else box
+    moved = amr_of([[box.to_device(second) if k % 2 else box
                             for k, box in enumerate(level)] for level in
                            (list(lv) for lv in amr.levels)], amr.ratios)
     for (_, a), (_, b) in zip(moved, amr):
@@ -349,9 +357,9 @@ def test_ghosts_nothing_holds_are_hidden(kind):
     root = [image((0, 0), (4, 4), 1.0), image((4, 0), (4, 4), 1.0),
             image((0, 4), (4, 4), 1.0)]
     fine = [image((6, 2), (2, 4), 0.5)]
-    amr = td.AMRDataSet([root, fine], [2])
+    amr = amr_of([root, fine], [2])
     if kind == "curvilinear":
-        amr = td.AMRDataSet([[_as(kind, b) for b in level] for level in
+        amr = amr_of([[_as(kind, b) for b in level] for level in
                              ([*amr.levels[0]], [*amr.levels[1]])], [2])
     grown = td.ghost_cells(amr)
     second = grown.levels[0][1]                     # grows up into the notch at x 4..8
@@ -429,7 +437,7 @@ def test_ghost_geometry_is_interpolated_in_the_coarse_cells(kind):
         out.fields["p"] = td.Field(td.H1(out), tack.array(out.positions()[:, 1]))
         return out
 
-    amr = td.AMRDataSet([[box((0, 0), (8, 8), 1)], [box((4, 4), (6, 6), 2)]], [2])
+    amr = amr_of([[box((0, 0), (8, 8), 1)], [box((4, 4), (6, 6), 2)]], [2])
     fine = td.ghost_cells(amr).levels[1][0]
     lo = np.asarray(fine.topology.offset)
     dims = fine.topology.point_dims
@@ -469,7 +477,7 @@ def _many_boxes():
               for j in range(0, 16, 4) for i in range(0, 16, 4)]
     fine = [image((i, j, k), (4, 4, 4), 0.5) for k in range(4, 12, 4)
             for j in range(8, 24, 4) for i in range(8, 24, 4)]
-    return td.AMRDataSet([coarse, fine], ratios=[2])
+    return amr_of([coarse, fine], ratios=[2])
 
 
 def test_ghost_cells_of_many_boxes_are_exact_for_linear_fields():
@@ -510,7 +518,7 @@ def across(world):
         mine.append([_unmarked(boxes[i]) for i in chosen])
         keys.append(chosen)
     # Boxes are numbered by rank, then in order: map ours back to the whole's.
-    amr = td.AMRDataSet(mine, [2, 2], world=world)
+    amr = amr_of(mine, [2, 2], world=world)
     out = {}
     for level, boxes in enumerate(amr.levels):
         for box, whole in zip(boxes, keys[level]):
@@ -530,3 +538,50 @@ def across(world):
 
 def _unmarked(box):
     return td.DataSet(box.topology, box.geometry.values, fields=dict(box.fields))
+
+
+# -- the single-array form (a level's values in one array, the boxes views) ---------
+
+def _is_view_of_one(arrays):
+    """Whether every array is a view of one root buffer, end to end in order."""
+    roots = {id(getattr(a._buffer, "_root", None)) for a in arrays}
+    starts = [a._buffer._start for a in arrays]
+    return (None not in [getattr(a._buffer, "_root", None) for a in arrays]
+            and len(roots) == 1 and starts == sorted(starts))
+
+
+def test_levels_are_one_array_each():
+    """The marks a hierarchy makes, and the fields ``in_level_buffers`` (the VTK
+    adapter, the sources, this file's ``amr_of``) puts in, are views of one array
+    a level, so algorithms that work a level at a time take them as they are."""
+    for amr in (hierarchy(), td.amr_gaussian_pulse()):
+        for boxes in amr.levels:
+            boxes = list(boxes)
+            assert _is_view_of_one([b.ghosts.cells for b in boxes])
+            assert _is_view_of_one([b.ghosts.points for b in boxes])
+            for name in [n for n, _ in boxes[0].fields.entries()]:
+                assert _is_view_of_one([b.fields[name].values for b in boxes]), name
+
+
+def test_writes_to_a_box_reach_its_level_array():
+    amr = hierarchy()
+    first, second = list(amr.levels[1])[:2]
+    before = second.fields["c"].values.numpy()
+    first.fields["c"].values.fill(-1.0)
+    np.testing.assert_array_equal(second.fields["c"].values.numpy(), before)
+    level = first.fields["c"].values._buffer._root
+    n = first.fields["c"].values.shape[0]
+    assert (level.to_numpy()[:n] == -1.0).all()
+
+
+@needs_vtk
+def test_vtk_to_dataset_gives_the_single_array_form():
+    amr = td.amr_gaussian_pulse()
+    from tack.interop.vtk import dataset_to_vtk, vtk_to_dataset
+    back = vtk_to_dataset(dataset_to_vtk(amr))
+    for boxes in back.levels:
+        boxes = list(boxes)
+        assert _is_view_of_one([b.fields["Gaussian-Pulse"].values for b in boxes])
+    shared = vtk_to_dataset(dataset_to_vtk(amr), copy=False)
+    assert all(getattr(b.fields["Gaussian-Pulse"].values._buffer, "_root", None) is None
+               for _, b in shared)

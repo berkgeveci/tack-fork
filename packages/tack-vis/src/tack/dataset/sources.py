@@ -152,7 +152,11 @@ def amr_gaussian_pulse(dimension=3, root_spacing=0.5, refinement_ratio=2,
         lo = np.array([a for a, _ in patch])
         points = [r * (b - a) + 1 for a, b in patch]
         fine.append(box(points, h / r, origin + lo * h, lo * r))
-    return AMRDataSet([[root], fine], ratios=[r])
+    from tack.dataset.amr import in_level_buffers
+
+    # Each level's values in one array, each box's a view, as vtk_to_dataset
+    # gives a hierarchy.
+    return AMRDataSet(in_level_buffers([[root], fine]), ratios=[r])
 
 
 def _cell_centres(dims, corner, spacing):
