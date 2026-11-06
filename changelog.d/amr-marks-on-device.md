@@ -9,3 +9,9 @@
   too, one array a device as the constructor's, instead of on the host box by
   box: on AMR-Wind's five levels the marks went from 2.2 to 0.5 s and
   `ghost_cells` from 11.5 to 9.0 s, the marks bit for bit the same.
+- `ghost_cells` and `average_down` of an `AMRDataSet` keep their fills' rows
+  (targets, sources, weights) on the device, compacted there, instead of
+  reading them back and assembling them in NumPy; only sources another device
+  or rank holds come to the host, to make the exchange. On AMR-Wind's five
+  levels `ghost_cells` went from 9.0 to 5.8 s, the values bit for bit the
+  same.

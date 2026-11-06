@@ -705,3 +705,39 @@ def test_fills_in_place_are_the_copying_fills(kind):
         for (_, a), (_, b) in zip(views, copies):
             np.testing.assert_array_equal(a.fields[name].values.numpy(),
                                           b.fields[name].values.numpy())
+
+
+@pytest.mark.parametrize("kind", ["image", "curvilinear"])
+def test_ghost_cells_and_averages_on_two_devices_are_one_devices(kind):
+    """Every other box on a simulated second device: each device's boxes a group
+    whose ghosts the other group's boxes fill, staged across by ``_Fill``'s plan
+    (its remote sources, the only rows that come to the host). The grown marks
+    and values, ``update_ghosts`` and ``average_down`` are one device's, bit for
+    bit."""
+    second = dispatch.as_device(_SecondCPU())
+    one = amr_of(_three_levels(kind), [2, 2])
+    two = amr_of([[b.to_device(second) if k % 2 else b for k, b in enumerate(level)]
+                  for level in _three_levels(kind)], [2, 2])
+    grown_one, grown_two = td.ghost_cells(one), td.ghost_cells(two)
+    assert any(box.device == second for _, box in grown_two)
+    assert all(any(group["m"] for group in grown_two._fills[what].boxes.values())
+               for what in ("cells", "points"))      # sources staged across
+
+    def same(a_amr, b_amr, names):
+        for (_, a), (_, b) in zip(a_amr, b_amr):
+            np.testing.assert_array_equal(a.ghosts.cells.numpy(), b.ghosts.cells.numpy())
+            np.testing.assert_array_equal(a.ghosts.points.numpy(), b.ghosts.points.numpy())
+            for name in names:
+                np.testing.assert_array_equal(a.fields[name].values.numpy(),
+                                              b.fields[name].values.numpy())
+
+    same(grown_one, grown_two, ("c", "p"))
+    for amr in (grown_one, grown_two):
+        for _, box in amr:
+            box.fields["c"].values.fill(7.0)
+        td.update_ghosts(amr, "c")
+    same(grown_one, grown_two, ("c",))
+    for name in ("c", "p"):
+        td.average_down(one, name)
+        td.average_down(two, name)
+    same(one, two, ("c", "p"))
