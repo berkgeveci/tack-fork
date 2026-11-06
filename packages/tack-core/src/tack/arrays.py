@@ -361,6 +361,19 @@ def _three(values, fill, what):
     return values + (fill,) * (3 - len(values))
 
 
+def _identity(dtype, device):
+    """A 3 x 3 identity of ``dtype`` on ``device``, one a type and device: an
+    unoriented image's ``direction``. Kept on the backend, so it goes with it."""
+    from tack.runtime.dispatch import as_device, backend_of
+
+    backend = backend_of(device)
+    kept = backend.__dict__.setdefault("_tack_identities", {})
+    found = kept.get(dtype)
+    if found is None:
+        found = kept[dtype] = _store(np.eye(3).reshape(-1), dtype, as_device(backend))
+    return found
+
+
 @tack.device_class
 class UniformCoordinates(_Implicit):
     """The points of an image: ``origin + direction @ ((i, j, k) * spacing)`` at index
@@ -398,8 +411,11 @@ class UniformCoordinates(_Implicit):
         if direction is not None and not np.allclose(matrix, np.eye(3)):
             self.ORIENTED = 1
         # Always present, so an f64 grid's scalars are f64 in the kernel; it
-        # puts the grid on ``device`` (by default the default device).
-        self.direction = _store(matrix.reshape(-1), dtype, device)
+        # puts the grid on ``device`` (by default the default device). An image
+        # without a direction shares one identity of its type on its device: no
+        # kernel writes it, and an AMR hierarchy has an image a box.
+        self.direction = (_store(matrix.reshape(-1), dtype, device) if self.ORIENTED
+                          else _identity(dtype, device))
         self._origin, self._spacing, self._matrix = origin, spacing, matrix
         _metadata(self, math.prod(dims), 3, dtype)
 

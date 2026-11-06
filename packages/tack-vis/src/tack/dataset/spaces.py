@@ -116,8 +116,14 @@ class Space:
         # one per array object, which it keeps alive, so its id stays unique.
         key = (cls, tuple(sorted((k, ("array", id(v)) if _is_array(v) else v)
                                  for k, v in params.items())))
-        interned = topology.__dict__.setdefault("_spaces", weakref.WeakValueDictionary())
-        space = interned.get(key)
+        # Weak references in a plain dict: a WeakValueDictionary costs 20 us to make,
+        # once a topology, and an AMR hierarchy has a topology a box. A dead entry
+        # stays until its key is asked for again; a topology has a few.
+        interned = topology.__dict__.get("_spaces")
+        if interned is None:
+            interned = topology.__dict__["_spaces"] = {}
+        found = interned.get(key)
+        space = None if found is None else found()
         if space is None:
             space = super().__new__(cls)
             space.topology = topology
@@ -127,7 +133,7 @@ class Space:
                 # layout, whose "auto" depends on the device).
                 if not isinstance(getattr(cls, name, None), property):
                     setattr(space, name, value)
-            interned[key] = space
+            interned[key] = weakref.ref(space)
         return space
 
     @classmethod

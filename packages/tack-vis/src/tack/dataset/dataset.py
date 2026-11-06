@@ -833,7 +833,9 @@ class DataSet:
         held = [parts.get("topology")]
         if parts.get("_geometry") is not None:
             held.append(parts["_geometry"].values)
-        held.extend(field.values for field in parts.get("_fields", {}).values())
+        fields = parts.get("_fields")
+        if fields is not None:              # its entries: by name, each is a search
+            held.extend(field.values for _, field in fields._entries)
         held.extend(s.ids for s in (parts.get("_sets") or {}).values())
         held.append(parts.get("_ghosts"))
         held.append(parts.get("_global_ids"))
