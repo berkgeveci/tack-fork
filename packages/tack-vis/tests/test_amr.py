@@ -741,3 +741,23 @@ def test_ghost_cells_and_averages_on_two_devices_are_one_devices(kind):
         td.average_down(one, name)
         td.average_down(two, name)
     same(one, two, ("c", "p"))
+
+
+@pytest.mark.parametrize("kind", ["image", "curvilinear"])
+@pytest.mark.parametrize("d", [2, 3])
+def test_rows_meeting_more_boxes_than_they_keep_search_entry_by_entry(kind, d, monkeypatch):
+    """``ghost_cells``' source kernels find the siblings meeting a row of a box's
+    shell once (``row_boxes``), and a row meeting more than they keep
+    (``_row_most``) searches the bins entry by entry. Keeping none, every row that
+    meets a sibling does: the same grown hierarchy, bit for bit."""
+    from tack.dataset.algorithms import amr_ghosts
+
+    kept = td.ghost_cells(hierarchy(kind, d))
+    monkeypatch.setattr(amr_ghosts, "_row_most", 0)
+    searched = td.ghost_cells(hierarchy(kind, d))
+    for (_, a), (_, b) in zip(kept, searched):
+        np.testing.assert_array_equal(a.ghosts.cells.numpy(), b.ghosts.cells.numpy())
+        np.testing.assert_array_equal(a.ghosts.points.numpy(), b.ghosts.points.numpy())
+        for name in a.fields:
+            np.testing.assert_array_equal(a.fields[name].values.numpy(),
+                                          b.fields[name].values.numpy())

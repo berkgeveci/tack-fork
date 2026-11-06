@@ -19,3 +19,8 @@
   grown arrays by one launch where they are views of one array (as
   `vtk_to_dataset` makes them), not one launch a box: on AMR-Wind's five
   levels 1.3 to 0.09 s, `ghost_cells` 5.8 to 4.4 s.
+- `ghost_cells` of an `AMRDataSet` finds its ghosts' sources a row of a box's
+  shell at a time, the siblings meeting the row found once, instead of
+  decoding and searching for every entry: on AMR-Wind's five levels the
+  kernels went from 2.3 to 0.8 s and `ghost_cells` from 4.4 to 3.0 s, the
+  sources the same, entry for entry.

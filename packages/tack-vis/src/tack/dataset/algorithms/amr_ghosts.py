@@ -384,6 +384,64 @@ class _LevelBoxes:
         return found
 
     @tack.func
+    def row_boxes(self, q1, q2, x0, x1, closed, skip, most, found):
+        """The boxes other than ``skip`` that hold ``(q1, q2)`` along y and z
+        (``[lo, hi)``, or ``[lo, hi]`` closed) and meet ``[x0, x1]`` along x, in
+        ``found`` in increasing order, from the bins the row crosses: their number,
+        or -1 where there are more than ``most`` (at most ``found``'s size)."""
+        count = 0 * q1
+        b1 = (q1 - self.origin[1]) // self.size[1] if self.d > 1 else 0 * q1
+        b2 = (q2 - self.origin[2]) // self.size[2] if self.d > 2 else 0 * q2
+        first = max((x0 - self.origin[0]) // self.size[0], 0)
+        last = min((x1 - self.origin[0]) // self.size[0], self.dims[0] - 1)
+        if b1 >= 0 and b2 >= 0 and b1 < self.dims[1] and b2 < self.dims[2]:
+            for b0 in range(first, last + 1):
+                b = b0 + self.dims[0] * (b1 + self.dims[1] * b2)
+                for m in range(self.offsets[b], self.offsets[b + 1]):
+                    j = self.ids[m]
+                    meets = 1 if j != skip and count >= 0 else 0
+                    if meets == 1 and (self.lo[3 * j] > x1 or self.hi[3 * j] < x0
+                                       or (closed == 0 and self.hi[3 * j] == x0)):
+                        meets = 0
+                    for a in range(1, self.d):
+                        q = q1 if a == 1 else q2
+                        if meets == 1 and (q < self.lo[3 * j + a] or q > self.hi[3 * j + a]
+                                           or (closed == 0 and q == self.hi[3 * j + a])):
+                            meets = 0
+                    at = count
+                    if meets == 1:
+                        # In order, once: a box is in every bin it reaches.
+                        while at > 0 and found[at - 1] > j:
+                            at -= 1
+                        if at > 0 and found[at - 1] == j:
+                            meets = 0
+                    if meets == 1:
+                        if count == most:
+                            count = -1
+                        else:
+                            k = count
+                            while k > at:
+                                found[k] = found[k - 1]
+                                k -= 1
+                            found[at] = j
+                            count += 1
+        return count
+
+    @tack.func
+    def pick(self, found, count, q0, closed):
+        """The first of ``found`` (``count`` of them, `row_boxes`') whose x extent
+        holds ``q0``, or -1."""
+        s = -1 + 0 * q0
+        m = 0 * q0
+        while m < count and s < 0:
+            j = found[m]
+            if q0 >= self.lo[3 * j] and (q0 < self.hi[3 * j]
+                                         or (closed == 1 and q0 == self.hi[3 * j])):
+                s = j
+            m += 1
+        return s
+
+    @tack.func
     def find_scaled(self, q0, q1, q2, r0, r1, r2):
         """The lowest box that holds ``q / r`` (a finer level's point), closed, or -1."""
         found = -1
@@ -456,7 +514,7 @@ def _index(same, j, r, points, use_box):
 
 @tack.func
 def _hole(same, j, a, points):
-    """Axis ``a`` of box ``j``'s grown extent, for ``_shell_index``: its size, and the
+    """Axis ``a`` of box ``j``'s grown extent, for ``_row_of``: its size, and the
     start and size of the hole in it, the entries a sibling never holds (the box's
     own cells, or its own points off its boundary); an axis the boxes lack is one
     entry, inside the hole."""
@@ -473,62 +531,8 @@ def _hole(same, j, a, points):
     return n, start, size
 
 
-@tack.func
-def _shell_index(same, j, r, points):
-    """Entry ``r`` of box ``j``'s shell: its grown extent less the hole (``_hole``),
-    x fastest, as ``(q0, q1, q2)``. Slabs of z before the hole, through it and
-    after it, and in a slab through it rows of y alike, so the hole's entries are
-    never enumerated."""
-    nx, ax, hx = _hole(same, j, 0, points)
-    ny, ay, hy = _hole(same, j, 1, points)
-    nz, az, hz = _hole(same, j, 2, points)
-    if hx <= 0 or hy <= 0 or hz <= 0:       # no hole
-        hx = 0 * hx
-        hy = 0 * hy
-        hz = 0 * hz
-        ax = 0 * ax
-        ay = 0 * ay
-        az = nz
-    slab = nx * ny
-    holed = slab - hx * hy
-    z = 0 * r
-    rest = r
-    full = 1
-    if r < az * slab:
-        z = r // slab
-        rest = r - z * slab
-    elif r < az * slab + hz * holed:
-        k = r - az * slab
-        z = az + k // holed
-        rest = k - (z - az) * holed
-        full = 0
-    else:
-        k = r - az * slab - hz * holed
-        z = az + hz + k // slab
-        rest = k - (z - az - hz) * slab
-    y = 0 * r
-    x = 0 * r
-    if full == 1:
-        y = rest // nx
-        x = rest - y * nx
-    elif rest < ay * nx:
-        y = rest // nx
-        x = rest - y * nx
-    elif rest < ay * nx + hy * (nx - hx):
-        m = rest - ay * nx
-        y = ay + m // (nx - hx)
-        x = m - (y - ay) * (nx - hx)
-        if x >= ax:
-            x = x + hx
-    else:
-        m = rest - ay * nx - hy * (nx - hx)
-        y = ay + hy + m // nx
-        x = m - (y - ay - hy) * nx
-    return same.elo[3 * j] + x, same.elo[3 * j + 1] + y, same.elo[3 * j + 2] + z
-
-
 def _shell_sizes(boxes, extents, d, points):
-    """Each box's shell entries (``_shell_index``): its grown extent's cells or points
+    """Each box's shell entries (``_row_of``): its grown extent's cells or points
     less the hole."""
     lo, hi = boxes[:, 0, :d], boxes[:, 1, :d]
     full = np.prod(extents[:, 1, :d] - extents[:, 0, :d] + points, axis=1)
@@ -536,114 +540,203 @@ def _shell_sizes(boxes, extents, d, points):
     return full - hole
 
 
-@tack.kernel
-def _ghost_cells_of(same, coarse, has_coarse, r0, r1, r2, ids, offsets, n, targets, groups,
-                    places):
-    # Each entry of the boxes' shells (``_shell_index``): a ghost cell's target place and its one
-    # source, a sibling's (the lowest holding it) else the coarse cell's; -1 targets
-    # for the boxes' own cells, -1 groups for ghosts nothing holds (hidden).
-    for e in range(targets.shape[0]):
-        b = _entry(offsets, n, e)
-        j = ids[b]
-        q0, q1, q2 = _shell_index(same, j, e - offsets[b], 0)
-        target = -1
-        group = -1
-        place = 0 * j
-        if same.holds(j, q0, q1, q2, 0) == 0:
-            target = same.place(j, q0, q1, q2, 0)
-            s = same.find(q0, q1, q2, 0, j, same.ids.shape[0] + same.lo.shape[0])
-            if s >= 0:
-                group = same.group[s]
-                place = same.place(s, q0, q1, q2, 0)
-            elif has_coarse == 1:
-                c0 = q0 // r0
-                c1 = q1 // r1
-                c2 = q2 // r2
-                t = coarse.find(c0, c1, c2, 0, -1, coarse.ids.shape[0] + coarse.lo.shape[0])
-                if t >= 0:
-                    group = coarse.group[t]
-                    place = coarse.place(t, c0, c1, c2, 0)
-        targets[e] = target
-        groups[e] = group
-        places[e] = place
+_ROW_MOST = tack.constant(32)
+# The boxes a row keeps (at most _ROW_MOST): a launch's argument, so a test can make
+# rows overflow onto the per-entry search.
+_row_most = int(_ROW_MOST)
+
+
+@tack.func
+def _row_of(same, ids, row_starts, n, r, points):
+    """Row ``r`` (along x) of the boxes' grown extents, box ``b``'s rows from
+    ``row_starts[b]``: its box ``j``, its ``(q1, q2)``, its extent along x and
+    where the hole (``_hole``) starts in it and its size there (0 where the row
+    misses the hole)."""
+    b = _entry(row_starts, n, r)
+    j = ids[b]
+    local = r - row_starts[b]
+    nx, ax, hx = _hole(same, j, 0, points)
+    ny, ay, hy = _hole(same, j, 1, points)
+    nz, az, hz = _hole(same, j, 2, points)
+    y = local % ny
+    z = local // ny
+    skip = 0 * hx
+    if hx > 0 and hy > 0 and hz > 0 and y >= ay and y < ay + hy and z >= az and z < az + hz:
+        skip = hx
+    return j, same.elo[3 * j + 1] + y, same.elo[3 * j + 2] + z, nx, ax, skip
 
 
 @tack.kernel
-def _ghost_points_of(same, coarse, has_coarse, r0, r1, r2, den, scale, ids, offsets, n, write,
-                     starts, counts, targets, groups, places, weights):
-    # Each point of the boxes' shells (``_shell_index``): its sources' count (-1 not a target, 0
-    # hidden) and, with ``write``, the sources at ``starts``. A ghost point is a
-    # sibling's (the lowest holding it), else interpolated in the coarse cell
-    # holding it by its corners' owners (the lowest coarse box holding each); an
-    # own point a lower sibling also holds is that sibling's. Weights are integer
-    # numerators over ``den`` (the ratios' product) times ``scale``, so a group's
-    # levels share one denominator and no device needs f64.
-    for e in range(counts.shape[0]):
-        b = _entry(offsets, n, e)
-        j = ids[b]
-        q0, q1, q2 = _shell_index(same, j, e - offsets[b], 1)
+def _shell_rows(same, ids, row_starts, n, points, sizes):
+    # Each row's entries in the boxes' shells: its extent less the hole.
+    for r in range(sizes.shape[0]):
+        j, q1, q2, nx, ax, skip = _row_of(same, ids, row_starts, n, r, points)
+        sizes[r] = nx - skip
+
+
+def _shell_layout(same, ids, extents, d, points, device):
+    """The rows of boxes ``ids``' shells (``_hole``): each box's first row (host
+    and device) and, on the device, each row's first entry, x fastest, in the
+    order the shells were enumerated entry by entry."""
+    spans = np.ones((len(ids), 3), np.int64)
+    spans[:, :d] = extents[:, 1, :d] - extents[:, 0, :d] + points
+    row_starts = np.concatenate([[0], np.cumsum(spans[:, 1] * spans[:, 2])]).astype(np.int64)
+    rows = int(row_starts[-1])
+    with device:
+        row_starts_d = tack.array(row_starts, tack.i64)
+        entries = tack.empty((rows + 1,), tack.i64)
+        _shell_rows(same, tack.array(ids, tack.i64), row_starts_d, len(ids), points, entries[:rows])
+        exclusive_scan(entries, entries, rows, close=True, total=False)
+    return rows, row_starts_d, entries
+
+
+@tack.kernel
+def _ghost_cells_of(same, coarse, has_coarse, r0, r1, r2, ids, row_starts, n, rows,
+                    entry_starts, most, targets, groups, places):
+    # One thread a row (along x) of the boxes' shells (`_row_of`): each entry a
+    # ghost cell's target place and its one source, a sibling's (the lowest
+    # holding it) else the coarse cell's; -1 targets for the boxes' own cells, -1
+    # groups for ghosts nothing holds (hidden). The siblings meeting the row are
+    # found once (`row_boxes`), so an entry only scans them; per entry, decoding
+    # and the bins' search were 0.5 s of AMR-Wind's 47M shell cells.
+    for r in range(rows):
+        j, q1, q2, nx, ax, skip = _row_of(same, ids, row_starts, n, r, 0)
+        x0 = same.elo[3 * j]
         big = same.ids.shape[0] + same.lo.shape[0]
-        count = -1
-        at = starts[e] if write == 1 else 0 * e
-        if same.holds(j, q0, q1, q2, 1) == 1:
-            s = same.find(q0, q1, q2, 1, j, j)
-            if s >= 0:
-                count = 1
+        found = tack.local_array(tack.i64, _ROW_MOST)
+        count = same.row_boxes(q1, q2, x0, x0 + nx - 1, 0, j, most, found)
+        e = entry_starts[r]
+        for x in range(nx):
+            if skip == 0 or x < ax or x >= ax + skip:
+                q0 = x0 + x
+                target = -1
+                group = -1
+                place = 0 * j
+                if same.holds(j, q0, q1, q2, 0) == 0:
+                    target = same.place(j, q0, q1, q2, 0)
+                    s = same.pick(found, count, q0, 0)
+                    if count < 0:
+                        s = same.find(q0, q1, q2, 0, j, big)
+                    if s >= 0:
+                        group = same.group[s]
+                        place = same.place(s, q0, q1, q2, 0)
+                    elif has_coarse == 1:
+                        c0 = q0 // r0
+                        c1 = q1 // r1
+                        c2 = q2 // r2
+                        t = coarse.find(c0, c1, c2, 0, -1,
+                                        coarse.ids.shape[0] + coarse.lo.shape[0])
+                        if t >= 0:
+                            group = coarse.group[t]
+                            place = coarse.place(t, c0, c1, c2, 0)
+                targets[e] = target
+                groups[e] = group
+                places[e] = place
+                e += 1
+
+
+@tack.kernel
+def _ghost_points_of(same, coarse, has_coarse, r0, r1, r2, den, scale, ids, row_starts, n,
+                     rows, entry_starts, most, write, starts, counts, targets, groups, places,
+                     weights):
+    # One thread a row (along x) of the boxes' shells (`_row_of`), each point its
+    # sources' count (-1 not a target, 0 hidden) and, with ``write``, the sources
+    # at ``starts``. A ghost point is a sibling's (the lowest holding it), else
+    # interpolated in the coarse cell holding it by its corners' owners (the
+    # lowest coarse box holding each); an own point a lower sibling also holds is
+    # that sibling's. Weights are integer numerators over ``den`` (the ratios'
+    # product) times ``scale``, so a group's levels share one denominator and no
+    # device needs f64. The siblings meeting the row are found once.
+    for r in range(rows):
+        j, q1, q2, nx, ax, skip = _row_of(same, ids, row_starts, n, r, 1)
+        x0 = same.elo[3 * j]
+        big = same.ids.shape[0] + same.lo.shape[0]
+        found = tack.local_array(tack.i64, _ROW_MOST)
+        count = same.row_boxes(q1, q2, x0, x0 + nx - 1, 1, j, most, found)
+        e = entry_starts[r]
+        for x in range(nx):
+            if skip == 0 or x < ax or x >= ax + skip:
+                q0 = x0 + x
+                points = -1
+                at = starts[e] if write == 1 else 0 * e
+                s = same.pick(found, count, q0, 1)
+                if same.holds(j, q0, q1, q2, 1) == 1:
+                    if count < 0:
+                        s = same.find(q0, q1, q2, 1, j, j)
+                    elif s >= j:
+                        s = -1                  # only a lower sibling's
+                    if s >= 0:
+                        points = 1
+                        if write == 1:
+                            targets[e] = same.place(j, q0, q1, q2, 1)
+                            groups[at] = same.group[s]
+                            places[at] = same.place(s, q0, q1, q2, 1)
+                            weights[at] = den * scale
+                else:
+                    points = 0
+                    if write == 1:
+                        targets[e] = same.place(j, q0, q1, q2, 1)
+                    if count < 0:
+                        s = same.find(q0, q1, q2, 1, j, big)
+                    if s >= 0:
+                        points = 1
+                        if write == 1:
+                            groups[at] = same.group[s]
+                            places[at] = same.place(s, q0, q1, q2, 1)
+                            weights[at] = den * scale
+                    elif has_coarse == 1:
+                        points = _coarse_corners(coarse, q0, q1, q2, r0, r1, r2, scale, big,
+                                                 write, at, groups, places, weights)
+                if write == 0:
+                    counts[e] = points
+                e += 1
+
+
+@tack.func
+def _coarse_corners(coarse, q0, q1, q2, r0, r1, r2, scale, big, write, at, groups, places,
+                    weights):
+    """A ghost point no sibling holds: interpolated in the coarse cell holding it
+    (the lowest coarse box's), each corner with a weight by its owner (the lowest
+    coarse box holding it); written at ``at`` with ``write``. Its number of
+    sources, 0 where no coarse box holds it."""
+    count = 0 * q0
+    t = coarse.find_scaled(q0, q1, q2, r0, r1, r2)
+    if t >= 0:
+        # The coarse cell: q // r, kept within the box; q's place in it.
+        c0 = min(max(q0 // r0, coarse.lo[3 * t]), coarse.hi[3 * t] - 1)
+        c1 = q1 - q1
+        c2 = q2 - q2
+        if coarse.d > 1:
+            c1 = min(max(q1 // r1, coarse.lo[3 * t + 1]), coarse.hi[3 * t + 1] - 1)
+        if coarse.d > 2:
+            c2 = min(max(q2 // r2, coarse.lo[3 * t + 2]), coarse.hi[3 * t + 2] - 1)
+        t0 = q0 - c0 * r0
+        t1 = q1 - c1 * r1
+        t2 = q2 - c2 * r2
+        corners = 1
+        for a in range(coarse.d):
+            corners = corners * 2
+        for c in range(corners):
+            a0 = c & 1
+            a1 = (c >> 1) & 1
+            a2 = (c >> 2) & 1
+            w = t0 if a0 == 1 else r0 - t0
+            if coarse.d > 1:
+                w = w * (t1 if a1 == 1 else r1 - t1)
+            if coarse.d > 2:
+                w = w * (t2 if a2 == 1 else r2 - t2)
+            if w > 0:
+                k0 = c0 + a0
+                k1 = c1 + a1 if coarse.d > 1 else c1
+                k2 = c2 + a2 if coarse.d > 2 else c2
                 if write == 1:
-                    targets[e] = same.place(j, q0, q1, q2, 1)
-                    groups[at] = same.group[s]
-                    places[at] = same.place(s, q0, q1, q2, 1)
-                    weights[at] = den * scale
-        else:
-            count = 0
-            if write == 1:
-                targets[e] = same.place(j, q0, q1, q2, 1)
-            s = same.find(q0, q1, q2, 1, j, big)
-            if s >= 0:
-                count = 1
-                if write == 1:
-                    groups[at] = same.group[s]
-                    places[at] = same.place(s, q0, q1, q2, 1)
-                    weights[at] = den * scale
-            elif has_coarse == 1:
-                t = coarse.find_scaled(q0, q1, q2, r0, r1, r2)
-                if t >= 0:
-                    # The coarse cell: q // r, kept within the box; q's place in it.
-                    c0 = min(max(q0 // r0, coarse.lo[3 * t]), coarse.hi[3 * t] - 1)
-                    c1 = q1 - q1
-                    c2 = q2 - q2
-                    if coarse.d > 1:
-                        c1 = min(max(q1 // r1, coarse.lo[3 * t + 1]), coarse.hi[3 * t + 1] - 1)
-                    if coarse.d > 2:
-                        c2 = min(max(q2 // r2, coarse.lo[3 * t + 2]), coarse.hi[3 * t + 2] - 1)
-                    t0 = q0 - c0 * r0
-                    t1 = q1 - c1 * r1
-                    t2 = q2 - c2 * r2
-                    corners = 1
-                    for a in range(coarse.d):
-                        corners = corners * 2
-                    for c in range(corners):
-                        a0 = c & 1
-                        a1 = (c >> 1) & 1
-                        a2 = (c >> 2) & 1
-                        w = t0 if a0 == 1 else r0 - t0
-                        if coarse.d > 1:
-                            w = w * (t1 if a1 == 1 else r1 - t1)
-                        if coarse.d > 2:
-                            w = w * (t2 if a2 == 1 else r2 - t2)
-                        if w > 0:
-                            k0 = c0 + a0
-                            k1 = c1 + a1 if coarse.d > 1 else c1
-                            k2 = c2 + a2 if coarse.d > 2 else c2
-                            if write == 1:
-                                # The corner's owner: only the writing pass needs it.
-                                owner = coarse.find(k0, k1, k2, 1, -1, big + coarse.lo.shape[0])
-                                groups[at + count] = coarse.group[owner]
-                                places[at + count] = coarse.place(owner, k0, k1, k2, 1)
-                                weights[at + count] = w * scale
-                            count += 1
-        if write == 0:
-            counts[e] = count
+                    # The corner's owner: only the writing pass needs it.
+                    owner = coarse.find(k0, k1, k2, 1, -1, big + coarse.lo.shape[0])
+                    groups[at + count] = coarse.group[owner]
+                    places[at + count] = coarse.place(owner, k0, k1, k2, 1)
+                    weights[at + count] = w * scale
+                count += 1
+    return count
 
 
 _MOST_FINE = tack.constant(64)
@@ -851,7 +944,8 @@ def _clamped(counts, sizes):
 def _ghost_parts(amr, groups, extents):
     """Every group's ghost-cell and ghost-point fills' parts (``_Part``s) and its
     hidden cells and points (places in its arrays), on the group's device: each
-    level's boxes' shells are found by `_ghost_cells_of` and `_ghost_points_of`
+    level's boxes' shells are found by `_ghost_cells_of` and `_ghost_points_of` (a
+    thread a row of the shells)
     into views of arrays for the whole group, then compacted there. Nothing is
     read back but totals: reading the sources back, assembling them in NumPy and
     uploading them again was 4.2 s of AMR-Wind's five levels."""
@@ -888,21 +982,25 @@ def _ghost_parts(amr, groups, extents):
                 coarse = table(level - 1) if level else same
                 r = _ratio3(amr, level - 1) if level else np.ones(3, np.int64)
                 ids_d = tack.array(ids, tack.i64)
-                offsets, offsets_d = _entries(cell_sizes, device)
-                k = int(offsets[-1])
+                ext = extents[level][ids]
+                k = int(cell_sizes.sum())
                 if k:
+                    rows, row_starts, entries = _shell_layout(same, ids, ext, d, 0, device)
                     _ghost_cells_of(same, coarse, int(level > 0), *map(int, r), ids_d,
-                                    offsets_d, len(ids), targets[a:a + k], sources[a:a + k],
-                                    places[a:a + k])
+                                    row_starts, len(ids), rows, entries, _row_most,
+                                    targets[a:a + k],
+                                    sources[a:a + k], places[a:a + k])
                 a += k
-                offsets, offsets_d = _entries(point_sizes, device)
-                k = int(offsets[-1])
+                k = int(point_sizes.sum())
+                rows, row_starts, entries = 0, None, None
                 if k:
+                    rows, row_starts, entries = _shell_layout(same, ids, ext, d, 1, device)
                     _ghost_points_of(same, coarse, int(level > 0), *map(int, r), level_den,
-                                     den // level_den, ids_d, offsets_d, len(ids), 0, one,
-                                     counts[b:b + k], one, one, one, one)
-                launches.append((level, same, coarse, r, level_den, ids_d, offsets_d, len(ids),
-                                 b, k))
+                                     den // level_den, ids_d, row_starts, len(ids), rows,
+                                     entries, _row_most, 0, one, counts[b:b + k], one, one,
+                                     one, one)
+                launches.append((level, same, coarse, r, level_den, ids_d, row_starts, len(ids),
+                                 rows, entries, b, k))
                 b += k
             cell_parts[g], hidden_cells = _one_source(targets, sources, places)
             starts = tack.empty((max(npoints, 1),), tack.i64)
@@ -910,10 +1008,12 @@ def _ghost_parts(amr, groups, extents):
                 _clamped(counts, starts)
             m = exclusive_scan(starts, starts, npoints)
             point_sources = [tack.empty((max(m, 1),), tack.i64) for _ in range(3)]
-            for level, same, coarse, r, level_den, ids_d, offsets_d, nb, b, k in launches:
+            for (level, same, coarse, r, level_den, ids_d, row_starts, nb, rows, entries, b,
+                 k) in launches:
                 if k:
                     _ghost_points_of(same, coarse, int(level > 0), *map(int, r), level_den,
-                                     den // level_den, ids_d, offsets_d, nb, 1,
+                                     den // level_den, ids_d, row_starts, nb, rows, entries,
+                                     _row_most, 1,
                                      starts[b:b + k], counts[b:b + k],
                                      point_targets[b:b + k], *point_sources)
             point_parts[g], hidden_points = _counted(counts, point_targets, starts, m,
