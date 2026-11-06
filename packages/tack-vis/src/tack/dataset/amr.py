@@ -95,8 +95,10 @@ class AMRDataSet:
         self._fills = None
         self.domain = self._domain(domain)
         self._check(given)
-        self.levels = tuple(PartitionedDataSet(self._marked(level, pieces), world)
-                            for level, pieces in enumerate(given))
+        self.levels = tuple(PartitionedDataSet(pieces, world)
+                            for pieces in _with_marks(given, [self._marks(level, pieces)
+                                                              for level, pieces in
+                                                              enumerate(given)]))
 
     @classmethod
     def _grown(cls, base, levels, extents, layers, fills):
@@ -289,8 +291,9 @@ class AMRDataSet:
 
     # -- the marks -------------------------------------------------------
 
-    def _marked(self, level, pieces):
-        """This rank's boxes of ``level``, ``pieces``, with their marks computed."""
+    def _marks(self, level, pieces):
+        """The marks of this rank's boxes of ``level``, ``pieces``: per box, its cells'
+        and its points' on the host (`_with_marks` puts them on the boxes)."""
         d = self.dimension
         first = self._first[level]
         every = self._boxes[level]
@@ -318,21 +321,32 @@ class AMRDataSet:
             if marks is not None and marks.points is not None:
                 points |= (marks.points.numpy() & cleared_points).reshape(points.shape)
             marked.append((cells.reshape(-1), points.reshape(-1)))
-        # The level's marks of each kind in one array per device, each box's a view
-        # of it: one upload a level, and one buffer for algorithms over the level.
-        ghosts = [None] * len(pieces)
-        for device, ks in _by_device(pieces):
-            with device:
-                cells = _level_views(np.concatenate([marked[k][0] for k in ks]),
-                                     [marked[k][0].size for k in ks])
-                points = _level_views(np.concatenate([marked[k][1] for k in ks]),
-                                      [marked[k][1].size for k in ks])
-            for k, c, p in zip(ks, cells, points):
-                ghosts[k] = Ghosts(cells=c, points=p)
-        return [DataSet(piece.topology, piece.geometry, fields=dict(piece.fields),
-                        sets=dict(piece.sets), dtype=piece.dtype, ghosts=ghosts[k],
-                        global_ids=piece.global_ids, **piece._frame())
-                for k, piece in enumerate(pieces)]
+        return marked
+
+
+def _with_marks(levels, marks):
+    """``levels``' boxes with ``marks`` (per level, per box, host cells and points):
+    each kind of mark in one array per device for the whole hierarchy, the levels in
+    order and each box's a view of it, uploaded once (`_device_views`)."""
+    every = [box for pieces in levels for box in pieces]
+    flat = [m for level in marks for m in level]
+    ghosts = [None] * len(every)
+    for device, ks in _by_device(every):
+        with device:
+            cells = _device_views([flat[k][0] for k in ks])
+            points = _device_views([flat[k][1] for k in ks])
+        for k, c, p in zip(ks, cells, points):
+            ghosts[k] = Ghosts(cells=c, points=p)
+    out, k = [], 0
+    for pieces in levels:
+        level = []
+        for piece in pieces:
+            level.append(DataSet(piece.topology, piece.geometry, fields=dict(piece.fields),
+                                 sets=dict(piece.sets), dtype=piece.dtype, ghosts=ghosts[k],
+                                 global_ids=piece.global_ids, **piece._frame()))
+            k += 1
+        out.append(level)
+    return out
 
 
 def _by_device(pieces):
@@ -356,55 +370,56 @@ def _by_device(pieces):
     return groups
 
 
-def _level_views(host, sizes):
-    """``host`` (the boxes' values end to end) as one array on the current device,
-    and each box's ``sizes`` entries of it as a view, in order."""
+def _device_views(parts):
+    """``parts`` (host arrays) end to end in one array on the current device, and
+    each part's stretch of it as a view (``array[i:j]``), in order."""
     import tack
 
-    level = tack.array(host)
-    starts = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
-    return [level[int(a):int(b)] for a, b in itertools.pairwise(starts)]
+    whole = tack.array(np.concatenate(parts))
+    starts = np.concatenate([[0], np.cumsum([p.shape[0] for p in parts])]).astype(np.int64)
+    return [whole[int(a):int(b)] for a, b in itertools.pairwise(starts)]
 
 
-def in_level_buffers(levels):
-    """Put each level's fields in one array per device, in place: each box's
-    values become a view (``array[i:j]``) of its level's array, the boxes end to
-    end in order. One copy now, and algorithms that work a level at a time
-    (reductions, ghost fills) take the level's values without another; the
-    marks ``AMRDataSet`` makes are kept the same way (``_marked``). A field is
-    taken where every box on the device has it, at the same place among its
-    fields, in one kind of space, as a stored array of one element type; any
-    other is left as it is. ``levels`` are lists of ``DataSet``s, as
-    ``AMRDataSet`` takes them; returned for chaining."""
+def in_device_buffers(levels):
+    """Put a hierarchy's fields in one array per device, in place: each box's values
+    become a view (``array[i:j]``) of its device's array, the levels in order and
+    each level's boxes in order, so a level's boxes (statistics) and a device's
+    boxes of any run of levels (``_Fill``'s groups: ghost cells, ``average_down``)
+    are one stretch of it, taken without a copy. One copy now; the marks
+    ``AMRDataSet`` makes are laid out the same way (`_with_marks`). A field is taken
+    where every box on the device has it, at the same place among its fields, in
+    one kind of space, as a stored array of one element type; any other is left
+    as it is. ``levels`` are lists of ``DataSet``s, as ``AMRDataSet`` takes them;
+    returned for chaining."""
     import tack
     from tack.dataset.dataset import _same_space
     from tack.lang.array import Array
 
-    for pieces in levels:
-        for device, ks in _by_device(pieces):
-            boxes = [pieces[k] for k in ks]
-            entries = [box.fields.entries() for box in boxes]
-            for i, (name, first) in enumerate(entries[0]):
-                fields = []
-                for listed in entries:
-                    if i >= len(listed):
-                        break
-                    other_name, field = listed[i]
-                    values = field.values
-                    if (other_name != name or not _same_space(field.space, first.space)
-                            or type(values) is not Array or values.ndim != 1
-                            or values.dtype != first.values.dtype):
-                        break
-                    fields.append(field)
-                if len(fields) != len(boxes):
-                    continue
-                with device:
-                    level = tack.concat([f.values for f in fields])
-                start = 0
-                for field in fields:
-                    n = field.values.shape[0]
-                    field.values = level[start:start + n]
-                    start += n
+    every = [box for pieces in levels for box in pieces]
+    for device, ks in _by_device(every):
+        boxes = [every[k] for k in ks]
+        entries = [box.fields.entries() for box in boxes]
+        for i, (name, first) in enumerate(entries[0]):
+            fields = []
+            for listed in entries:
+                if i >= len(listed):
+                    break
+                other_name, field = listed[i]
+                values = field.values
+                if (other_name != name or not _same_space(field.space, first.space)
+                        or type(values) is not Array or values.ndim != 1
+                        or values.dtype != first.values.dtype):
+                    break
+                fields.append(field)
+            if len(fields) != len(boxes):
+                continue
+            with device:
+                whole = tack.concat([f.values for f in fields])
+            start = 0
+            for field in fields:
+                n = field.values.shape[0]
+                field.values = whole[start:start + n]
+                start += n
     return levels
 
 

@@ -764,28 +764,44 @@ def _revision(values):
     return id(values)
 
 
+def _joined_view(parts, extra=0):
+    """``parts`` (stored 1-D arrays of one element type) end to end, and ``extra``
+    elements after them, as one view of the memory they are in, where they are
+    views of one buffer that abut in order (``array[i:j]``, as an AMR hierarchy's
+    boxes are) and, for ``extra``, that buffer ends ``extra`` elements after them
+    (room made for them, as ``ghost_cells`` makes it, never another part's); else
+    None. Writes through it are writes to the parts."""
+    from tack.lang.array import _array_view, view_buffer
+
+    first = parts[0] if parts else None
+    root = getattr(getattr(first, "_buffer", None), "_root", None)
+    if root is None or not all(type(p) is type(first) and p.layout == "aos"
+                               and getattr(p._buffer, "_root", None) is root
+                               and p.dtype == first.dtype for p in parts):
+        return None
+    start = at = first._buffer._start
+    for p in parts:
+        if p._buffer._start != at:
+            return None
+        at += p.scalar_size
+    width = getattr(first, "_vector_n", None) or 1     # scalars an element
+    capacity = root.nbytes // first.scalar_dtype.numpy_dtype.itemsize
+    # The room after them must be no one else's: the buffer's end, made for it.
+    if at + extra * width > capacity or (extra and at + extra * width != capacity):
+        return None
+    count = sum(p.size for p in parts) + extra
+    return _array_view(first.dtype, (count,),
+                       view_buffer(root, start, at + extra * width - start),
+                       all(p._writable for p in parts), first._device)
+
+
 def _joined(parts):
     """One 1-D array of ``parts`` (stored arrays of one element type, on one
     device) end to end: the stretch of memory they are, without a copy, where
-    they are views of one buffer that abut in order (``array[i:j]``, as an AMR
-    level's boxes are); else ``tack.concat``'s copy."""
-    from tack.lang.array import _array_view, view_buffer
-
-    first = parts[0]
-    root = getattr(first._buffer, "_root", None)
-    if root is not None and all(type(p) is type(first) and p.layout == "aos"
-                                and getattr(p._buffer, "_root", None) is root
-                                and p.dtype == first.dtype for p in parts):
-        start = at = first._buffer._start
-        for p in parts:
-            if p._buffer._start != at:
-                break
-            at += p.scalar_size
-        else:
-            count = sum(p.size for p in parts)
-            return _array_view(first.dtype, (count,), view_buffer(root, start, at - start),
-                               all(p._writable for p in parts), first._device)
-    return tack.concat(parts)
+    they are views of one buffer that abut in order (`_joined_view`); else
+    ``tack.concat``'s copy."""
+    joined = _joined_view(parts)
+    return joined if joined is not None else tack.concat(parts)
 
 
 def size_of(values):

@@ -16,6 +16,8 @@ so rectilinear and curvilinear boxes get their ghost layers' geometry from
 their siblings, or interpolated in the coarse cells.
 """
 
+import functools
+
 import numpy as np
 
 import tack
@@ -105,34 +107,65 @@ class _Fill:
         integer arrays included, each target takes its weightiest source's
         value."""
         groups, blocks = self.groups, self.groups.blocks
-        combined = {}
+        combined, in_place = {}, set()
         for g in blocks.local:
             box = self.boxes[g]
             parts = [values[i] for i in groups.members[g]]
             with blocks.device(g):
+                # The group's values where they are one stretch of memory with room
+                # for the staged sources after them (`in_device_buffers`, and
+                # `ghost_cells`' grown arrays): filled where they are, nothing
+                # copied in or back.
+                joined = arrays._joined_view(parts, box["m"]) if parts else None
+                if joined is not None:
+                    combined[g] = joined
+                    in_place.add(g)
+                    continue
                 if box["m"] or not parts:
                     # A device none of whose boxes take part still joins the exchange.
                     dtype = values[0].dtype if values else tack.f32
                     parts = [*parts, tack.zeros((box["m"],), dtype)]
                 combined[g] = tack.concat(parts) if len(parts) > 1 else parts[0].copy()
         self.plan.run(combined)
+        self.fill_groups(combined, combine)
+        for g in blocks.local:
+            box, buffer = self.boxes[g], combined[g]
+            if g in in_place or not len(box["targets"]):
+                continue
+            with blocks.device(g):
+                for i, start in zip(groups.members[g], groups.starts(g, self.kind)):
+                    if len(self.box_targets.get(i, ())):
+                        _copy_into(buffer, int(start), values[i])
+
+    def fill_groups(self, combined, combine=True):
+        """The fill's kernel on each group's buffer (``combined[g]``: the group's
+        values, then its staged sources, exchanged already)."""
+        blocks = self.groups.blocks
         for g in blocks.local:
             box, buffer = self.boxes[g], combined[g]
             if not len(box["targets"]):
                 continue
             with blocks.device(g):
-                targets = tack.array(box["targets"], tack.i64)
                 scalar = getattr(buffer.dtype, "scalar_dtype", buffer.dtype)
+                tables = self._tables(g, scalar)
                 if combine and scalar.numpy_dtype.kind == "f":
-                    _apply(buffer, tack.array(box["offsets"], tack.i64),
-                           tack.array(box["entries"], tack.i64),
-                           tack.array(box["weights"].astype(scalar.numpy_dtype), scalar),
-                           targets, buffer)
+                    _apply(buffer, tables["offsets"], tables["entries"], tables["weights"],
+                           tables["targets"], buffer)
                 else:
-                    _pick(buffer, tack.array(box["picks"], tack.i64), targets, buffer)
-                for i, start in zip(groups.members[g], groups.starts(g, self.kind)):
-                    if len(self.box_targets.get(i, ())):
-                        _copy_into(buffer, int(start), values[i])
+                    _pick(buffer, tables["picks"], tables["targets"], buffer)
+
+    def _tables(self, g, scalar):
+        """Group ``g``'s rows on its device, uploaded at its first run (``update_ghosts``
+        runs a fill again and again); the weights per floating type."""
+        box = self.boxes[g]
+        tables = box.setdefault("device", {})
+        if "targets" not in tables:
+            for name in ("targets", "offsets", "entries", "picks"):
+                tables[name] = tack.array(box[name], tack.i64)
+        key = ("weights", scalar)
+        if key not in tables:
+            tables[key] = tack.array(box["weights"].astype(scalar.numpy_dtype), scalar)
+        return {**tables, "weights": tables[key]}
 
 
 @tack.kernel
@@ -867,11 +900,15 @@ def amr_ghost_cells(amr, layers, fields):
     need = any(amr.world._allgather(
         any(not isinstance(piece.geometry.values, UniformCoordinates) for piece in pieces)))
     grown_boxes, arrays_by_kind, positions = [], [], []
+    grown = _GroupArrays(groups, fills)
     for i, ((level, k), piece) in enumerate(zip(groups.local, pieces)):
         box, ext = amr._boxes[level][k], extents[level][k]
         with groups.devices[i]:
-            assembled = {name: _placed(piece.fields[name].values, _kind(piece.fields[name]),
-                                       box, ext, d) for name in names}
+            assembled = {}
+            for name in names:
+                kind = _kind(piece.fields[name])
+                assembled[name] = _placed(piece.fields[name].values, kind, box, ext, d,
+                                          functools.partial(grown.view, i, name, kind))
             positions.append(tack.array(_placed_host(piece.positions(), "points", box, ext, d),
                                         tack.vec3(piece.dtype)) if need else None)
         arrays_by_kind.append(assembled)
@@ -916,9 +953,40 @@ def _placed_host(values, kind, box, ext, d):
     return out.reshape((-1, *extra))
 
 
-def _placed(values, kind, box, ext, d):
+class _GroupArrays:
+    """The grown boxes' arrays, a group's (``_Groups``: a rank's boxes on a device) in
+    one buffer per field, each box's a view of it in the group's order, with room
+    after them for the sources the fill stages from other groups: the form
+    ``_Fill.run`` fills in place, and ``update_ghosts`` again after."""
+
+    def __init__(self, groups, fills):
+        self.groups, self.fills, self.buffers = groups, fills, {}
+        self.group_of = {i: g for g in groups.blocks.local for i in groups.members[g]}
+        self.starts = {kind: {i: int(start) for g in groups.blocks.local
+                              for i, start in zip(groups.members[g], groups.starts(g, kind))}
+                       for kind in ("cells", "points")}
+
+    def view(self, i, name, kind, values, n):
+        """Box ``i``'s zeroed array of ``n`` entries for ``name``: its stretch of the
+        group's buffer, made at the group's first box; a new array where a box's
+        type differs from the group's."""
+        g, groups = self.group_of[i], self.groups
+        key = (g, name)
+        buffer = self.buffers.get(key)
+        if buffer is None:
+            extra = self.fills[kind].boxes[g]["m"]
+            buffer = self.buffers[key] = tack.zeros((groups.size(g, kind) + extra,),
+                                                    values.dtype)
+        if buffer.dtype != values.dtype:
+            return tack.zeros((n,), values.dtype)
+        start = self.starts[kind][i]
+        return buffer[start:start + n]
+
+
+def _placed(values, kind, box, ext, d, out_of=None):
     """A box's values placed in an array of the grown extent, zeros elsewhere, on the
-    device (through the host it was 3.6 s of AMR-Wind's five levels)."""
+    device (through the host it was 3.6 s of AMR-Wind's five levels); the array
+    ``out_of(values, n)`` gives, zeroed, where given."""
     extra = 1 if kind == "points" else 0
     own = np.ones(3, np.int64)
     grown = np.ones(3, np.int64)
@@ -927,7 +995,8 @@ def _placed(values, kind, box, ext, d):
     grown[:d] = ext[1, :d] - ext[0, :d] + extra
     start[:d] = box[0, :d] - ext[0, :d]
     values = arrays.materialize(_point_values(values, int(np.prod(own))))
-    out = tack.zeros((int(np.prod(grown)),), values.dtype)
+    n = int(np.prod(grown))
+    out = tack.zeros((n,), values.dtype) if out_of is None else out_of(values, n)
     if values.shape[0]:
         _place_into(values, out, *map(int, own[:2]), *map(int, grown[:2]), *map(int, start))
     return out
@@ -1094,6 +1163,8 @@ def average_down(amr, field):
         if kind == "points":
             fill.run(values)
             continue
+        if _average_cells_in_place(fill, groups, values):
+            continue
         # Cells: sums of measure times value over sums of measure. The measures are
         # the boxes' own, each found once.
         weighted, sums = [], []
@@ -1109,6 +1180,65 @@ def average_down(amr, field):
             if len(targets):
                 with groups.devices[i]:
                     _divide(weighted[i], sums[i], tack.array(targets, tack.i64), values[i])
+
+
+def _average_cells_in_place(fill, groups, values):
+    """``average_down``'s cells where each group's values are one stretch of memory
+    (`in_device_buffers`): per group, the values times their measures and the
+    measures in buffers with room for the staged sources, both filled, and the
+    targets divided into the values where they are -- a few launches a group, not
+    three a box. False, having done nothing, where a group's values are not one
+    stretch."""
+    blocks = groups.blocks
+    joined = {}
+    for g in blocks.local:
+        parts = [values[i] for i in groups.members[g]]
+        joined[g] = arrays._joined_view(parts) if parts else None
+        if parts and joined[g] is None:
+            return False
+    weighted, sums = {}, {}
+    for g in blocks.local:
+        box = fill.boxes[g]
+        n, m = box["n"], box["m"]
+        dtype = values[0].dtype if values else tack.f32
+        with blocks.device(g):
+            weighted[g] = tack.zeros((n + m,), dtype)
+            sums[g] = tack.zeros((n + m,), dtype)
+            if n:
+                measures = _group_measures([groups.pieces[i] for i in groups.members[g]],
+                                           dtype)
+                _scaled(joined[g], measures, weighted[g])
+                _copy_offset(measures, sums[g])
+    for buffers in (weighted, sums):
+        fill.plan.run(buffers)
+        fill.fill_groups(buffers)
+    for g in blocks.local:
+        box = fill.boxes[g]
+        if len(box["targets"]):
+            with blocks.device(g):
+                _divide(weighted[g], sums[g], fill._tables(g, dtype)["targets"], joined[g])
+    return True
+
+
+@tack.kernel
+def _copy_offset(source, out):
+    for i in range(source.shape[0]):
+        out[i] = source[i]
+
+
+def _group_measures(boxes, dtype):
+    """The boxes' cells' measures end to end, in ``dtype``: an image box's all its
+    spacing's product (one value a box, spread by ``segment_broadcast``), any other
+    box's by `_measures`."""
+    from tack.algorithms.segmented import segment_broadcast
+
+    if not all(isinstance(b.geometry.values, UniformCoordinates) for b in boxes):
+        return tack.concat([_measures(b, b.device, dtype) for b in boxes])
+    volumes = np.array([np.prod(np.asarray(b.geometry.values._spacing, np.float64)
+                                [:len(b.topology.point_dims)]) for b in boxes])
+    offsets = np.concatenate([[0], np.cumsum([b.num_cells for b in boxes])]).astype(np.int64)
+    return segment_broadcast(tack.array(volumes.astype(dtype.numpy_dtype), dtype),
+                             tack.array(offsets, tack.i64), int(offsets[-1]))
 
 
 def _measures(box, device, dtype):

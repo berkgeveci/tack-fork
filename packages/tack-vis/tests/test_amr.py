@@ -20,7 +20,7 @@ import pytest
 import tack
 import tack.dataset as td
 from tack.dataset import Ghosts
-from tack.dataset.amr import in_level_buffers
+from tack.dataset.amr import in_device_buffers
 from tack.runtime import dispatch
 from tack.runtime.cpu import CPUBackend
 from tack.runtime.dispatch import env_flag
@@ -78,7 +78,7 @@ def amr_of(levels, ratios=(), **kwargs):
     """``td.AMRDataSet`` of ``levels`` with each level's fields in one array, each
     box's values a view of it, as ``vtk_to_dataset`` and the sources give a
     hierarchy: every algorithm here is tested on that form."""
-    return td.AMRDataSet(in_level_buffers(levels), ratios, **kwargs)
+    return td.AMRDataSet(in_device_buffers(levels), ratios, **kwargs)
 
 
 def hierarchy(kind="image", d=2):
@@ -550,17 +550,21 @@ def _is_view_of_one(arrays):
             and len(roots) == 1 and starts == sorted(starts))
 
 
-def test_levels_are_one_array_each():
-    """The marks a hierarchy makes, and the fields ``in_level_buffers`` (the VTK
+def test_a_hierarchy_is_one_array_a_device():
+    """The marks a hierarchy makes, and the fields ``in_device_buffers`` (the VTK
     adapter, the sources, this file's ``amr_of``) puts in, are views of one array
-    a level, so algorithms that work a level at a time take them as they are."""
+    per device, levels in order: a level's boxes, and a device's boxes of any run of
+    levels, are one stretch of it, which algorithms take as it is."""
+    from tack import arrays
+
     for amr in (hierarchy(), td.amr_gaussian_pulse()):
-        for boxes in amr.levels:
-            boxes = list(boxes)
-            assert _is_view_of_one([b.ghosts.cells for b in boxes])
-            assert _is_view_of_one([b.ghosts.points for b in boxes])
-            for name in [n for n, _ in boxes[0].fields.entries()]:
-                assert _is_view_of_one([b.fields[name].values for b in boxes]), name
+        boxes = [b for _, b in amr]
+        assert _is_view_of_one([b.ghosts.cells for b in boxes])
+        assert _is_view_of_one([b.ghosts.points for b in boxes])
+        for name in [n for n, _ in boxes[0].fields.entries()]:
+            assert _is_view_of_one([b.fields[name].values for b in boxes]), name
+            for level in amr.levels:
+                assert arrays._joined_view([b.fields[name].values for b in level]) is not None
 
 
 def test_writes_to_a_box_reach_its_level_array():
@@ -569,9 +573,9 @@ def test_writes_to_a_box_reach_its_level_array():
     before = second.fields["c"].values.numpy()
     first.fields["c"].values.fill(-1.0)
     np.testing.assert_array_equal(second.fields["c"].values.numpy(), before)
-    level = first.fields["c"].values._buffer._root
-    n = first.fields["c"].values.shape[0]
-    assert (level.to_numpy()[:n] == -1.0).all()
+    view = first.fields["c"].values._buffer
+    n, start = first.fields["c"].values.shape[0], view._start
+    assert (view._root.to_numpy()[start:start + n] == -1.0).all()
 
 
 @needs_vtk
@@ -614,3 +618,41 @@ def test_statistics_a_level_at_a_time_are_the_boxes(kind, name, weights):
         # m3 sums cubes that nearly cancel: f32 rounding of the scale m2^1.5.
         np.testing.assert_allclose(a.m3, by_box.m3, atol=1e-6 * by_box.m2 ** 1.5)
         assert a.unit == by_box.unit and a.weight_unit == by_box.weight_unit
+
+
+def _three_levels(kind):
+    boxes = [[image(lo, cells, h) for lo, cells in level] for level, h in
+             zip([[((0, 0), (4, 8)), ((4, 0), (4, 8))],
+                  [((2, 2), (4, 4)), ((6, 2), (2, 4)), ((2, 10), (8, 4))],
+                  [((6, 6), (4, 4))]], [1.0, 0.5, 0.25])]
+    return boxes if kind == "image" else [[_as(kind, b) for b in level] for level in boxes]
+
+
+@pytest.mark.parametrize("kind", ["image", "curvilinear"])
+def test_fills_in_place_are_the_copying_fills(kind):
+    """``ghost_cells``, ``update_ghosts`` and ``average_down`` fill a device's boxes
+    in place where they are one stretch of memory (``_Fill.run``,
+    ``_average_cells_in_place``), and through a copy where they are not (boxes made
+    one by one): the same bits either way, and the grown hierarchy is in the
+    single-array form."""
+    views = amr_of(_three_levels(kind), [2, 2])
+    copies = td.AMRDataSet(_three_levels(kind), [2, 2])
+    grown_views, grown_copies = td.ghost_cells(views), td.ghost_cells(copies)
+    boxes = [b for _, b in grown_views]
+    for name in ("c", "p"):
+        assert _is_view_of_one([b.fields[name].values for b in boxes])
+        for (_, a), (_, b) in zip(grown_views, grown_copies):
+            np.testing.assert_array_equal(a.fields[name].values.numpy(),
+                                          b.fields[name].values.numpy())
+    for amr in (grown_views, grown_copies):
+        for _, box in amr:
+            box.fields["c"].values.fill(7.0)
+        td.update_ghosts(amr, "c")
+    for (_, a), (_, b) in zip(grown_views, grown_copies):
+        np.testing.assert_array_equal(a.fields["c"].values.numpy(), b.fields["c"].values.numpy())
+    for name in ("c", "p"):
+        td.average_down(views, name)
+        td.average_down(copies, name)
+        for (_, a), (_, b) in zip(views, copies):
+            np.testing.assert_array_equal(a.fields[name].values.numpy(),
+                                          b.fields[name].values.numpy())
