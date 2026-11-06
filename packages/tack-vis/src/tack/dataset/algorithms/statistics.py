@@ -229,6 +229,113 @@ def _over_pieces(data, each):
     return blocks.all_gather({g: each(piece) for g, piece in zip(blocks.local, pieces)})
 
 
+def _amr_statistics(amr, field, weights):
+    """``statistics`` of an ``AMRDataSet``: each level's boxes on a device reduced as
+    one array (`_level_moments`), the parts gathered over the hierarchy's world and
+    combined in order, as pieces' are."""
+    from tack import communication as tc
+    from tack.dataset import units
+    from tack.dataset.algorithms._common import _measure_unit
+    from tack.dataset.amr import _by_device
+
+    pieces = amr._as_pieces()
+    given = _per_piece(pieces, field, weights, "statistics")
+    # Each box's units from its resolved field (`_units` looks the field up again,
+    # 8 us a box); the volume's is the spatial unit, one per hierarchy.
+    if weights is None:
+        mine = [(f.unit, "dimensionless") for f, _ in given.values()]
+    elif isinstance(weights, str) and weights == "volume":
+        measure = _measure_unit(pieces[0]) if len(pieces) else None
+        mine = [(f.unit, measure) for f, _ in given.values()]
+    else:
+        mine = [_units(piece, *given[id(piece)]) for piece in pieces]
+    every = [pair for part in amr.world._allgather(mine) for pair in part]
+    unit = units.common("statistics' boxes' field", [u for u, _ in every])
+    weight_unit = units.common("statistics' boxes' weights", [w for _, w in every])
+    groups = []
+    for level in amr.levels:
+        level = list(level)
+        groups += [(device, [level[k] for k in ks]) for device, ks in _by_device(level)]
+    blocks = tc.Blocks([device for device, _ in groups], amr.world)
+    moments = None
+    for part in blocks.all_gather({g: _level_moments(boxes, given, amr.dimension)
+                                   for g, (_, boxes) in zip(blocks.local, groups)}):
+        if part is not None:
+            moments = part if moments is None else _merged(moments, part)
+    if moments is None:
+        raise ValueError("statistics of no values")
+    return _summary(*moments)._replace(unit=unit, weight_unit=weight_unit)
+
+
+def _level_moments(boxes, given, d):
+    """The moments of one level's boxes on one device, as one array: their values,
+    marks and weights end to end (`tack.arrays._joined`: the level's own array where
+    the boxes are views of it, as ``vtk_to_dataset`` and the sources give them, else
+    a copy), the entries the marks leave owned taken once (`owned_ids`), one
+    `_array_moments`. Fields the marks do not place (not on cells or points), and
+    boxes that lost their marks, go box by box as before."""
+    from tack import arrays
+    from tack.dataset.algorithms.ghost_cells import _kind
+    from tack.dataset.carry import _take
+    from tack.dataset.ghosts import Ghosts, owned_ids
+    from tack.lang.array import Array
+
+    fields = [given[id(b)][0] for b in boxes]
+    weights = given[id(boxes[0])][1]
+    kind = _kind(fields[0])
+    plain = kind is not None and all(
+        type(f.values) is Array and not b._ghosts_lost and b.ghosts is not None
+        and getattr(b.ghosts, kind) is not None for b, f in zip(boxes, fields))
+    if weights is not None and plain and not (isinstance(weights, str) and weights == "volume"):
+        weight_fields = [_weights(b, f, given[id(b)][1]) for b, f in zip(boxes, fields)]
+        plain = all(type(w.values) is Array for w in weight_fields)
+    if not plain:
+        moments = None
+        for b in boxes:
+            part = _moments(b, *given[id(b)])
+            if part is not None:
+                moments = part if moments is None else _merged(moments, part)
+        return moments
+    with boxes[0].device:
+        values = arrays._joined([f.values for f in fields])
+        if weights is None:
+            w = None
+        elif isinstance(weights, str) and weights == "volume":
+            if kind != "cells":
+                raise TypeError("volume weights are a cell's measure: they take a cell field")
+            w = _volumes(boxes, d)
+        else:
+            w = arrays._joined([wf.values for wf in weight_fields])
+        marks = arrays._joined([getattr(b.ghosts, kind) for b in boxes])
+        skipped = Ghosts.SKIPPED_CELLS if kind == "cells" else Ghosts.SKIPPED_POINTS
+        ids = owned_ids(marks, skipped, boxes[0].id_dtype)
+        if ids is not None:
+            values = _take(values, ids)
+            w = None if w is None else _take(w, ids)
+        return _array_moments(values, w)
+
+
+def _volumes(boxes, d):
+    """Each cell's measure, the boxes' cells end to end: an image box's cells all
+    the product of its spacing (one value a box, spread by `segment_broadcast`),
+    any other box's from its corners (`cell_geometry`)."""
+    from tack import arrays
+    from tack.algorithms.segmented import segment_broadcast
+    from tack.arrays import UniformCoordinates
+    from tack.dataset.algorithms.cell_geometry import cell_geometry
+
+    if not all(isinstance(b.geometry.values, UniformCoordinates) for b in boxes):
+        return arrays._joined([arrays.materialize(cell_geometry(b).measure.values)
+                               for b in boxes])
+    measures = np.array([np.prod(np.asarray(b.geometry.values._spacing, np.float64)[:d])
+                         for b in boxes])
+    counts = np.array([b.num_cells for b in boxes], np.int64)
+    offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    dtype = boxes[0].dtype
+    return segment_broadcast(tack.array(measures.astype(dtype.numpy_dtype), dtype),
+                             tack.array(offsets, tack.i64), int(offsets[-1]))
+
+
 def _summary(n, weight, weight2, low, high, total, mean, m2, m3, m4):
     # With weights, W stands for n; the sample variance takes them as
     # reliability weights (NumPy's aweights), m2 / (W - W2 / W), which is
@@ -284,7 +391,7 @@ def statistics(data, field, weights=None, level=None):
     if level is not None:
         raise TypeError("level= picks an octree's level; this is not an OctreeDataSet")
     if isinstance(data, AMRDataSet):
-        data = data._as_pieces()
+        return _amr_statistics(data, field, weights)
     if isinstance(data, PartitionedDataSet):
         from tack.dataset import units
 

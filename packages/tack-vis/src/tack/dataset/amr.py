@@ -336,10 +336,17 @@ class AMRDataSet:
 
 
 def _by_device(pieces):
-    """``[(device, [k, ...])]``: the indices of ``pieces`` on each device, in order."""
+    """``[(device, [k, ...])]``: the indices of ``pieces`` on each device, in order.
+    A box's device is its marks' where it has them, as every box of a hierarchy
+    does: ``DataSet.device`` searches the dataset's parts, about 15 us a box."""
+    from tack.runtime.dispatch import as_device
+
     groups = []
     for k, piece in enumerate(pieces):
-        device = piece.device
+        ghosts = piece.ghosts
+        marks = None if ghosts is None else (ghosts.cells if ghosts.cells is not None
+                                             else ghosts.points)
+        device = as_device(marks._backend) if marks is not None else piece.device
         for d, ks in groups:
             if d == device:
                 ks.append(k)

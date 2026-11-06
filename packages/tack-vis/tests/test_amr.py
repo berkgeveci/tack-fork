@@ -585,3 +585,32 @@ def test_vtk_to_dataset_gives_the_single_array_form():
     shared = vtk_to_dataset(dataset_to_vtk(amr), copy=False)
     assert all(getattr(b.fields["Gaussian-Pulse"].values._buffer, "_root", None) is None
                for _, b in shared)
+
+
+@pytest.mark.parametrize("kind", ["image", "curvilinear"])
+@pytest.mark.parametrize("name, weights", [("c", None), ("c", "volume"), ("p", None),
+                                           ("c", "c")])
+def test_statistics_a_level_at_a_time_are_the_boxes(kind, name, weights):
+    """Statistics reduce each level as one array: the level's own where the boxes
+    are its views, a copy where they are not (boxes made one by one), and box by box
+    before. All three agree (to the order of summation)."""
+    def levels():
+        return [[(image(lo, cells, h) if kind == "image" else _as(kind, image(lo, cells, h)))
+                 for lo, cells in level] for level, h in
+                zip([[((0, 0), (4, 8)), ((4, 0), (4, 8))],
+                     [((2, 2), (4, 4)), ((6, 2), (2, 4)), ((2, 10), (8, 4))],
+                     [((6, 6), (4, 4))]], [1.0, 0.5, 0.25])]
+
+    views = td.statistics(amr_of(levels(), [2, 2]), name, weights)
+    copies = td.statistics(td.AMRDataSet(levels(), [2, 2]), name, weights)
+    amr = td.AMRDataSet(levels(), [2, 2])
+    by_box = td.statistics(amr._as_pieces(), name, weights)
+    for a in (views, copies):
+        for field in ("n", "weight", "min", "max"):
+            assert getattr(a, field) == getattr(by_box, field), field
+        for field in ("sum", "mean", "m2", "m4"):
+            np.testing.assert_allclose(getattr(a, field), getattr(by_box, field),
+                                       rtol=1e-5, atol=1e-6, err_msg=field)
+        # m3 sums cubes that nearly cancel: f32 rounding of the scale m2^1.5.
+        np.testing.assert_allclose(a.m3, by_box.m3, atol=1e-6 * by_box.m2 ** 1.5)
+        assert a.unit == by_box.unit and a.weight_unit == by_box.weight_unit

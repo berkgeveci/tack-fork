@@ -275,15 +275,34 @@ def owned_values(data, field):
             _keep_blocks(marks, skipped, space.offsets, flags)
     elif n:
         _keep(marks, skipped, flags)
-    idt = data.id_dtype
-    slots = tack.empty((n,), idt)
+    ids = _flagged_ids(flags, n, data.id_dtype)
+    return values if ids is None else _take(values, ids)
+
+
+def _flagged_ids(flags, n, id_dtype):
+    """The indices of ``flags`` that are 1, in order, or None where all ``n`` are."""
+    slots = tack.empty((n,), id_dtype)
     count = exclusive_scan(flags, slots, n) if n else 0
     if count == n:
-        return values
-    ids = tack.empty((count,), idt)
+        return None
+    ids = tack.empty((count,), id_dtype)
     if count:
         _kept(flags, slots, ids)
-    return _take(values, ids)
+    return ids
+
+
+@on_inputs_device
+def owned_ids(marks, skipped, id_dtype):
+    """The indices of the entries ``marks`` (one per entry) leaves owned, those
+    with none of the bits ``skipped`` (``Ghosts.SKIPPED_CELLS`` or
+    ``SKIPPED_POINTS``), in order; None where it leaves all of them. What
+    `owned_values` takes, for a caller with several arrays on the same entries
+    (values and their weights) or with marks of its own (an AMR level's)."""
+    n = marks.shape[0]
+    flags = tack.empty((n,), tack.i32)
+    if n:
+        _keep(marks, skipped, flags)
+    return _flagged_ids(flags, n, id_dtype)
 
 
 # ── What filters make: the marks carried ────────────────────────────

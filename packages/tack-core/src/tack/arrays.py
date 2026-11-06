@@ -764,6 +764,30 @@ def _revision(values):
     return id(values)
 
 
+def _joined(parts):
+    """One 1-D array of ``parts`` (stored arrays of one element type, on one
+    device) end to end: the stretch of memory they are, without a copy, where
+    they are views of one buffer that abut in order (``array[i:j]``, as an AMR
+    level's boxes are); else ``tack.concat``'s copy."""
+    from tack.lang.array import _array_view, view_buffer
+
+    first = parts[0]
+    root = getattr(first._buffer, "_root", None)
+    if root is not None and all(type(p) is type(first) and p.layout == "aos"
+                                and getattr(p._buffer, "_root", None) is root
+                                and p.dtype == first.dtype for p in parts):
+        start = at = first._buffer._start
+        for p in parts:
+            if p._buffer._start != at:
+                break
+            at += p.scalar_size
+        else:
+            count = sum(p.size for p in parts)
+            return _array_view(first.dtype, (count,), view_buffer(root, start, at - start),
+                               all(p._writable for p in parts), first._device)
+    return tack.concat(parts)
+
+
 def size_of(values):
     """The number of values."""
     return values.size
