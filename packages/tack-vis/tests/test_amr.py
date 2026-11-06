@@ -230,6 +230,55 @@ def test_marks_already_given_are_recomputed_and_others_kept():
     assert not got[1] & Ghosts.REFINEDCELL
 
 
+def test_marks_given_on_some_boxes_only_are_kept():
+    """Given marks not one stretch of an array (some boxes without any) are kept
+    box by box, the rest zeros before the hierarchy's own."""
+    amr = hierarchy()
+    levels = [[td.DataSet(box.topology, box.geometry, fields=dict(box.fields))
+               for box in level] for level in amr.levels]
+    first = levels[0][0]
+    cells = np.zeros(first.num_cells, np.uint8)
+    cells[0] = Ghosts.HIDDENCELL
+    first.ghosts = Ghosts(cells=cells)
+    again = td.AMRDataSet(levels, amr.ratios)
+    for (_, a), (_, b) in zip(again, amr):
+        np.testing.assert_array_equal(a.ghosts.points.numpy(), b.ghosts.points.numpy())
+    got = again.levels[0][0].ghosts.cells.numpy()
+    expected = amr.levels[0][0].ghosts.cells.numpy().copy()
+    expected[0] |= Ghosts.HIDDENCELL
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("d", [1, 2, 3])
+@pytest.mark.parametrize("closed", [False, True])
+def test_box_pairs_are_every_pair_that_meets(d, closed):
+    from tack.dataset._box_pairs import pairs
+
+    rng = np.random.default_rng(d + 3 * closed)
+
+    def boxes(n, most):
+        lo = np.zeros((n, 3), np.int64)
+        hi = np.ones((n, 3), np.int64)
+        lo[:, :d] = rng.integers(-5, 40, (n, d))
+        hi[:, :d] = lo[:, :d] + rng.integers(1, most, (n, d))
+        return np.stack([lo, hi], 1)
+
+    def meet(a, b):
+        low, high = np.maximum(a[0, :d], b[0, :d]), np.minimum(a[1, :d], b[1, :d])
+        return bool((low <= high).all() if closed else (low < high).all())
+
+    a = boxes(120, 9)
+    for b, distinct in ((boxes(90, 20), False), (a, True)):
+        found = pairs(a, b, d, closed, distinct)
+        got = list(zip(found.first.numpy().tolist(), found.second.numpy().tolist()))
+        assert len(got) == len(set(got)) == found.count
+        assert set(got) == {(i, j) for i in range(len(a)) for j in range(len(b))
+                            if not (distinct and i == j) and meet(a[i], b[j])}
+        first = found.first.numpy()
+        np.testing.assert_array_equal(found.offsets.numpy(),
+                                      np.searchsorted(first, np.arange(len(a) + 1)))
+
+
 def test_hierarchies_that_vtks_model_cannot_hold_are_refused():
     boxes = [[image((0, 0), (8, 8), 1.0)], [image((2, 2), (4, 4), 0.5)]]
     with pytest.raises(ValueError, match="overlap"):

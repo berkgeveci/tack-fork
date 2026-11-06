@@ -800,6 +800,30 @@ class DataSet:
         self.global_ids = global_ids
         _ = self._device                    # refuses parts on two devices
 
+    def _with_ghosts(self, ghosts):
+        """A copy with ``ghosts`` for marks, sharing everything else, and checked only
+        for the marks: its parts passed their checks when it was made. Its fields
+        and sets are its own containers, so changing them leaves this one's alone.
+        What makes many boxes at once (``AMRDataSet``) uses it: the constructor's
+        checks cost about 60 us a box."""
+        import copy
+
+        out = copy.copy(self)
+        fields = Fields.__new__(Fields)
+        fields._topology = self.topology
+        fields._entries = [list(entry) for entry in self._fields._entries]
+        out._fields = fields
+        sets = Sets.__new__(Sets)
+        sets._topology = self.topology
+        dict.update(sets, self._sets)
+        out._sets = sets
+        if ghosts is not None:
+            ghosts._check(self.topology)
+            same_device("DataSet", (self.topology, ghosts))
+        out._ghosts_lost = False
+        out._ghosts = ghosts
+        return out
+
     @property
     def _device(self):
         """The device its topology, geometry, fields and sets are on; parts on two
