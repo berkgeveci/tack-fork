@@ -52,6 +52,14 @@
   without polyhedra of its own takes them as ghosts), `update_ghosts`,
   `merge_pieces`, `generate_global_ids` and `connected_components` over
   pieces take mixed meshes, in one process and across MPI ranks.
+- Every algorithm takes polyhedra beside shapes (#307, phase 6) but what needs
+  a reference element in every cell (`H1` above order 1, `L2`, `shrink`,
+  `subdivide`), which refuses the mesh as all polyhedra alike; every call runs
+  on mixed meshes on every device, one without f64 too. On AhmedML, a pipeline
+  of gradients, quality, integration, surface, slice, contour, clip, probe and
+  streamlines takes 3.7 s warm on the mixed reading against 4.2 s as all
+  polyhedra, after reading in 8.7 s against 32 s, at a peak of 25 GB against
+  33.
 - Deprecations (`tack._deprecation`): a deprecated feature warns with
   `tack.TackDeprecationWarning`, a `DeprecationWarning`, at the line that uses
   it; a test fails once a release reaches a deprecation's removal, and the
@@ -69,6 +77,8 @@
 
 - Hiding cells by their hidden points (`hidden_by_points`, which
   `vtk_to_dataset` calls) compiles for polyhedra beside shaped cells.
+- `Set.from_sides` takes polyhedra beside shapes; it read a `cell_offsets`
+  a mixed topology does not have.
 - `connected_components` over pieces of polyhedra (a `PolyhedralTopology`)
   finds their boundary points; it read face rows they do not have.
 

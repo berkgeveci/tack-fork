@@ -174,7 +174,7 @@ class Set:
         cell's view numbers them (VTK's order on the shape path, the cell's own
         face list on the polyhedral one). Which side was named is not kept: on
         the boundary, a face has only the one."""
-        from tack.dataset.dataset import for_each
+        from tack.dataset import shapes
 
         cells = np.asarray(cells, np.int64).reshape(-1)
         local = np.asarray(local_faces, np.int64).reshape(-1)
@@ -189,24 +189,36 @@ class Set:
         faces = topology.faces()
         flags = tack.zeros((faces.num_faces,), tack.i32)
         bad = tack.zeros((1,), tack.i32)
-        if hasattr(topology, "cell_faces"):
+        listed = np.zeros(cells.size, bool)          # pairs of cells that list their faces
+        if getattr(topology, "mixed", False):
+            # Polyhedra or polygons beside shapes: theirs in the face lists, by cell id.
+            types = topology.types.numpy()[cells] if cells.size else np.zeros(0, np.uint8)
+            listed = (types == int(shapes.POLYHEDRON)) | (types == int(shapes.POLYGON))
+            offsets = topology.cell_face_offsets
+        elif hasattr(topology, "cell_faces"):
+            listed[:] = True
+            offsets = topology.cell_offsets
+        if listed.any():
             # Cells list their faces, as many as they like: look each pair up.
-            if cells.size:
-                _listed_faces(tack.array(cells), tack.array(local),
-                              topology.cell_offsets, topology.cell_faces, flags, bad)
-        else:
+            _listed_faces(tack.array(cells[listed]), tack.array(local[listed]), offsets,
+                          topology.cell_faces, flags, bad)
+        shaped = ~listed
+        if shaped.any():
             # Shapes have at most six faces: a bit per local face, a mask per cell.
-            if local.size and local.max() >= 63:
-                bad = tack.full((1,), int((local >= 63).sum()), tack.i32)
+            if local[shaped].max() >= 63:
+                count = int(bad[0]) + int((local[shaped] >= 63).sum())
+                tack.copyto(bad, np.array([count], np.int32))
             else:
                 host = np.zeros(n, np.int64)
-                np.bitwise_or.at(host, cells, np.left_shift(np.int64(1), local))
+                np.bitwise_or.at(host, cells[shaped], np.left_shift(np.int64(1),
+                                                                    local[shaped]))
                 masks = tack.empty((n,), tack.i64)
                 if n:
                     tack.copyto(masks, host)
-                if cells.size:
-                    for_each(_side_faces, data, "cells", masks, flags, bad,
-                             incidence="faces")
+                for group in data.launch_groups("cells"):
+                    if group.count and group.shape.REFERENCE:
+                        _side_faces(data.domain_view("cells", group, incidence="faces"),
+                                    masks, flags, bad)
         if bad[0]:
             raise ValueError(f"{bad[0]} cells are given a local face they do not have")
         return cls._from_flags(data.topology, "faces", flags)

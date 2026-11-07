@@ -460,8 +460,9 @@ def test_extract_cells_of_a_mixed_vtk_mesh_goes_back_to_vtk():
 
 # ── Which algorithms take mixed cells ───────────────────────────────
 
-#: test_dataset_devices.CALLS that take a mixed mesh (#307 phase 1) and must give
-#: the shaped mesh's answer; every other one refuses it by name.
+#: test_dataset_devices.CALLS that take a mixed mesh and must give the shaped mesh's
+#: answer (or as the sets below say); every other one refuses it, as it refuses the
+#: same mesh as all polyhedra: what needs a reference element in every cell.
 READY = {
     "contour_1d", "threshold", "extract_geometry", "extract_cells", "extract_extent", "mask",
     "mask_points", "threshold_points", "extract_points", "boundary_faces", "extract_edges",
@@ -548,6 +549,9 @@ def test_an_algorithm_takes_mixed_cells_or_refuses_them(name):
         if name not in READY:
             with pytest.raises(NotImplementedError, match="polyhedra|Polyhedron"):
                 call(mixed)
+            # Only what the mesh as all polyhedra is refused too.
+            with pytest.raises(NotImplementedError):
+                call(devices._with_fields(td.as_polyhedra(shaped), cpu))
             return
         if name in OWN_TESTS:
             call(mixed)
@@ -1068,8 +1072,11 @@ def test_an_algorithm_takes_polygons_beside_shapes_or_refuses_them(name):
                 call(mixed)
             return
         if name not in READY_2D:
-            with pytest.raises(NotImplementedError, match="polyhedra|Polyhedron|polygon"):
+            with pytest.raises(NotImplementedError, match="polyhedra|Polyhedron|[Pp]olygon"):
                 call(mixed)
+            # Only what the surface as all polygons is refused too.
+            with pytest.raises(NotImplementedError):
+                call(devices._with_fields(td.as_polygons(shaped), tack.device("cpu")))
             return
         got = call(mixed)
         if name in ORIENTED_2D:
@@ -1532,3 +1539,22 @@ def test_mixed_pieces_across_mpi_ranks(mpiexec):
     for ranks in (2, 3):
         run = mpiexec(ranks, script)
         assert run.returncode == 0 and "ok" in run.stdout, run.stdout + run.stderr
+
+
+# ── The whole (phase 6) ─────────────────────────────────────────────
+
+def test_faces_named_by_their_cells_sides_are_the_shaped_meshs():
+    # _mixed lists a polyhedron's faces in its shape's local order, so the same
+    # (cell, local face) pairs name the same faces, polyhedra and shapes alike.
+    shaped, mixed, _, chosen, _ = _located()
+    cells = np.repeat(np.arange(shaped.num_cells), 6)
+    local = np.tile(np.arange(6), shaped.num_cells)
+
+    def named(data):
+        found = set(td.Set.from_sides(data, cells, local).ids.numpy().tolist())
+        return sorted(sorted(k) for k in _face_records(data.topology)
+                      if _face_id(data.topology, k) in found)
+
+    assert named(mixed) == named(shaped)
+    with pytest.raises(ValueError, match="1 cells are given a local face"):
+        td.Set.from_sides(mixed, [chosen[0], 1], [6, 2])

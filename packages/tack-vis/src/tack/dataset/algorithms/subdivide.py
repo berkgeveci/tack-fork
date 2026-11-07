@@ -38,7 +38,7 @@ from tack.dataset.carry import selected
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.ghosts import _before
 from tack.dataset.spaces import H1, L2, Constant, Values
-from tack.dataset.topology import UnstructuredTopology, _refuse_mixed, uniform_cells
+from tack.dataset.topology import UnstructuredTopology, uniform_cells
 from tack.dataset.views import _axis
 from tack.runtime.dispatch import on_inputs_device
 
@@ -1340,7 +1340,6 @@ def subdivide(data, level=None, fields=None):
     computed once (on an ``L2`` geometry each cell's points are its own). ``H1`` and ``L2`` fields become point data (an ``L2`` field's
     value at a shared point from one of its cells); cell fields go to every
     sub-cell of their cell. Segments, quads, pixels, hexahedra and voxels."""
-    _refuse_mixed(data, "subdivide")
     names = selected(data, fields)
     level = default_level(data, *(data.fields[name] for name in names)) if level is None \
         else int(level)

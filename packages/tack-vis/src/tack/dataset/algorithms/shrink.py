@@ -7,7 +7,6 @@ import tack
 from tack.dataset.algorithms.project import project
 from tack.dataset.dataset import DataSet, Field
 from tack.dataset.spaces import H1, L2, Values
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['shrink']
@@ -34,8 +33,6 @@ def shrink(data, factor=0.5, fields=None):
     topology, and point data becomes ``L2`` the same way (each cell's own copy
     of its corners' values). Everything else is kept, the topology's faces and
     edges with it."""
-    _refuse_mixed(data, "shrink")
-
     if not 0 <= factor <= 1:
         raise ValueError(f"factor must lie in [0, 1], not {factor!r}")
     corners = project(data, data.geometry, L2(data))

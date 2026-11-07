@@ -97,6 +97,52 @@ def _with_fields(data, device):
     return data
 
 
+def _mixed_hexes(device):
+    """``_hexes`` with cells 0, 3 and 5 polyhedra of the same faces, beside the
+    hexahedra in one topology (#307; ``test_mixed_cells._mixed``)."""
+    from test_mixed_cells import _mixed
+
+    shaped = _hexes(device)
+    with device:
+        topology = _mixed(shaped.topology, [0, 3, 5])
+    return _with_fields(td.DataSet(topology, shaped.geometry.values), device)
+
+
+def _polygons(device):
+    """A flat surface of 3 x 2 quads with two of them polygons of the same loops,
+    beside the quads in one topology."""
+    pts = np.array([[i, j, 0] for j in range(3) for i in range(4)], np.float32)
+    conn = [i + a + 4 * (j + b) for j in range(2) for i in range(3)
+            for a, b in ((0, 0), (1, 0), (1, 1), (0, 1))]
+    types = np.full(6, 9, np.uint8)
+    types[[0, 4]] = 7
+    topology = td.UnstructuredTopology(
+        tack.array(types, tack.u8, device=device),
+        tack.array(np.arange(0, 25, 4, dtype=np.int32), device=device),
+        tack.array(np.array(conn, np.int32), device=device), num_points=len(pts))
+    return _with_fields(td.DataSet(topology, tack.array(pts, tack.vec3(), device=device)),
+                        device)
+
+
+#: The datasets the sweeps run every call on.
+MAKERS = {"hexes": _hexes, "grid": lambda device: _grid(device), "mixed": _mixed_hexes,
+          "polygons": _polygons}
+
+
+def _called(name, make, data):
+    """``CALLS[name](data)``; ``None`` for a call a mixed dataset is refused, which
+    it checks is refused (``test_mixed_cells``' sweeps hold the rest to the shaped
+    meshes' answers)."""
+    if make in ("mixed", "polygons"):
+        import test_mixed_cells as mixed
+
+        if name not in (mixed.READY if make == "mixed" else mixed.READY_2D):
+            with pytest.raises((NotImplementedError, ValueError, TypeError)):
+                CALLS[name](data)
+            return None
+    return CALLS[name](data)
+
+
 def _point(device):
     """One point, where ``probe`` samples, as a dataset on ``device``."""
     with device:
@@ -247,12 +293,12 @@ def _results(value):
 
 
 @pytest.mark.parametrize("name", CALLS)
-@pytest.mark.parametrize("make", ["hexes", "grid"])
+@pytest.mark.parametrize("make", list(MAKERS))
 def test_every_algorithm_runs_on_the_datasets_device(second, name, make):
     """The default is the CPU; the dataset is on the second device. Before, the
     first launch met a temporary on the default device ("arrays on two devices")."""
-    data = (_hexes if make == "hexes" else _grid)(second)
-    result = CALLS[name](data)
+    data = MAKERS[make](second)
+    result = _called(name, make, data)
     for part in _results(result):
         assert _on(second, part), f"{name} left {part!r} on another device"
     assert _on(second, data)          # nothing derived it elsewhere
@@ -284,19 +330,19 @@ def test_point_gradients_at_singular_corners_run_without_f64(no_f64):
 
 
 @pytest.mark.parametrize("name", CALLS)
-@pytest.mark.parametrize("make", ["hexes", "grid"])
+@pytest.mark.parametrize("make", list(MAKERS))
 def test_every_algorithm_runs_on_a_device_without_f64(no_f64, name, make):
     """As on Metal, everywhere: an algorithm must not make an f64 array for its
     kernels on a device that has none (Metal's round found one in ghost_points,
     and octrees' fields)."""
-    data = (_hexes if make == "hexes" else _grid)(no_f64)
-    for part in _results(CALLS[name](data)):
+    data = MAKERS[make](no_f64)
+    for part in _results(_called(name, make, data)):
         assert _on(no_f64, part), f"{name} left {part!r} on another device"
 
 
-@pytest.mark.parametrize("make", ["hexes", "grid"])
+@pytest.mark.parametrize("make", ["hexes", "grid", "mixed"])
 def test_derived_state_and_iteration_are_on_the_datasets_device(second, make):
-    data = (_hexes if make == "hexes" else _grid)(second)
+    data = MAKERS[make](second)
     faces = data.topology.faces()
     assert _on(second, faces) and _on(second, faces.boundary())
     assert _on(second, data.topology.edges())
@@ -305,20 +351,22 @@ def test_derived_state_and_iteration_are_on_the_datasets_device(second, make):
     assert _on(second, td.Set.from_sides(data, [0], [0]))
     data.sets["edge"] = td.Set(data, "edges", [0, 3])
     assert _on(second, data.sets["edge"]) and _on(second, td.extract_edges(data, "edge"))
-    assert td.H1(data, order=2).size > data.num_points
+    if make != "mixed":                 # no H1 above order 1 without reference cells
+        assert td.H1(data, order=2).size > data.num_points
     found = td.CellLocator(data).find(tack.array(np.array([[0.5, 0.5, 0.5]], np.float32),
                                                  tack.vec3(), device=second))
-    assert _on(second, found.cells) and _on(second, found.pcs) and found.tets is None
+    assert _on(second, found.cells) and _on(second, found.pcs)
+    assert found.tets is None if make != "mixed" else _on(second, found.tets)
 
 
-@pytest.mark.parametrize("make", ["hexes", "grid"])
+@pytest.mark.parametrize("make", ["hexes", "grid", "mixed"])
 def test_the_public_building_blocks_run_on_the_datasets_device(second, make):
     """What filters of one's own are written with (`visible`, `owned_values`,
     `carry`), on marked data, so each allocates, and `orient`: called directly,
     not from inside an algorithm that already made the dataset's device the
     default, they once allocated on the default device ("arrays on two
     devices")."""
-    data = (_hexes if make == "hexes" else _grid)(second)
+    data = MAKERS[make](second)
     cells = np.zeros(data.num_cells, np.uint8)
     cells[0] = td.Ghosts.HIDDENCELL
     cells[1] = td.Ghosts.DUPLICATECELL
@@ -354,19 +402,19 @@ def test_a_dataset_refuses_parts_on_two_devices(second):
         td.contour(data, "s", 3.0)
 
 
-@pytest.mark.parametrize("make", ["hexes", "grid", "polyhedra"])
+@pytest.mark.parametrize("make", ["hexes", "grid", "polyhedra", "mixed", "polygons"])
 def test_to_device_moves_everything_and_computes_the_same(second, make):
     here = tack.device("cpu")
-    data = {"hexes": lambda: _hexes(here), "grid": lambda: _grid(here),
-            "polyhedra": lambda: td.as_polyhedra(_hexes(here))}[make]()
+    data = {"polyhedra": lambda: td.as_polyhedra(_hexes(here))}.get(
+        make, lambda: MAKERS[make](here))()
     moved = data.to_device(second)
     assert moved is not data and _on(second, moved) and moved.device == second
     assert all(_on(second, f) for f in moved.fields.values())
     assert all(_on(second, s) for s in moved.sets.values())
     assert set(moved.fields) == set(data.fields) and set(moved.sets) == set(data.sets)
     np.testing.assert_array_equal(moved.positions(), data.positions())
-    a = td.cell_centers(data) if make != "polyhedra" else td.cell_geometry(data).centroid
-    b = td.cell_centers(moved) if make != "polyhedra" else td.cell_geometry(moved).centroid
+    a, b = (td.cell_centers(d) if make not in ("polyhedra", "mixed")
+            else td.cell_geometry(d).centroid for d in (data, moved))
     np.testing.assert_allclose(arrays.to_host(b.values), arrays.to_host(a.values))
     assert moved.to_device(second) is moved and data.to_device(here) is data
 

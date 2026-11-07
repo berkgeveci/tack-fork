@@ -357,20 +357,6 @@ def _refuse(kind, found):
         raise ValueError(f"invalid {kind}: " + "; ".join(found))
 
 
-def _refuse_mixed(data, what):
-    """Refuse ``data`` (a dataset, or pieces of them) whose topology holds polyhedra
-    beside shaped cells, for an algorithm that does not take them yet (#307), rather
-    than computing on some of its cells."""
-    pieces = data if isinstance(data, (list, tuple)) or type(data).__name__ == \
-        "PartitionedDataSet" else [data]
-    for piece in pieces:
-        if getattr(getattr(piece, "topology", None), "mixed", False):
-            raise NotImplementedError(
-                f"{what} does not take polyhedra or polygons beside shaped cells yet (#307); "
-                "as_polyhedra (as_polygons, of a surface) makes every cell one, which it "
-                "does take, as does vtk_to_dataset(..., polyhedral=True)")
-
-
 def _checks_ids():
     """Whether topologies check their ids when made: in debug mode
     (`tack.set_debug`, ``TACK_DEBUG``), where a bad id would otherwise be read
