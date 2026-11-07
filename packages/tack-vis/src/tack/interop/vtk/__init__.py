@@ -844,6 +844,93 @@ def _polyhedral_topology(grid, orient=False, id_dtype=None, cells=None):
         raise
 
 
+def _mixed_polyhedra(grid, types, orient=False):
+    """The polyhedra of a ``vtkUnstructuredGrid`` that has shaped cells beside them, as
+    an ``UnstructuredTopology`` keeps them (its ``polyhedra``): ``(face_offsets,
+    face_points, cell_face_offsets, cell_faces, cell_face_sides)``, host arrays.
+
+    VTK keeps each face once per cell, outward for that cell; the polyhedra's copies
+    are matched among themselves by point set (``_match_rings``), the first found
+    the face, its cell side 0. A face a polyhedron shares with a shaped cell is
+    the polyhedron's copy, and ``faces()`` makes the shaped cell its other side.
+    ``types`` is the grid's cell types (a NumPy array). Copies wound the same way
+    by both their polyhedra are refused, or, with ``orient``, the polyhedra are
+    made consistent among themselves and outward (``PolyhedralTopology.
+    from_cell_faces``), on the host."""
+    import numpy as np
+
+    from tack.dataset import PolyhedralTopology
+    from tack.dataset.polyhedra import _match_rings, _ranges
+
+    n = types.size
+    polyhedra = np.flatnonzero(types == 42)
+    locations, faces = grid.polyhedron_face_locations, grid.polyhedron_faces
+    loc_offsets = np.asarray(locations.offsets_array).astype(np.int64)
+    loc_faces = np.asarray(locations.connectivity_array).astype(np.int64)
+    face_offsets = np.asarray(faces.offsets_array).astype(np.int64)
+    face_conn = np.asarray(faces.connectivity_array)
+    ids = np.int32 if grid.number_of_points < 2**31 else np.int64
+    count = loc_offsets[polyhedra + 1] - loc_offsets[polyhedra]
+    listed = loc_faces[_ranges(loc_offsets[polyhedra], count)]
+    sizes = face_offsets[listed + 1] - face_offsets[listed]
+    ring_points = face_conn[_ranges(face_offsets[listed], sizes)].astype(ids)
+    ring_offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+    out_offsets, out_points, cell_faces, sides, same_way = _match_rings(ring_offsets,
+                                                                        ring_points)
+    inside_out = 0 if same_way else _inside_out_rings(grid, count, ring_offsets, ring_points)
+    if inside_out and not orient:
+        import warnings
+
+        warnings.warn(f"{inside_out} polyhedra are inside out: their faces agree with their "
+                      "neighbours' but point inward, so their volumes are negative; "
+                      "vtk_to_dataset(..., orient=True) turns them outward", stacklevel=5)
+    if same_way or (inside_out and orient):
+        if not orient:
+            raise ValueError(f"{same_way} faces two polyhedra share are wound the same way by "
+                             "both. VTK winds every polyhedron face outward for its cell; "
+                             "vtk_to_dataset(..., orient=True) repairs the input")
+        starts = np.concatenate([[0], np.cumsum(count)])
+        rings = [[ring_points[ring_offsets[r]:ring_offsets[r + 1]].tolist()
+                  for r in range(starts[c], starts[c + 1])] for c in range(polyhedra.size)]
+        oriented = PolyhedralTopology.from_cell_faces(
+            rings, grid.number_of_points, positions=_vtk_points(grid), orient=True)
+        out_offsets, out_points, poly_offsets, cell_faces, sides = oriented.arrays()
+        count = np.diff(poly_offsets)
+    per_cell = np.zeros(n, np.int64)
+    per_cell[polyhedra] = count
+    cell_face_offsets = np.concatenate([[0], np.cumsum(per_cell)]).astype(np.int64)
+    return (np.asarray(out_offsets, np.int64), np.asarray(out_points), cell_face_offsets,
+            np.asarray(cell_faces), np.asarray(sides, np.uint8))
+
+
+def _inside_out_rings(grid, count, ring_offsets, ring_points):
+    """How many polyhedra, each ``count`` rings of ``ring_offsets``/``ring_points`` as
+    VTK lists them (outward for the cell), have a negative volume: each ring fanned
+    from its first point, the cell's volume the sum of the fans' signed volumes about
+    the origin (exact for a closed cell, wherever the origin is). On the host, in
+    whole-array steps."""
+    import numpy as np
+
+    if not count.size:
+        return 0
+    x = _vtk_points(grid).astype(np.float64)
+    sizes = np.diff(ring_offsets)
+    first = np.repeat(ring_offsets[:-1], sizes)
+    j = np.arange(ring_points.size, dtype=np.int64) - first
+    following = first + (j + 1) % np.repeat(sizes, sizes)
+    # Triangles (first, j, j + 1) for j from 1 to size - 2 of each ring.
+    fan = (j >= 1) & (j <= np.repeat(sizes, sizes) - 2)
+    a = x[ring_points[first[fan]]]
+    b = x[ring_points[np.flatnonzero(fan)]]
+    c = x[ring_points[following[fan]]]
+    signed = np.einsum("ij,ij->i", a, np.cross(b, c))
+    ring_of = np.repeat(np.arange(sizes.size), sizes)[fan]
+    per_ring = np.bincount(ring_of, signed, minlength=sizes.size)
+    cell_of = np.repeat(np.arange(count.size), count)
+    volumes = np.bincount(cell_of, per_ring, minlength=count.size)
+    return int(np.count_nonzero(volumes < 0))
+
+
 def _inside_out_polyhedra(grid, topology, listed, orient):
     """Whether any of ``topology``'s cells that VTK listed as polyhedra (``listed``, a
     flag a cell) are inside out: their faces agree with their neighbours' -- the
@@ -925,7 +1012,9 @@ def _split_polyhedra(grid, options):
     polyhedra = np.flatnonzero(types == 42)
     shaped = np.flatnonzero(types != 42)
     if not polyhedra.size or not shaped.size:
-        return PartitionedDataSet([_vtk_to_dataset(grid, **whole)])
+        # One kind: one piece, its polyhedra a PolyhedralTopology as the split's are.
+        return PartitionedDataSet([_vtk_to_dataset(grid, **{**whole,
+                                                            "polyhedral": bool(polyhedra.size)})])
     stored = grid.GetCells()
     offsets = np.asarray(stored.offsets_array).astype(np.int64)
     connectivity = np.asarray(stored.connectivity_array)
@@ -1006,13 +1095,14 @@ def vtk_to_dataset(grid, dtype=_DEFAULT_FLOAT, polyhedral=None, orient=False, id
     unstructured grid's cells must all be linear shapes -- or all VTK Lagrange
     curves, quadrilaterals or hexahedra of one order ``p``, which become linear
     cells on their corner points, with the geometry and point data in
-    ``H1(order=p, basis="equispaced")`` (VTK's Lagrange nodes) -- unless it holds
-    polyhedra (or ``polyhedral`` is true), when it becomes a
-    ``PolyhedralTopology``, every cell a polyhedron of its faces (with
-    ``polyhedral="split"``, a ``PartitionedDataSet`` instead: its shaped cells one
-    piece, its polyhedra another, over the same points; see ``_split_polyhedra``), polylines,
-    when it becomes a ``PolylineTopology`` (its lines two-point polylines, and
-    no other cells allowed), or polygons (``VTK_POLYGON``), when it becomes a
+    ``H1(order=p, basis="equispaced")`` (VTK's Lagrange nodes). Polyhedra stand
+    beside the shapes in one ``UnstructuredTopology``, their faces matched once
+    (``_mixed_polyhedra``); with ``polyhedral=True`` (or ``"all"``) the grid becomes
+    a ``PolyhedralTopology`` instead, every cell a polyhedron of its faces, and with
+    ``polyhedral="split"`` a ``PartitionedDataSet``: its shaped cells one piece,
+    its polyhedra another, over the same points (``_split_polyhedra``). A grid of
+    polylines becomes a ``PolylineTopology`` (its lines two-point polylines, and
+    no other cells allowed), and one of polygons (``VTK_POLYGON``) a
     ``PolygonalTopology`` (its triangles and quads polygons too, and no other
     cells allowed). Its types, offsets and connectivity stay implicit where
     VTK's are (a cell type given as a number, affine offsets). Hexahedra with
@@ -1502,8 +1592,11 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
                    else _present_types(np.asarray(types)))
         if polyhedral == "split":
             return _split_polyhedra(grid, options)
-        if polyhedral is None:
-            polyhedral = 42 in present
+        if polyhedral == "all":
+            polyhedral = True
+        elif isinstance(polyhedral, str):
+            raise ValueError(f"polyhedral is None, True, 'all' or 'split', not {polyhedral!r}")
+        # Without it, polyhedra are read beside the shaped cells, as VTK holds them.
         from tack.interop.vtk import _lagrange
 
         if present & (_lagrange.HIGHER_ORDER | set(_lagrange.REFUSED)):
@@ -1560,7 +1653,7 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
             from tack.dataset.shapes import _BY_ID
 
             # Refused here, by VTK's names, rather than by the first algorithm.
-            unknown = sorted(present - set(_BY_ID))
+            unknown = sorted(present - set(_BY_ID) - {42})
             if unknown:
                 from vtkmodules.vtkCommonDataModel import vtkCellTypeUtilities
 
@@ -1575,8 +1668,10 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
                 collapsed = _collapsed_hexahedra(types, offsets, connectivity)
                 if collapsed is not None:
                     types, offsets, connectivity = collapsed
+            polyhedra = (_mixed_polyhedra(grid, np.asarray(grid.cell_types), orient)
+                         if 42 in present else None)
             topology = UnstructuredTopology(types, offsets, connectivity, num_points=num_points,
-                                            id_dtype=id_dtype)
+                                            id_dtype=id_dtype, polyhedra=polyhedra)
         geometry, geometry_dtype = _points_geometry(grid, shift, dtype, share, device)
     elif isinstance(grid, vtkImageData):
         dims = list(grid.dimensions)
@@ -2326,6 +2421,33 @@ def dataset_to_vtk(data, copy=True, higher_order=False, cell_grid=False):
     return out
 
 
+def _vtk_face_copies(topology):
+    """An ``UnstructuredTopology``'s polyhedra as VTK keeps them: ``(face_locations,
+    faces)``, ``vtkCellArray``s. VTK keeps a face once per cell, outward for that
+    cell, so side 1's copy is the face walked backwards from the same first point;
+    a shaped cell lists no faces. Built in whole-array steps."""
+    import numpy as np
+    from vtkmodules.vtkCommonCore import vtkAffineArray
+    from vtkmodules.vtkCommonDataModel import vtkCellArray
+
+    face_offsets, face_points, cell_face_offsets, cell_faces, sides = (
+        getattr(topology, name).numpy() for name in topology._POLYHEDRAL)
+    face_offsets = face_offsets.astype(np.int64)
+    sizes = face_offsets[cell_faces + 1] - face_offsets[cell_faces]
+    copy_offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+    # Point j of a copy: the face's point j on side 0; on side 1, its point
+    # (n - j) mod n, the face reversed from the same first point.
+    j = np.arange(int(copy_offsets[-1]), dtype=np.int64) - np.repeat(copy_offsets[:-1], sizes)
+    n = np.repeat(sizes, sizes)
+    turned = np.repeat(sides.astype(bool), sizes)
+    at = np.where(turned, (n - j) % n, j)
+    copies = face_points[np.repeat(face_offsets[cell_faces], sizes) + at]
+    locations = vtkCellArray(offsets=np.asarray(cell_face_offsets, np.int64),
+                             connectivity=vtkAffineArray[np.int64](len(cell_faces), 1, 0))
+    faces = vtkCellArray(offsets=copy_offsets, connectivity=np.asarray(copies, np.int64))
+    return locations, faces
+
+
 def _dataset_to_vtk(data, copy=True):
     """``dataset_to_vtk`` before the time is stamped."""
     import numpy as np
@@ -2411,7 +2533,11 @@ def _dataset_to_vtk(data, copy=True):
         grid.points = _vtk_points_of(data, share)
         types = _to_vtk_types(topology.types, share)
         cells = _vtk_cells(topology.offsets, topology.connectivity, share)
-        if isinstance(types, int):
+        if topology.has_polyhedra:
+            if isinstance(types, int):
+                types = vtkUnsignedCharArray(np.full(topology.num_cells, types, np.uint8))
+            grid.SetPolyhedralCells(types, cells, *_vtk_face_copies(topology))
+        elif isinstance(types, int):
             grid.cells = (types, cells)
         else:
             # What SetCells (the pythonic ``cells``) does after it has looked through

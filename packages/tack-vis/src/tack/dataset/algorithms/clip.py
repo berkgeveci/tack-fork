@@ -26,7 +26,7 @@ from tack.dataset.buckets import key_order, run_offsets
 from tack.dataset.carry import Interpolate, Pieces, _point_values, carry
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import H1, Values
-from tack.dataset.topology import UnstructuredTopology
+from tack.dataset.topology import UnstructuredTopology, _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['clip']
@@ -291,6 +291,7 @@ def clip(data, by, value=0.0, inside=False, fields=None, subdivision=None, toler
     on sub-cells' edges are where the field takes the value along them
     (``exact``, as ``contour``'s), or with ``exact=False`` where the line
     between the lattice values does."""
+    _refuse_mixed(data, "clip")
     from tack.dataset.ghosts import visible
 
     data, by = visible(data, by)

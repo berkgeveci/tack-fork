@@ -12,6 +12,7 @@ from tack.dataset.algorithms.traces import traces
 from tack.dataset.carry import _like
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import Values, reference_cells
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['jump']
@@ -68,6 +69,7 @@ def jump(data, field):
     wrong, and each side's basis is evaluated there. Cell data (``Constant``, values on
     cells) is read from each side's cell directly, on any topology, polyhedral
     included."""
+    _refuse_mixed(data, "jump")
     field = _field(data, field)
     faces = data.topology.faces()
     out = _like(field.values, faces.num_faces)

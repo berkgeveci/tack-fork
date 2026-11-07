@@ -620,6 +620,51 @@ class _SelectedPolyhedra(_PolyhedralCells):
 _PolyhedralCells._selected = _SelectedPolyhedra
 
 
+class _MixedPolyhedra(_PolyhedralCells):
+    """The polyhedra of an unstructured topology that also holds shaped cells: the
+    ``num_cells`` cells ``ids`` (global cell ids). The arrays are the topology's,
+    indexed by global cell id: ``cell_offsets`` has an entry per cell (a shaped
+    cell's range empty), and a cell's points are its run of the connectivity.
+    ``index(c)`` is the cell's position in the group, as a shaped group's is."""
+
+    def __init__(self, cell_offsets, cell_faces, cell_face_sides, face_offsets, face_points,
+                 point_offsets, point_ids, ids, num_cells):
+        super().__init__(cell_offsets, cell_faces, cell_face_sides, face_offsets, face_points,
+                         point_offsets, point_ids, num_cells)
+        self.ids = ids
+
+    @tack.func
+    def cell(self, c):
+        return self.ids[c]
+
+    @tack.func
+    def index(self, c):
+        return c
+
+
+class _SelectedMixedPolyhedra(_MixedPolyhedra):
+    """A subgroup of `_MixedPolyhedra`: ``num_cells`` of the group's positions
+    ``selected`` from ``first``."""
+
+    def __init__(self, cell_offsets, cell_faces, cell_face_sides, face_offsets, face_points,
+                 point_offsets, point_ids, ids, num_cells, selected, first):
+        super().__init__(cell_offsets, cell_faces, cell_face_sides, face_offsets, face_points,
+                         point_offsets, point_ids, ids, num_cells)
+        self.selected = selected
+        self.first = first
+
+    @tack.func
+    def cell(self, c):
+        return self.ids[self.selected[self.first + c]]
+
+    @tack.func
+    def index(self, c):
+        return self.selected[self.first + c]
+
+
+_MixedPolyhedra._selected = _SelectedMixedPolyhedra
+
+
 class _PolylineCells(_CellsById):
     """The cells of a polyline topology: each a chain of points,
     ``line_points[line_offsets[c]:line_offsets[c + 1]]``, at least two. Its facets

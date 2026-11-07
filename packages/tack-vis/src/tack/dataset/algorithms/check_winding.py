@@ -10,6 +10,7 @@ from tack.arrays import size_of
 from tack.dataset.buckets import key_order, run_offsets
 from tack.dataset.polyhedra import _cell_sizes
 from tack.dataset.sets import Set
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['check_winding']
@@ -85,6 +86,7 @@ def check_winding(data):
     walked their way, do not close into a loop. Polylines have no winding, and
     shape-based cells take their faces from their shape's table, so are refused.
     """
+    _refuse_mixed(data, "check_winding")
     t = getattr(data, "topology", data)
     if getattr(t, "reference_cells", True):
         raise TypeError("check_winding checks cells that list their faces (polyhedra and "

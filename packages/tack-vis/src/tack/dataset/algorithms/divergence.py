@@ -10,6 +10,7 @@ from tack.dataset.algorithms.net_flux import net_flux
 from tack.dataset.carry import _like
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import Values
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['divergence']
@@ -29,6 +30,7 @@ def divergence(data, flux):
     linear field it is the field's divergence. A cell of no measure gives no
     finite value, as ``perot`` and ``gradients`` give. ``flow_quantities`` gives
     the finite-element divergence instead, the trace of a field's gradient."""
+    _refuse_mixed(data, "divergence")
     net = net_flux(data, flux)
     measure = cell_geometry(data).measure
     out = _like(net.values, data.num_cells)

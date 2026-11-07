@@ -26,7 +26,7 @@ from tack.dataset.buckets import key_order, run_offsets
 from tack.dataset.carry import Interpolate, Pieces, _like, carry
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import H1, Values
-from tack.dataset.topology import UnstructuredTopology, uniform_cells
+from tack.dataset.topology import UnstructuredTopology, _refuse_mixed, uniform_cells
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['contour']
@@ -468,6 +468,7 @@ def contour(data, field, value, merge_points=True, fields=None, dimension=None,
     fields (``Constant``, values on cells) onto its triangles, from the cell
     each came from.
     """
+    _refuse_mixed(data, "contour")
     value = _in_unit_of(_field(data, field), value, "contour's value")
     from tack.dataset.ghosts import visible
 

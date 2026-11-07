@@ -10,6 +10,7 @@ from tack.dataset.algorithms._advection import _parameters, _run
 from tack.dataset.algorithms._common import _time_unit
 from tack.dataset.dataset import DataSet, Field
 from tack.dataset.spaces import Values
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['streamlines']
@@ -82,6 +83,7 @@ def streamlines(data, field, seeds, step_size, steps, integrator="rk4", locator=
 
     Over a ``PartitionedDataSet`` (``field`` by name), paths cross from piece to
     piece, each piece holding the stretches it traced."""
+    _refuse_mixed(data, "streamlines")
     # A step as a time ("0.5 s") is in the spatial unit over the velocity's; as
     # a length ("1 mm"), in the spatial unit.
     if step_unit not in ("time", "length"):

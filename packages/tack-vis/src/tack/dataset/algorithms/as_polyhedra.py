@@ -8,6 +8,7 @@ from tack.algorithms.scan import exclusive_scan
 from tack.dataset import ids, shapes
 from tack.dataset.carry import Same, carry
 from tack.dataset.polyhedra import PolyhedralTopology
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['as_polyhedra']
@@ -66,6 +67,7 @@ def as_polyhedra(data, fields=None):
     ``Constant`` and ``H1`` order-1 fields, values on points, cells, faces and
     edges, and sets carry over; fields needing a reference element are dropped.
     """
+    _refuse_mixed(data, "as_polyhedra")
     from tack.dataset.spaces import H1
 
     if not isinstance(data.geometry.space, H1) or data.geometry.space.order != 1:

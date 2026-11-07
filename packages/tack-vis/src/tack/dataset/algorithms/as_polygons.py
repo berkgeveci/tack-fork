@@ -8,6 +8,7 @@ from tack.algorithms.scan import exclusive_scan
 from tack.dataset import shapes
 from tack.dataset.carry import Same, carry
 from tack.dataset.polyhedra import PolygonalTopology
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['as_polygons']
@@ -36,6 +37,7 @@ def as_polygons(data, fields=None):
     ``as_polyhedra``'s do, but values on faces and edges, whose numbering the
     polygonal topology derives afresh, are dropped. A polygonal dataset comes
     back as it is (a new dataset on the same topology)."""
+    _refuse_mixed(data, "as_polygons")
 
     topology = data.topology
     if isinstance(topology, PolygonalTopology):

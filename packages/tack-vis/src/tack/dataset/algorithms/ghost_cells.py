@@ -46,7 +46,7 @@ from tack.dataset.global_ids import GlobalIds
 from tack.dataset.partitioned import PartitionedDataSet, common_origin
 from tack.dataset.sets import Set
 from tack.dataset.spaces import H1, Constant, Values
-from tack.dataset.topology import StructuredTopology, UnstructuredTopology
+from tack.dataset.topology import StructuredTopology, UnstructuredTopology, _refuse_mixed
 
 
 def _polyhedral(topology):
@@ -111,6 +111,7 @@ def ghost_cells(data, layers=1, world=None, fields=None, tolerance=0.0):
     grow too. Ghosts a finer box covers are marked refined. ``update_ghosts``
     refreshes them, ``average_down`` puts fine data into coarse cells.
     """
+    _refuse_mixed(data, "ghost_cells")
     if isinstance(layers, bool) or not isinstance(layers, (int, np.integer)) or layers < 1:
         raise ValueError(f"ghost_cells makes one or more layers, not {layers!r}")
     from tack.dataset.amr import AMRDataSet
@@ -199,6 +200,7 @@ def update_ghosts(data, *fields):
     rim; refreshing the ghosts makes a second such filter right too. Each named
     field is a point or cell field of explicit values on every piece. One
     exchange moves all the point fields, one all the cell fields."""
+    _refuse_mixed(data, "update_ghosts")
     from tack.dataset.amr import AMRDataSet
 
     if isinstance(data, AMRDataSet):

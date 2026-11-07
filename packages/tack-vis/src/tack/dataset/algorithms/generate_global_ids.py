@@ -15,7 +15,7 @@ from tack.dataset.dataset import DataSet
 from tack.dataset.ghosts import Ghosts
 from tack.dataset.global_ids import GlobalIds
 from tack.dataset.partitioned import PartitionedDataSet, common_origin
-from tack.dataset.topology import StructuredTopology
+from tack.dataset.topology import StructuredTopology, _refuse_mixed
 
 __all__ = ["generate_global_ids"]
 
@@ -53,6 +53,7 @@ def generate_global_ids(data, world=None, tolerance=0.0):
     ``tack.communication.World`` they live in (``data.world`` by default).
     The matching runs on the host and the exchanges on the pieces' devices.
     """
+    _refuse_mixed(data, "generate_global_ids")
     if not isinstance(data, PartitionedDataSet):
         raise TypeError(f"generate_global_ids takes a PartitionedDataSet, not "
                         f"{type(data).__name__}")

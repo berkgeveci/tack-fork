@@ -524,16 +524,19 @@ so.
 
 | Option | Does | Use it for |
 |---|---|---|
-| `polyhedral=True` | reads every cell as a polyhedron of its faces | a mesh to treat as polyhedra throughout |
-| `polyhedral="split"` | gives a `PartitionedDataSet` of two pieces over the same points: the shaped cells, and the polyhedra | a large mesh with a few polyhedra, so the shaped cells stay shaped |
+| `polyhedral=True` | reads every cell as a polyhedron of its faces | a mesh to treat as polyhedra throughout, or an algorithm that does not take polyhedra beside shaped cells yet |
+| `polyhedral="split"` | gives a `PartitionedDataSet` of two pieces over the same points: the shaped cells, and the polyhedra | the same, keeping the shaped cells shaped |
 | `merge_points=True` (or a tolerance) | merges coincident points before anything else is read | a mesh written per processor and put together without merging, such as OpenFOAM's `foamToVTK` of a decomposed case |
 | `orient=True` | turns inside-out cells outward, and repairs inconsistently wound polyhedra | meshes from converters that write cells in the reverse of VTK's order |
 | `id_dtype` | the topology's id type; by default `i32`, unless the grid is too large for it | choosing the id width yourself |
 
-A topology holds either shaped cells or polyhedra for now, which is why a grid
-that has any polyhedra reads as polyhedra. With `polyhedral="split"`, each
-point is owned by one of the two pieces, so reductions count it once; see
-[Pieces](../data/pieces.md).
+By default a grid's polyhedra stand beside its shaped cells in one
+`UnstructuredTopology`, as VTK holds them: one point and one cell numbering,
+and a face a hexahedron and a polyhedron share is one face with both as its
+sides. Algorithms are taking such meshes one by one; one that does not yet
+says so by name, and `polyhedral=True` reads the mesh the way it takes. With
+`polyhedral="split"`, each point is owned by one of the two pieces, so
+reductions count it once; see [Pieces](../data/pieces.md).
 
 Inside-out cells are found on every read and named in a warning. Wedges are
 the usual case: VTK's documentation long described the wedge's corner order

@@ -16,7 +16,7 @@ from tack.dataset.carry import Pieces, Same, Take, _take, carry, selected
 from tack.dataset.dataset import Field
 from tack.dataset.sets import Set
 from tack.dataset.spaces import H1
-from tack.dataset.topology import UnstructuredTopology, _face_row, _same_key
+from tack.dataset.topology import UnstructuredTopology, _face_row, _refuse_mixed, _same_key
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['extract_surface']
@@ -255,6 +255,7 @@ def extract_surface(data, faces=None, fields=None):
     is on a boundary, and each piece's surface is its own, its ghost faces
     marked. The surface's points are owned once (``generate_global_ids`` marks
     them where the pieces had no ghost cells)."""
+    _refuse_mixed(data, "extract_surface")
     from tack.dataset.ghosts import refuse_hidden, visible
     from tack.dataset.partitioned import PartitionedDataSet
 

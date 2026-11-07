@@ -8,6 +8,7 @@ from tack.arrays import materialize
 from tack.dataset.algorithms._common import _vectors
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import Values
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['cell_centers']
@@ -30,6 +31,7 @@ def cell_centers(data):
     *cell point*, the mean of its distinct points, where its interpolation fans
     its faces from. That is not the centroid either, unless the points are
     spread evenly."""
+    _refuse_mixed(data, "cell_centers")
     out = _vectors(data.num_cells, data.dtype)
     if not getattr(data.topology, "reference_cells", True):
         from tack.dataset.algorithms.project import _distinct_point_means

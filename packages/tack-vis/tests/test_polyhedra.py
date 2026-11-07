@@ -277,7 +277,7 @@ def _check_vtk_round_trip(data):
         volumes.append(cell.ComputeVolume())
     assert min(volumes) > 0
     assert vtk.vtkGeometryFilter()(grid).number_of_cells == t.faces().boundary().shape[0]
-    back = vtk_to_dataset(grid)
+    back = vtk_to_dataset(grid, polyhedral=True)
     assert isinstance(back.topology, td.PolyhedralTopology)
     ours = _faces_by_points(t)
     theirs = _faces_by_points(back.topology)
@@ -339,7 +339,7 @@ def test_polyhedra_from_vtk_data(backend, name):
         with pytest.raises(ValueError, match="wound the same way"):
             vtk_to_dataset(grid)
         return
-    data = vtk_to_dataset(grid)
+    data = vtk_to_dataset(grid, polyhedral=True)
     assert isinstance(data.topology, td.PolyhedralTopology)
     assert data.num_cells == grid.number_of_cells
     surface = vtk.vtkGeometryFilter()(grid)
@@ -937,8 +937,8 @@ def _cgns(name):
 def test_cgns_in_both_polyhedral_conventions(backend):
     """NFACE_n (a sign per cell -> face reference) and NGON_n with ParentElements
     (owner and neighbour): the same mesh, consistently wound either way."""
-    nface = vtk_to_dataset(_cgns("Example_nface_n.cgns"))
-    ngon = vtk_to_dataset(_cgns("Example_ngon_pe.cgns"))
+    nface = vtk_to_dataset(_cgns("Example_nface_n.cgns"), polyhedral=True)
+    ngon = vtk_to_dataset(_cgns("Example_ngon_pe.cgns"), polyhedral=True)
     for data in (nface, ngon):
         assert isinstance(data.topology, td.PolyhedralTopology)
         assert len(td.check_winding(data)) == 0
@@ -958,7 +958,7 @@ def test_a_real_cfd_mesh_needs_orienting(backend):
     grid = _cgns("EngineSector.cgns")
     with pytest.raises(ValueError, match="orient=True"):
         vtk_to_dataset(grid)
-    data = vtk_to_dataset(grid, orient=True)
+    data = vtk_to_dataset(grid, orient=True, polyhedral=True)
     assert data.num_cells == 1956 and len(td.check_winding(data)) == 0
     assert (td.algorithms.cell_geometry(data)[0].values.numpy() > 0).all()
     surface = vtk.vtkGeometryFilter()(dataset_to_vtk(data))

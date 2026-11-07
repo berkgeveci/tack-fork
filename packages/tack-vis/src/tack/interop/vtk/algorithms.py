@@ -288,6 +288,17 @@ def _entry(vtk_data):
     return entry if entry is not None and entry[0] == _key(vtk_data) else None
 
 
+def _converted(vtk_data):
+    """``vtk_to_dataset(vtk_data, dtype=None, copy=False)``, a grid with polyhedra read
+    with every cell a polyhedron: most filters do not take polyhedra beside shaped
+    cells yet (#307), and each wrapper keeps the reading it had."""
+    from tack.interop.vtk import vtk_to_dataset
+
+    faces = vtk_data.GetPolyhedronFaces() if hasattr(vtk_data, "GetPolyhedronFaces") else None
+    polyhedral = True if faces is not None and faces.GetNumberOfCells() else None
+    return vtk_to_dataset(vtk_data, dtype=None, copy=False, polyhedral=polyhedral)
+
+
 def _as_dataset(vtk_data, device=None, world=None):
     """``vtk_to_dataset(vtk_data, dtype=None, copy=False)``, the same Tack dataset for
     the same VTK dataset unchanged (each piece of a ``vtkPartitionedDataSet``);
@@ -313,7 +324,7 @@ def _as_dataset(vtk_data, device=None, world=None):
         return data
     entry = _entry(vtk_data)
     if entry is None:
-        _remember(vtk_data, vtk_to_dataset(vtk_data, dtype=None, copy=False))
+        _remember(vtk_data, _converted(vtk_data))
         entry = getattr(vtk_data, _CACHE)
     copies = entry[1]
     data = copies[None]

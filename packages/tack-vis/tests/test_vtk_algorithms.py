@@ -776,8 +776,11 @@ def _cloud_pieces():
 
 
 def _tack(vtk_data):
-    """The Tack dataset (or pieces) a wrapper sees."""
-    return vtk_to_dataset(vtk_data, dtype=None)
+    """The Tack dataset (or pieces) a wrapper sees: a grid with polyhedra read with
+    every cell a polyhedron (``algorithms._converted``)."""
+    faces = vtk_data.GetPolyhedronFaces() if hasattr(vtk_data, "GetPolyhedronFaces") else None
+    polyhedral = True if faces is not None and faces.GetNumberOfCells() else None
+    return vtk_to_dataset(vtk_data, dtype=None, polyhedral=polyhedral)
 
 
 def _with(data, fields):

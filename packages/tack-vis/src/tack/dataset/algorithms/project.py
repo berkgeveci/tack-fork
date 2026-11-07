@@ -22,7 +22,7 @@ from tack.dataset.buckets import bucket_order
 from tack.dataset.carry import _like, _take
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import H1, L2, Constant, SideTraces, Values, reference_cells
-from tack.dataset.topology import UnstructuredTopology, corner_layout
+from tack.dataset.topology import UnstructuredTopology, _refuse_mixed, corner_layout
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['project']
@@ -359,6 +359,7 @@ def project(data, field, space, *, average="integral"):
     points). The values must be floating point, scalars or vectors, except from
     order-1 ``H1`` into order-1 ``L2``, which copies them and takes integers too.
     """
+    _refuse_mixed(data, "project")
     if average not in _AVERAGES:
         raise ValueError(f"average is one of {', '.join(map(repr, _AVERAGES))}, "
                          f"not {average!r}")

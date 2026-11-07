@@ -9,6 +9,7 @@ from tack.dataset.algorithms._common import _field, _with_basis
 from tack.dataset.carry import _like
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import H1, Constant, Values
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['values_at_centers']
@@ -29,6 +30,7 @@ def values_at_centers(data, field):
     takes its value there, the mean of the cell's distinct points' values: the
     value of the cell's interpolant, linear on tetrahedra fanned from that
     point. Cell data (``Constant``) is its own value."""
+    _refuse_mixed(data, "values_at_centers")
     field = _with_basis(data, _field(data, field))
     out = _like(field.values, data.num_cells)
     if getattr(data.topology, "reference_cells", True):

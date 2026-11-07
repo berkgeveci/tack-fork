@@ -10,7 +10,7 @@ from tack.dataset import ids
 from tack.dataset.buckets import bucket_order
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import H1, L2, Constant, Values, reference_cells
-from tack.dataset.topology import corner_layout
+from tack.dataset.topology import _refuse_mixed, corner_layout
 from tack.lang.func import Func
 from tack.runtime.dispatch import on_inputs_device
 
@@ -215,6 +215,7 @@ def interpolate(data, function, space, dtype=None, unit=None):
 
     ``unit`` is the values' unit (``Field.unit``): a function's code does not say
     it, so by default it is unknown."""
+    _refuse_mixed(data, "interpolate")
     if not isinstance(function, Func):
         raise TypeError(f"interpolate takes a @tack.func of position, not {function!r}")
     if space.topology is not data.topology:

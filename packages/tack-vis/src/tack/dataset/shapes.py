@@ -301,6 +301,10 @@ class Shape:
     ``is_inside``, and the Newton step for its dimension (``_newton_step``).
     """
 
+    #: A reference element: parametric coordinates and shape functions. A cell
+    #: without one (``Polyhedron``, ``Polygon``, ``PolyLine``) says false, and an
+    #: algorithm takes its group's polyhedral path.
+    REFERENCE = True
     NUM_EDGES = 0
     NUM_FACES = 0
     #: The most triangles one cell of the shape contours to; 0 for shapes
@@ -1326,6 +1330,7 @@ class _NoReference:
     counts host-side code reads (none fixed). Not a ``Shape``, whose methods all
     assume fixed points and shape functions."""
 
+    REFERENCE = False
     NUM_EDGES = 0
     NUM_FACES = 0
     CONTOUR_TRIANGLES = 0

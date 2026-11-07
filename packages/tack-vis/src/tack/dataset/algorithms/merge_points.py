@@ -24,7 +24,7 @@ from tack.dataset.polyhedra import (
     _side_counts,
 )
 from tack.dataset.spaces import H1
-from tack.dataset.topology import StructuredTopology, UnstructuredTopology
+from tack.dataset.topology import StructuredTopology, UnstructuredTopology, _refuse_mixed
 from tack.runtime.dispatch import get_backend, on_inputs_device
 
 __all__ = ["merge_points"]
@@ -186,6 +186,7 @@ def merge_points(data, tolerance=0.0, fields=None):
     more than two cells, are refused. Polygonal and polyline topologies derive
     their facets from the merged loops and lines. Hidden cells are dropped
     first, as every filter that makes cells drops them."""
+    _refuse_mixed(data, "merge_points")
     tolerance = _length(data, tolerance, "merge_points's tolerance")
     if not tolerance >= 0:
         raise ValueError(f"tolerance must be at least zero, not {tolerance!r}")

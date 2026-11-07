@@ -4,6 +4,7 @@
 """``tetrahedralize``: every 3D cell as tetrahedra that meet face to face, as VTK's vtkDataSetTriangleFilter makes them (a structured grid's hexahedra in 5, alternating; a hexahedron or voxel of any other topology in 6, a wedge in 3, a pyramid in 2); other cells are left out. The points are the same; cell fields go to each cell's tetrahedra."""
 
 from tack.dataset.algorithms._refine import _split
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['tetrahedralize']
@@ -21,6 +22,7 @@ def tetrahedralize(data, fields=None):
     voxel in 6, a wedge in 3, a pyramid in 2), which fills a convex cell. So
     the pieces of a partitioned dataset split the faces they share alike too. Other cells are left out. The
     points are the same; cell fields go to each cell's tetrahedra."""
+    _refuse_mixed(data, "tetrahedralize")
     from tack.dataset.ghosts import visible
 
     data = visible(data)

@@ -17,6 +17,7 @@ from tack.dataset.algorithms._common import _field, _with_basis
 from tack.dataset.algorithms.cell_geometry import _signed_twice_area
 from tack.dataset.dataset import Field, is_field_key
 from tack.dataset.spaces import H1, L2, Constant, Values
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['Integrals', 'integrate']
@@ -382,6 +383,7 @@ def integrate(data, fields=None):
     integrals leave out its surfaces, lines and vertices. Only owned cells count
     (ghost marks), and a ``PartitionedDataSet`` sums its pieces over every rank, in
     the pieces' order."""
+    _refuse_mixed(data, "integrate")
     from tack.dataset.algorithms._common import _measure_unit
     from tack.dataset.partitioned import PartitionedDataSet
 

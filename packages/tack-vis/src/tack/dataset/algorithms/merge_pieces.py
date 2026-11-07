@@ -16,7 +16,7 @@ from tack.dataset.ghosts import Ghosts
 from tack.dataset.global_ids import GlobalIds
 from tack.dataset.partitioned import PartitionedDataSet, common_origin
 from tack.dataset.spaces import H1, Constant, Values
-from tack.dataset.topology import StructuredTopology, UnstructuredTopology
+from tack.dataset.topology import StructuredTopology, UnstructuredTopology, _refuse_mixed
 
 __all__ = ["merge_pieces"]
 
@@ -41,6 +41,7 @@ def merge_pieces(data, root=0, fields=None, device=None, tolerance=0.0):
     ``root`` rank (``None`` elsewhere), on ``device`` (by default the device
     of the root rank's first piece). A root with no pieces gets the merge made
     on the first rank that has some, moved to it (on its default device)."""
+    _refuse_mixed(data, "merge_pieces")
     if not isinstance(data, PartitionedDataSet):
         raise TypeError(f"merge_pieces takes a PartitionedDataSet, not {type(data).__name__}")
     from tack.dataset.algorithms.ghost_cells import _carried, _kind

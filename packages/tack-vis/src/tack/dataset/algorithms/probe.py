@@ -15,6 +15,7 @@ from tack.dataset.by_id import field_by_id
 from tack.dataset.dataset import DataSet, Field, relative_positions
 from tack.dataset.locator import cached_locator
 from tack.dataset.spaces import H1, Constant, Values
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['probe']
@@ -123,6 +124,7 @@ def probe(data, where, fields=None, locator=None):
     relative to its origin. Either way they are taken relative to ``data``'s
     origin in double precision before they are located (the pieces of a
     ``PartitionedDataSet`` share one)."""
+    _refuse_mixed(data, "probe")
     from tack.dataset.amr import AMRDataSet
     from tack.dataset.octree import OctreeDataSet
     from tack.dataset.partitioned import PartitionedDataSet

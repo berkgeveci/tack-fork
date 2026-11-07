@@ -13,6 +13,7 @@ from tack.dataset.algorithms.traces import traces
 from tack.dataset.carry import _like
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import Values
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['upwind_flux']
@@ -48,6 +49,7 @@ def upwind_flux(data, field, velocity):
     center -- the side the flow leaves -- as a DG advection scheme does. A boundary
     face takes its one side's value whichever way the flow goes. ``divergence`` of
     the result is each cell's net outflow."""
+    _refuse_mixed(data, "upwind_flux")
     field = _field(data, field)
     normals, areas = face_geometry(data)
     out = _like(field.values, data.topology.faces().num_faces)

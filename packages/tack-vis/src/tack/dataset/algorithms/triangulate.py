@@ -8,6 +8,7 @@ from tack.algorithms.scan import exclusive_scan
 from tack.arrays import materialize, size_of
 from tack.dataset import ids, shapes
 from tack.dataset.algorithms._refine import _ears, _fan_counts, _pieces_topology, _split
+from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['triangulate']
@@ -19,6 +20,7 @@ def triangulate(data, fields=None):
     ``n - 2`` by ear cutting in its plane (as VTK's vtkTriangleFilter), so a concave
     one is covered once, each triangle wound as the polygon; other cells are left
     out. The points are the same; cell fields go to each cell's triangles."""
+    _refuse_mixed(data, "triangulate")
     from tack.dataset.ghosts import visible
 
     data = visible(data)

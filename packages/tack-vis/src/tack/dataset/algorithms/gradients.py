@@ -12,7 +12,7 @@ from tack.dataset.algorithms._links import _average_links
 from tack.dataset.carry import _take
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import H1, L2, Constant, Values
-from tack.dataset.topology import corner_layout
+from tack.dataset.topology import _refuse_mixed, corner_layout
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['gradients', 'world_gradient', 'world_hessian', 'world_jet']
@@ -419,6 +419,7 @@ def gradients(data, field, at="cells"):
     as on shapes. A polygon's is the same in its plane, over its edges; polylines
     get zero. At the points, the cells' gradients are averaged over the cells
     around each point."""
+    _refuse_mixed(data, "gradients")
     field = _with_basis(data, _field(data, field))
     if not getattr(data.topology, "reference_cells", True) and field.gradient is not None:
         raise NotImplementedError("gradients of a field given its gradient on a mesh without "
