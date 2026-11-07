@@ -40,6 +40,13 @@
   matches the polyhedra's faces again; `as_polyhedra`, `check_winding`,
   `as_polygons`, `triangulate`, `surface_normals` and `feature_edges` take
   them too.
+- Cells by id on polyhedra or polygons beside shapes (#307, phase 4):
+  `CellLocator`, `probe`, `voxelize`, `advect` and `streamlines` take a mixed
+  mesh, each cell located by its type -- a shape by its parametric
+  coordinates, a polyhedron or polygon in its fan, from a cell point moved
+  into a concave polyhedron's kernel as before -- with no cost to meshes
+  without them. On AhmedML, probes in polyhedra match the all-polyhedra
+  reading to rounding.
 
 ### Fixed
 

@@ -58,8 +58,8 @@ __all__ = ["CellLocator", "Locations", "cached_locator"]
 class Locations(NamedTuple):
     """Where ``CellLocator.find`` put each point: ``cells``, the cell holding it (-1
     for none), in the dataset's ``id_dtype``; ``pcs``, its coordinates there; and
-    ``tets``, in polyhedra, its sub-tetrahedron in the cell (i32, -1 for none),
-    ``None`` on cells with a reference element. On those ``pcs`` are parametric
+    ``tets``, in polyhedra, its sub-tetrahedron in the cell (i32, -1 for none, and
+    for a shape beside polyhedra), ``None`` on cells with a reference element. On those ``pcs`` are parametric
     coordinates; in a polyhedron they are the weights of the sub-tetrahedron's
     face point and edge points (``views._PolyhedralLocation``), which a field's
     view evaluates with ``tet_value(c, t, pc)``."""
@@ -158,6 +158,16 @@ def _test_points(cells, points, lo, hi, bin_offsets, bin_points, ox, oy, oz, ix,
                                     tack.atomic_min(found, q, rank)
                                 elif found[q] == rank:
                                     pcs[q] = pc
+
+
+def _for_cells(kernel, data, fanned, *args):
+    """``kernel(view, *args)`` over ``data``'s cell groups with no reference element
+    (``fanned``: polyhedra, polygons, polylines) or with one: a mixed mesh's
+    polyhedra and shapes take different kernels. Over a topology of one kind it is
+    ``for_each`` on its cells."""
+    for group in data.launch_groups("cells"):
+        if group.count and (not group.shape.REFERENCE) == fanned:
+            kernel(data.domain_view("cells", group), *args)
 
 
 @tack.kernel
@@ -345,6 +355,13 @@ def _moved_counts(cells, bad, counts):
 
 
 @tack.kernel
+def _unmoved(cells, starts):
+    # A shape beside polyhedra keeps no cell point.
+    for c in cells:
+        starts[cells.entity_id(c)] = -1
+
+
+@tack.kernel
 def _skip(bad, starts):
     # A cell still not star-shaped from its point holds no points.
     for e in range(bad.shape[0]):
@@ -359,12 +376,13 @@ def _moved_cell_points(data, bad):
     found."""
     n = data.num_cells
     idt = data.id_dtype
-    counts = tack.empty((n,), idt)
-    for_each(_moved_counts, data, "cells", bad, counts)
+    counts = tack.zeros((n,), idt)           # a shape beside polyhedra moves nothing
+    _for_cells(_moved_counts, data, True, bad, counts)
     starts = tack.empty((n,), idt)
     total = int(exclusive_scan(counts, starts, n))
     weights = tack.empty((max(total, 1),), data.dtype)
-    for_each(_kernel_points, data, "cells", bad, starts, weights)
+    _for_cells(_kernel_points, data, True, bad, starts, weights)
+    _for_cells(_unmoved, data, False, starts)
     return starts, weights
 
 
@@ -630,7 +648,9 @@ class CellLocator:
         self.levels = levels
         #: Cells with no reference element -- polyhedra, polygons, polylines --
         #: have no parametric coordinates: points are located in a piece of each
-        #: cell's fan (a polyline's segment), which ``find`` says (``tets``).
+        #: cell's fan (a polyline's segment), which ``find`` says (``tets``). True
+        #: of a mixed mesh too, whose shapes beside them are located by their
+        #: coordinates (``tets`` -1 there).
         self.polyhedral = not getattr(data.topology, "reference_cells", True)
         #: The cells and their positions, without the fields: what the bins and
         #: searches read, held by a locator a topology keeps.
@@ -657,14 +677,14 @@ class CellLocator:
             bad = tack.zeros((n,), tack.i32)
             dimension = data.topology.dimension
             if dimension == 3:
-                for_each(_not_star_shaped, data, "cells", *self._moved(), bad)
+                _for_cells(_not_star_shaped, data, True, *self._moved(), bad)
                 if int(bad.numpy().sum()):
                     self.moved_cell_points = _moved_cell_points(data, bad)
                     bad.fill(0)
-                    for_each(_not_star_shaped, data, "cells", *self._moved(), bad)
+                    _for_cells(_not_star_shaped, data, True, *self._moved(), bad)
             elif dimension == 2:
                 # A polyline needs no fan, so has no such failure.
-                for_each(_not_star_shaped_polygons, data, "cells", bad)
+                _for_cells(_not_star_shaped_polygons, data, True, bad)
             count = int(bad.numpy().sum())
             if count and dimension == 3:
                 _skip(bad, self.moved_cell_points[0])
@@ -679,7 +699,8 @@ class CellLocator:
                     f"{count} of the {n} cells are not star-shaped from their cell point "
                     "(the mean of their points), or have no area: locating points in "
                     "them needs another inside test, not built yet")
-            for_each(_polyhedral_boxes, data, "cells", self.lo, self.hi)
+            _for_cells(_polyhedral_boxes, data, True, self.lo, self.hi)
+            _for_cells(_cell_boxes, data, False, self.lo, self.hi)    # shapes beside them
         elif n:
             for_each(_cell_boxes, data, "cells", self.lo, self.hi)
         if n:
@@ -838,7 +859,8 @@ class CellLocator:
         a particle was last found in (``advect(..., neighbors=True)``): ``_MAX_FACES``
         ids a cell, cell ``c``'s across its local face ``k`` at ``_MAX_FACES * c +
         k``, ``-1`` where there is none (the boundary, a face it does not have).
-        ``None`` for a topology whose cells are not solids (no walk there). Made
+        ``None`` for a topology whose cells are not solids, or that has polyhedra,
+        alone or beside shapes (no walk there). Made
         from the topology's faces on first use and kept: ``_MAX_FACES`` ids a cell
         (1.1 GB at 46.9M cells), and the faces' derivation the first time."""
         if "_cell_neighbors" not in self.__dict__:
@@ -943,9 +965,13 @@ class CellLocator:
                                           skip=nbins)
             for write in (0, 1):
                 if self.polyhedral:
-                    for_each(_test_points_in_polyhedra, data, "cells", points, self.lo,
-                             self.hi, starts, order, *self._grid(), _TOLERANCE,
-                             data.num_cells, write, found, tets, pcs, *self._moved())
+                    _for_cells(_test_points_in_polyhedra, data, True, points, self.lo,
+                               self.hi, starts, order, *self._grid(), _TOLERANCE,
+                               data.num_cells, write, found, tets, pcs, *self._moved())
+                    # A mixed mesh's shapes, which rank with them by the atomic.
+                    _for_cells(_test_points, data, False, points, self.lo, self.hi, starts,
+                               order, *self._grid(), _TOLERANCE, data.num_cells, write,
+                               found, pcs)
                 else:
                     for_each(_test_points, data, "cells", points, self.lo, self.hi, starts,
                              order, *self._grid(), _TOLERANCE, data.num_cells, write, found,

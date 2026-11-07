@@ -15,7 +15,6 @@ from tack.dataset.by_id import field_by_id
 from tack.dataset.dataset import DataSet, Field, relative_positions
 from tack.dataset.locator import cached_locator
 from tack.dataset.spaces import H1, Constant, Values
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['probe']
@@ -124,7 +123,6 @@ def probe(data, where, fields=None, locator=None):
     relative to its origin. Either way they are taken relative to ``data``'s
     origin in double precision before they are located (the pieces of a
     ``PartitionedDataSet`` share one)."""
-    _refuse_mixed(data, "probe")
     from tack.dataset.amr import AMRDataSet
     from tack.dataset.octree import OctreeDataSet
     from tack.dataset.partitioned import PartitionedDataSet
@@ -213,12 +211,13 @@ def probe(data, where, fields=None, locator=None):
             values.fill(0)
             order, links = by_cell()
             for group in data.launch_groups("cells", [f]):
-                if (group.count and locator.moved_cell_points is not None
+                fanned = not group.shape.REFERENCE      # beside shapes, in a mixed mesh
+                if (group.count and fanned and locator.moved_cell_points is not None
                         and isinstance(space, H1)):
                     _evaluate_in_moved_tets(data.domain_view("cells", group), f.view(group),
                                             *locator.moved_cell_points, links, order, tets,
                                             pcs, values)
-                elif group.count and locator.polyhedral:
+                elif group.count and fanned:
                     _evaluate_in_tets(data.domain_view("cells", group), f.view(group), links,
                                       order, tets, pcs, values)
                 elif group.count:

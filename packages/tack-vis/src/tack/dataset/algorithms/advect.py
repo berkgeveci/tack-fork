@@ -11,7 +11,6 @@ from tack.dataset.algorithms._extract import _vertices
 from tack.dataset.dataset import DataSet, Field
 from tack.dataset.partitioned import PartitionedDataSet
 from tack.dataset.spaces import Values
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['ParticleStatus', 'advect']
@@ -56,7 +55,6 @@ def advect(data, field, seeds, step_size, steps, integrator="rk4", locator=None,
     seeds use a few threads of a device built for thousands, each slower than
     a CPU core: below a few thousand seeds a CPU copy of the mesh is faster
     (the Visualization Guide's "Integrate a steady velocity field")."""
-    _refuse_mixed(data, "advect")
     # A step as a time ("0.5 s") is in the spatial unit over the velocity's; as a
     # length ("1 mm"), in the spatial unit.
     if step_unit not in ("time", "length"):

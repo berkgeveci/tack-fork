@@ -14,8 +14,16 @@ evaluated by cell id (``_PointValues``, ``_CellValues``: ``value(mesh, e, kind,
 pc, tet)``). Each shape's code is compiled in only when the mesh has that
 shape (``_kinds``).
 
+A cell class's ``NO_REFERENCE`` says how its cells are located: 0, every cell
+by its shape's parametric coordinates; 1, every cell in a piece of its fan
+(polyhedra, polygons, polylines); 2, a mixed mesh's, each cell by its type
+(``fanned``), the shapes by their coordinates and the polyhedra or polygons in
+their fans (``_MixedPolyhedralMesh``, ``_MixedPolygonMesh``). The per-cell
+choice is compiled in only for 2.
+
 What it serves: an ``H1`` geometry over unstructured cells of the shapes in
-``_SHAPES``, 2D and 3D structured grids, and polyhedra (order 1 there); point
+``_SHAPES``, 2D and 3D structured grids, and polyhedra and polygons, alone or
+beside shapes (order 1 there); point
 data (``H1`` order 1, values on points), cell data (``Constant``, values on
 cells), and any other interpolated space of one layout per shape. A curved
 geometry (``H1`` above order 1) and the fields of other spaces are read
@@ -79,6 +87,10 @@ class _NoPolyhedra:
     NO_REFERENCE = 0
 
     @tack.func
+    def fanned(self, e):
+        return 0
+
+    @tack.func
     def locate(self, e, p, slack):
         return -1, p - p, 0
 
@@ -97,6 +109,10 @@ class _FannedCells:
         point_offsets, point_ids = topology.cell_points()
         super().__init__(*topology._cell_walk(), point_offsets, point_ids, topology.num_cells)
         self.positions = positions
+
+    @tack.func
+    def fanned(self, e):
+        return 1
 
     @tack.func
     def point_position(self, p):
@@ -215,6 +231,54 @@ class _PolygonMesh(_FannedCells, views._PolygonLocation, views._PolyhedralWalk,
         return shapes.POLYGON
 
 
+class _MixedFans:
+    """For a mixed topology's cells by id (polyhedra or polygons beside shapes): each
+    cell's type from the topology's, and whether it is located in its fan
+    (``fanned``) or by its shape. Its arrays are the topology's, by cell id: a
+    polyhedron's or polygon's points its run of the connectivity, its facets
+    the face arrays (``cell_face_offsets`` an entry a cell, a shape's empty)."""
+
+    NO_REFERENCE = 2
+
+    def _mixed(self, topology, positions):
+        views._PolyhedralCells.__init__(
+            self, topology.cell_face_offsets, topology.cell_faces, topology.cell_face_sides,
+            topology.face_offsets, topology.face_points, topology.offsets,
+            topology.connectivity, topology.num_cells)
+        self.types = topology.types
+        self.positions = positions
+
+    @tack.func
+    def cell_type(self, e):
+        return tack.i32(self.types[e])
+
+    @tack.func
+    def fanned(self, e):
+        t = tack.i32(self.types[e])
+        return 1 if t == shapes.POLYHEDRON or t == shapes.POLYGON else 0
+
+
+@tack.device_class
+class _MixedPolyhedralMesh(_MixedFans, _PolyhedralMesh):
+    """A mixed 3D topology's cells by id: its polyhedra as ``_PolyhedralMesh``'s, cell
+    points moved as the locator moved them, beside its shapes."""
+
+    def __init__(self, topology, positions):
+        self._mixed(topology, positions)
+        device = topology.device
+        self.moved_starts = tack.full((1,), -1, topology.id_dtype, device=device)
+        self.moved_weights = tack.zeros((1,), arrays.dtype_of(positions), device=device)
+
+
+@tack.device_class
+class _MixedPolygonMesh(_MixedFans, _PolygonMesh):
+    """A mixed 2D topology's cells by id: its polygons as ``_PolygonMesh``'s, beside
+    its triangles and quads."""
+
+    def __init__(self, topology, positions):
+        self._mixed(topology, positions)
+
+
 @tack.device_class
 class _PolylineMesh(views._PolylineLocation, views._PolyhedralWalk, views._PolylineCells):
     """A polyline topology's cells by id, located on their segments
@@ -227,6 +291,10 @@ class _PolylineMesh(views._PolylineLocation, views._PolyhedralWalk, views._Polyl
         super().__init__(topology.line_offsets, topology.line_points, point_offsets,
                          point_ids, topology.num_cells)
         self.positions = positions
+
+    @tack.func
+    def fanned(self, e):
+        return 1
 
     @tack.func
     def point_position(self, p):
@@ -325,14 +393,20 @@ def cells_by_id(data, positions, strict=True):
     from tack.dataset.topology import StructuredTopology, UnstructuredTopology
 
     t = data.topology
+    mixed = isinstance(t, UnstructuredTopology) and t.mixed
     present = 0
     for group in t.groups() if hasattr(t, "groups") else ():
         if not group.count:
             continue
         if group.shape in _SHAPES:
             present |= 1 << _SHAPES.index(group.shape)
+        elif mixed and not group.shape.REFERENCE:
+            present |= _POLYHEDRA
         elif strict and isinstance(t, UnstructuredTopology):
             return None
+    if mixed:
+        mesh = _MixedPolyhedralMesh if t.has_polyhedra else _MixedPolygonMesh
+        return mesh(t, positions), present
     if isinstance(t, UnstructuredTopology):
         return _FlatCells(t.types, t.offsets, t.connectivity), present
     if isinstance(t, StructuredTopology) and len(t.point_dims) >= 2:
@@ -503,8 +577,9 @@ class _MeshSearch:
     #: locates through their groups' views (``_CurvedCells``).
     CURVED = 0
 
-    #: 1 (an instance's, compiled in): polyhedra (``_PolyhedralMesh``), which
-    #: ``find_from`` tries in their sub-tetrahedra (``_well_inside_fan``).
+    #: 1 (an instance's, compiled in): polyhedra (``_PolyhedralMesh``, alone or
+    #: beside shapes), which ``find_from`` tries in their sub-tetrahedra
+    #: (``_well_inside_fan``).
     FANNED = 0
 
     def __init__(self, cells, present, positions, locator, tolerance, neighbors=None,
@@ -555,7 +630,8 @@ class _MeshSearch:
         ``HOLD_TOLERANCE``: no other cell of a mesh whose cells do not overlap
         holds ``p`` then, so the search would give the same cell, and the same
         coordinates, computed alike. A polyhedron is tried in its sub-tetrahedra
-        (``_well_inside_fan``) by the same rule. Elsewhere, and for pyramids
+        (``_well_inside_fan``) by the same rule, in a mixed mesh too, where a
+        hint's type says which test it takes. Elsewhere, and for pyramids
         (whose coordinates collapse at the apex), surfaces, polygons and
         polylines, the bins are searched.
 
@@ -568,8 +644,10 @@ class _MeshSearch:
         pc = p - p
         tet = -1
         if self.PREVIOUS_CELL == 1 and self.FANNED == 1 and hint < self.ncells:
-            e, kind, pc, tet = self._well_inside_fan(p, hint)
-        if self.PREVIOUS_CELL == 1 and self.cells.NO_REFERENCE == 0 and hint < self.ncells:
+            if self.cells.NO_REFERENCE == 1 or self.cells.fanned(hint) == 1:
+                e, kind, pc, tet = self._well_inside_fan(p, hint)
+        if (self.PREVIOUS_CELL == 1 and self.cells.NO_REFERENCE != 1 and hint < self.ncells
+                and (self.cells.NO_REFERENCE == 0 or self.cells.fanned(hint) == 0)):
             e, kind, pc = self._well_inside(p, hint)
             if self.NEIGHBORS == 1 and e == self.ncells:
                 for k in range(self.MAX_FACES):
@@ -680,7 +758,8 @@ class _MeshSearch:
                         and p[1] >= a[1] - s and p[1] <= c[1] + s
                         and p[2] >= a[2] - s and p[2] <= c[2] + s):
                     kind = self.cells.cell_type(e)
-                    if self.cells.NO_REFERENCE == 1:
+                    if self.cells.NO_REFERENCE == 1 or (self.cells.NO_REFERENCE == 2
+                                                        and self.cells.fanned(e) == 1):
                         # No parametric coordinates: a piece of the cell's fan (a
                         # polyline's segment) and the point's place in it, within
                         # the cell's tolerance.
@@ -820,7 +899,7 @@ def mesh_search(data, locator, positions=None, strict=True, neighbors=False):
 @tack.device_class
 class _PointValues:
     """Point data by cell id: interpolated by the cell's shape functions, or in a
-    polyhedron linear on its sub-tetrahedron."""
+    polyhedron linear on its sub-tetrahedron (a polygon, its triangle)."""
 
     def __init__(self, values):
         self.values = values
@@ -828,7 +907,8 @@ class _PointValues:
     @tack.func
     def value(self, mesh, e, kind, pc, tet):
         v = self.values[mesh.cells.point_id(e, 0)]
-        if mesh.cells.NO_REFERENCE == 1:
+        if mesh.cells.NO_REFERENCE == 1 or (mesh.cells.NO_REFERENCE == 2
+                                            and mesh.cells.fanned(e) == 1):
             v = mesh.cells.tet_value_of(self, e, tet, pc)
         else:
             v = v * mesh.weight(kind, 0, pc)

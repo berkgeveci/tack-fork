@@ -481,6 +481,8 @@ READY = {
     "as_polyhedra", "merge_points", "merge_points_polyhedra", "clip", "clip_polyhedra",
     "clip_boolean", "tetrahedralize", "extract_surface", "external_faces", "surface_normals",
     "feature_edges", "contour_2d", "contour", "slice",
+    # Phase 4: cells by id.
+    "probe", "voxelize", "advect", "streamlines",
 }
 
 #: Calls of `READY` whose answer is not the shaped mesh's but that of the same call
@@ -1210,3 +1212,152 @@ def test_a_mixed_contour_is_each_cells_own_and_conforms(level):
     assert got.num_points == out["s"].num_points
     assert got.topology.faces().boundary().shape[0] == \
         out["s"].topology.faces().boundary().shape[0]
+
+
+# ── Cells by id: locating, probing, advecting (phase 4) ─────────────
+
+def _located(distorted=False, seed=1):
+    """``(shaped, mixed, every)`` as ``_three_ways``, over a 5 x 4 x 4 mesh with every
+    third cell a polyhedron, and points inside it, none on a face; with
+    ``distorted``, the points moved, so the faces are not planar."""
+    shaped = _hexes((6, 5, 5))
+    rng = np.random.default_rng(seed)
+    x = shaped.positions()
+    if distorted:
+        x = x + rng.uniform(-0.2, 0.2, x.shape)
+    shaped = td.DataSet(shaped.topology, tack.array(x, tack.vec3(tack.f64)))
+    chosen = list(range(0, shaped.num_cells, 3))
+    mixed = td.DataSet(_mixed(shaped.topology, chosen), shaped.geometry.values)
+    every = td.as_polyhedra(shaped)
+    f = np.sin(x[:, 0]) * x[:, 1] + x[:, 2] ** 2
+    for d in (shaped, mixed, every):
+        d.fields["f"] = td.Field(td.H1(d), tack.array(f))
+        d.fields["c"] = td.Field(td.Constant(d), tack.array(np.cos(np.arange(d.num_cells,
+                                                                             dtype=float))))
+    points = rng.uniform([0.3, 0.3, 0.3], [4.7, 3.7, 3.7], (60, 3))
+    return shaped, mixed, every, chosen, points
+
+
+@pytest.mark.parametrize("many", [False, True], ids=["from the cells", "from the points"])
+def test_a_mixed_mesh_locates_points_in_the_shaped_meshs_cells(many):
+    shaped, mixed, _, chosen, points = _located()
+    where = np.repeat(points, 10, axis=0) if many else points[:5]
+    expected = td.CellLocator(shaped).find(where)
+    got = td.CellLocator(mixed).find(where)
+    cells = got.cells.numpy()
+    np.testing.assert_array_equal(cells, expected.cells.numpy())
+    polyhedra = np.isin(cells, chosen)
+    assert polyhedra.any() and not polyhedra.all()
+    tets = got.tets.numpy()
+    assert (tets[polyhedra] >= 0).all() and (tets[~polyhedra] == -1).all()
+    # The shapes' coordinates are the shaped mesh's.
+    np.testing.assert_array_equal(got.pcs.numpy()[~polyhedra], expected.pcs.numpy()[~polyhedra])
+
+
+def test_both_searches_of_a_mixed_mesh_agree_bit_for_bit():
+    _, mixed, _, _, points = _located(distorted=True)
+    locator = td.CellLocator(mixed)
+    one = [locator.find(points[k:k + 2]) for k in range(0, len(points), 2)]  # the cells'
+    many = locator.find(points)                                             # the points'
+    for name in ("cells", "pcs", "tets"):
+        np.testing.assert_array_equal(np.concatenate([getattr(o, name).numpy() for o in one]),
+                                      getattr(many, name).numpy())
+
+
+@pytest.mark.parametrize("many", [False, True], ids=["from the cells", "from the points"])
+def test_probing_a_mixed_mesh_is_each_cells_own(many):
+    shaped, mixed, every, chosen, points = _located(distorted=True)
+    where = np.repeat(points, 10, axis=0) if many else points[:5]
+    out = {k: td.probe(d, where, locator=td.CellLocator(d))
+           for k, d in (("s", shaped), ("m", mixed), ("e", every))}
+    found = td.CellLocator(mixed).find(where).cells.numpy()
+    # A point near a face that is not planar may fall to another cell in another
+    # reading: compare where all three find the same one.
+    same = ((found == td.CellLocator(shaped).find(where).cells.numpy())
+            & (found == td.CellLocator(every).find(where).cells.numpy()))
+    assert same.mean() > 0.9
+    polyhedra = np.isin(found, chosen)
+    for name in ("f", "c"):
+        values = {k: o.fields[name].values.numpy() for k, o in out.items()}
+        expected = np.where(polyhedra, values["e"], values["s"])
+        np.testing.assert_allclose(values["m"][same], expected[same], rtol=1e-12, atol=1e-14)
+    assert (out["m"].fields["valid"].values.numpy() == 1).all()
+
+
+def _l_prism_beside_a_hexahedron():
+    """test_polyhedra's L-shaped prism, not star-shaped from the mean of its points,
+    beside a hexahedron (a shape) where its cube was."""
+    from test_polyhedra import _l_prism
+
+    top, pts = _l_prism()
+    first = top.cell_offsets.numpy()[:2]
+    faces = top.cell_faces.numpy()[first[0]:first[1]]
+    fo, fp = top.face_offsets.numpy(), top.face_points.numpy()
+    face_points = np.concatenate([fp[fo[f]:fo[f + 1]] for f in faces])
+    face_offsets = np.r_[0, np.cumsum([fo[f + 1] - fo[f] for f in faces])]
+    sides = top.cell_face_sides.numpy()[first[0]:first[1]]
+    c = 14
+    hexahedron = [c + 0, c + 1, c + 3, c + 2, c + 4, c + 5, c + 7, c + 6]
+    topology = td.UnstructuredTopology(
+        np.array([POLYHEDRON, 12], np.uint8), np.array([0, 14, 22]),
+        np.r_[np.arange(14), hexahedron], num_points=len(pts),
+        polyhedra=(face_offsets, face_points, np.array([0, len(faces), len(faces)]),
+                   np.arange(len(faces)), sides))
+    return td.DataSet(topology, tack.array(pts, tack.vec3(tack.f64)))
+
+
+@pytest.mark.parametrize("many", [False, True], ids=["from the cells", "from the points"])
+def test_a_mixed_meshs_concave_polyhedron_is_fanned_from_a_point_inside(many):
+    data = _l_prism_beside_a_hexahedron()
+    x = data.positions()
+    data.fields["u"] = td.Field(td.H1(data), tack.array(2 * x[:, 0] + 3 * x[:, 1] - x[:, 2] + 1))
+    locator = td.CellLocator(data)
+    starts = locator.moved_cell_points[0].numpy()
+    assert starts[0] >= 0 and starts[1] == -1               # the L moved, the hexahedron not
+    probes = np.array([[0.5, 0.5, 0.5], [2.5, 0.5, 0.3], [0.5, 2.5, 0.7], [2.9, 0.9, 0.9],
+                       [1.5, 1.5, 0.5], [2.5, 2.5, 0.5], [5.5, 0.5, 0.5], [5.2, 0.7, 0.1]])
+    stride = 100 if many else 1
+    out = td.probe(data, np.repeat(probes, stride, axis=0), locator=locator)
+    valid = out.fields["valid"].values.numpy()[::stride]
+    np.testing.assert_array_equal(valid, [1, 1, 1, 1, 0, 0, 1, 1])
+    want = 2 * probes[:, 0] + 3 * probes[:, 1] - probes[:, 2] + 1
+    np.testing.assert_allclose(out.fields["u"].values.numpy()[::stride][valid == 1],
+                               want[valid == 1], rtol=1e-12)
+
+
+@pytest.mark.parametrize("neighbors", [False, True])
+def test_particles_cross_a_mixed_mesh_as_the_shaped_one(neighbors):
+    # A linear velocity, exact in a hexahedron and in a polyhedron's sub-tetrahedra:
+    # the paths are the shaped mesh's, through shapes and polyhedra alike.
+    shaped, mixed, _, _, _ = _located()
+    seeds = np.array([[0.4, 0.5, 0.5], [2.1, 1.3, 3.2], [4.5, 3.5, 0.6], [1.7, 2.9, 1.9]])
+    paths = []
+    for d in (shaped, mixed):
+        x = d.positions()
+        v = np.c_[-(x[:, 1] - 2.0), x[:, 0] - 2.5, 0.2 + 0.1 * x[:, 2]]
+        d.fields["v"] = td.Field(td.H1(d), tack.array(v, tack.vec3(tack.f64)))
+        ends = td.advect(d, "v", seeds, 0.05, 80, neighbors=neighbors)
+        lines = td.streamlines(d, "v", seeds, 0.05, 80)
+        paths.append((ends.positions(), ends.fields["steps"].values.numpy(),
+                      ends.fields["status"].values.numpy(), lines.positions()))
+    for a, b in zip(*paths):
+        np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12)
+
+
+def test_a_surface_of_quads_and_polygons_locates_and_probes_as_the_quads():
+    shaped, mixed = _surfaces()
+    rng = np.random.default_rng(2)
+    points = np.c_[rng.uniform([0.1, 0.1], [3.9, 2.9], (40, 2)), np.zeros(40)]
+    for d in (shaped, mixed):
+        x = d.positions()
+        d.fields["u"] = td.Field(td.H1(d), tack.array(2 * x[:, 0] - 3 * x[:, 1] + 1))
+    for many in (False, True):
+        where = np.repeat(points, 10, axis=0) if many else points[:2]
+        found = [td.CellLocator(d).find(where).cells.numpy() for d in (shaped, mixed)]
+        np.testing.assert_array_equal(found[1], found[0])
+        assert (found[1] >= 0).all()
+        out = td.probe(mixed, where, locator=td.CellLocator(mixed))
+        np.testing.assert_array_equal(out.fields["valid"].values.numpy(), 1)
+        np.testing.assert_allclose(out.fields["u"].values.numpy(),
+                                   2 * where[:, 0] - 3 * where[:, 1] + 1, rtol=1e-12,
+                                   atol=1e-12)

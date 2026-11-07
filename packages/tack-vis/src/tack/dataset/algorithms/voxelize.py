@@ -12,7 +12,6 @@ from tack.arrays import UniformCoordinates
 from tack.dataset import units
 from tack.dataset.dataset import DataSet, Field
 from tack.dataset.spaces import Values
-from tack.dataset.topology import _refuse_mixed
 
 __all__ = ['voxelize']
 
@@ -98,7 +97,6 @@ def voxelize(data, grid, fields=None, samples=4):
     pieces over MPI ranks, an AMR hierarchy (its finest level at each sample)
     or an octree. The image keeps its fields; the result is on its device, at
     its origin and time. ``data``'s and ``grid``'s spatial units must agree."""
-    _refuse_mixed(data, "voxelize")
     from tack.dataset.algorithms._extract import _vertices
     from tack.dataset.algorithms.probe import probe
     from tack.dataset.ghosts import Ghosts, keep_marks
