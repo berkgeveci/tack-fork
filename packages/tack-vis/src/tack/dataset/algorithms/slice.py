@@ -9,7 +9,6 @@ from tack.dataset.algorithms.implicit_values import implicit_values
 from tack.dataset.algorithms.project import project
 from tack.dataset.implicit import Plane
 from tack.dataset.spaces import H1
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['slice', 'slice_plane']
@@ -27,7 +26,6 @@ def slice(data, function, merge_points=True, fields=None, value=0.0, subdivision
     quads, pixels, hexahedra or voxels the cells are cut on linear sub-cells,
     as ``contour`` cuts them (``subdivision``, ``tolerance``, ``exact``); on
     other cells, linearized at their corners."""
-    _refuse_mixed(data, "slice")
     values = implicit_values(data, function)
     from tack.dataset.algorithms.subdivide import subdivides
 
@@ -52,7 +50,6 @@ def slice_plane(data, origin, normal, merge_points=True, fields=None, value=0.0,
     sequence of them, gives parallel planes, all in one pass. ``slice`` with a
     ``Plane``; ``merge_points``, ``fields``, ``subdivision``, ``tolerance`` (a
     distance) and ``exact`` are ``contour``'s."""
-    _refuse_mixed(data, "slice_plane")
     origin = _length(data, origin, "slice_plane's origin")
     value = _length(data, value, "slice_plane's distance")
     if tolerance is not None:

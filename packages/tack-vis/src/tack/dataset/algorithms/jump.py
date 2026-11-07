@@ -73,7 +73,7 @@ def jump(data, field):
     out = _like(field.values, faces.num_faces)
     if _on_cells(data, field):
         for_each(_cell_jump, data, "faces", materialize(field.values), out)
-    elif data.topology.has_polyhedra:
+    elif data.topology.mixed:
         # Point data beside polyhedra is order-1 H1, continuous: both sides of
         # every face, polygons of five or more points too, agree.
         if faces.num_faces:

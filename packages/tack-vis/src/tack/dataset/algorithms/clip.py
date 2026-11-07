@@ -26,7 +26,7 @@ from tack.dataset.buckets import key_order, run_offsets
 from tack.dataset.carry import Interpolate, Pieces, _point_values, carry
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import H1, Values
-from tack.dataset.topology import UnstructuredTopology, _refuse_mixed
+from tack.dataset.topology import UnstructuredTopology
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['clip']
@@ -277,7 +277,10 @@ def clip(data, by, value=0.0, inside=False, fields=None, subdivision=None, toler
     ``contour`` traces them, by López's method -- as caps wound out of it; the
     output is a ``PolyhedralTopology``. A point at exactly ``value`` is kept on
     either side (``inside`` keeps at or below). Polygons and polylines are not
-    clipped yet.
+    clipped yet. Polyhedra beside shapes (a mixed ``UnstructuredTopology``) are
+    clipped the same way, and so is every cut shape beside them, since a shape's
+    pieces would split faces a polyhedron holds whole; a shape kept whole stays
+    as it is, so the output is mixed too, its whole shapes first.
 
     A curved geometry or a field above order 1 (or ``subdivision`` above 1, or a
     ``tolerance``) is clipped through subdivision, as ``contour`` cuts it, and the
@@ -291,14 +294,14 @@ def clip(data, by, value=0.0, inside=False, fields=None, subdivision=None, toler
     on sub-cells' edges are where the field takes the value along them
     (``exact``, as ``contour``'s), or with ``exact=False`` where the line
     between the lattice values does."""
-    _refuse_mixed(data, "clip")
     from tack.dataset.ghosts import visible
 
     data, by = visible(data, by)
     from tack.dataset.polyhedra import PolygonalTopology, PolyhedralTopology
 
-    polyhedral = isinstance(data.topology, PolyhedralTopology) and \
-        not isinstance(data.topology, PolygonalTopology)
+    mixed = data.topology.has_polyhedra
+    polyhedral = mixed or (isinstance(data.topology, PolyhedralTopology)
+                           and not isinstance(data.topology, PolygonalTopology))
     if not polyhedral and not getattr(data.topology, "reference_cells", True):
         raise NotImplementedError("clip takes cells of the linear shapes or polyhedra, not "
                                   "polygons or polylines")
@@ -330,6 +333,10 @@ def clip(data, by, value=0.0, inside=False, fields=None, subdivision=None, toler
         raise TypeError(f"clip takes point data or an implicit function, not {space!r}")
     precision = _floating_dtype(field.values)
     values = _converted(_point_values(field.values, data.num_points), precision)
+    if mixed:
+        from tack.dataset.algorithms._clip_polyhedra import clip_mixed
+
+        return clip_mixed(data, arrays.materialize(values), float(value), inside, fields)
     if polyhedral:
         from tack.dataset.algorithms._clip_polyhedra import clip_polyhedra
 

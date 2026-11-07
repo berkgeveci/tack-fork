@@ -558,7 +558,9 @@ class SizeBuckets(_OnItsArrays):
             field = tack.empty((n,), tack.i32)
             if n:
                 sizes = tack.empty((n,), tack.i32)
-                _cell_sizes(t.cell_offsets, t.cell_faces, t.face_offsets, sizes, n)
+                # A mixed topology's per cell, a shape's range empty.
+                cell_offsets = t.cell_face_offsets if t.mixed else t.cell_offsets
+                _cell_sizes(cell_offsets, t.cell_faces, t.face_offsets, sizes, n)
                 caps = _as_field(np.asarray(self.caps, np.int32), tack.i32)
                 largest = tack.zeros((1,), tack.i32)
                 _bucket_keys(sizes, caps, field, largest, n)

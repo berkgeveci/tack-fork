@@ -4,7 +4,6 @@
 """``tetrahedralize``: every 3D cell as tetrahedra that meet face to face, as VTK's vtkDataSetTriangleFilter makes them (a structured grid's hexahedra in 5, alternating; a hexahedron or voxel of any other topology in 6, a wedge in 3, a pyramid in 2); other cells are left out. The points are the same; cell fields go to each cell's tetrahedra."""
 
 from tack.dataset.algorithms._refine import _split
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['tetrahedralize']
@@ -21,11 +20,19 @@ def tetrahedralize(data, fields=None):
     quadrilateral face split from its own smallest corner (a hexahedron or
     voxel in 6, a wedge in 3, a pyramid in 2), which fills a convex cell. So
     the pieces of a partitioned dataset split the faces they share alike too. Other cells are left out. The
-    points are the same; cell fields go to each cell's tetrahedra."""
-    _refuse_mixed(data, "tetrahedralize")
+    points are the same; cell fields go to each cell's tetrahedra.
+
+    Polyhedra beside the shapes (a mixed topology) are cones from a point each
+    adds at its points' mean, over its faces: a triangle as it is, a quad split
+    from its corner of smallest rank as the shapes split theirs (so a shape
+    beside it splits the face alike), a face of five points or more fanned from
+    a point at its points' mean, which both its cells add once. These are the
+    tetrahedra Tack's polyhedral interpolation is linear on, apart from the
+    quads' split; the added points come after the input's, their values the
+    means of the points they average."""
     from tack.dataset.ghosts import visible
 
     data = visible(data)
-    if not getattr(data.topology, "reference_cells", True):
+    if not getattr(data.topology, "reference_cells", True) and not data.topology.mixed:
         raise NotImplementedError("tetrahedralize takes cells of the linear shapes")
     return _split(data, "tetrahedra", fields)

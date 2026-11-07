@@ -10,7 +10,6 @@ from tack.arrays import size_of
 from tack.dataset.buckets import key_order, run_offsets
 from tack.dataset.polyhedra import _cell_sizes
 from tack.dataset.sets import Set
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['check_winding']
@@ -67,7 +66,8 @@ def _check_loops(t):
     if total:
         keys = tack.empty((2 * total,), tack.vec(2, t.id_dtype))
         ends = tack.empty((2 * total,), tack.i32)
-        _loop_ends(t.cell_offsets, t.cell_faces, t.cell_face_sides, t.face_points, keys, ends,
+        cell_offsets = t.cell_face_offsets if t.mixed else t.cell_offsets
+        _loop_ends(cell_offsets, t.cell_faces, t.cell_face_sides, t.face_points, keys, ends,
                    t.num_cells)
         order = key_order(keys, t.num_cells, t.id_dtype)
         offsets, runs = run_offsets(keys, order)
@@ -84,9 +84,10 @@ def check_winding(data):
     a face with the wrong side, an open cell, an edge of three faces -- is listed.
     Combinatorial: geometry plays no part. For polygons: the cells whose edges,
     walked their way, do not close into a loop. Polylines have no winding, and
-    shape-based cells take their faces from their shape's table, so are refused.
+    shape-based cells take their faces from their shape's table, so are refused;
+    beside polyhedra (a mixed topology) they are never listed, the polyhedra
+    checked.
     """
-    _refuse_mixed(data, "check_winding")
     t = getattr(data, "topology", data)
     if getattr(t, "reference_cells", True):
         raise TypeError("check_winding checks cells that list their faces (polyhedra and "
@@ -97,16 +98,18 @@ def check_winding(data):
         return _check_loops(t)
     edges = t.edges()
     n = t.num_cells
+    # A mixed topology's per cell, a shape's range empty.
+    cell_offsets = t.cell_face_offsets if t.has_polyhedra else t.cell_offsets
     sizes = tack.empty((n,), tack.i32)
     starts = tack.empty((n,), t.id_dtype)
     if n:
-        _cell_sizes(t.cell_offsets, t.cell_faces, t.face_offsets, sizes, n)
+        _cell_sizes(cell_offsets, t.cell_faces, t.face_offsets, sizes, n)
     total = exclusive_scan(sizes, starts, n) if n else 0
     bad = tack.zeros((n,), tack.i32)
     if total:
         keys = tack.empty((total,), tack.vec(2, t.id_dtype))
         directions = tack.empty((total,), tack.i32)
-        _directed_edges(t.cell_offsets, t.cell_faces, t.cell_face_sides, t.face_offsets,
+        _directed_edges(cell_offsets, t.cell_faces, t.cell_face_sides, t.face_offsets,
                         edges.face_edge, edges.face_edge_sign, starts, keys, directions, n)
         order = key_order(keys, n, t.id_dtype)
         offsets, runs = run_offsets(keys, order)

@@ -358,15 +358,15 @@ def _scalar_gradients(data, field, at):
         for group, view in data._cell_node_views(at, groups):
             _node_gradients(view, field.view(group), out)
         return out
-    if not getattr(data.topology, "reference_cells", True) and not data.topology.has_polyhedra:
+    if not getattr(data.topology, "reference_cells", True) and not data.topology.mixed:
         return _polyhedral_scalar_gradients(data, field, at)
     # Polyhedra beside the shapes: theirs as on a polyhedral topology, each
     # shape's from its basis.
-    values = (materialize(field.values) if data.topology.has_polyhedra
+    values = (materialize(field.values) if data.topology.mixed
               and isinstance(field.space, H1) else None)
     if at == "cells":
         out = _vectors(data.num_cells, data.dtype)
-        if not data.topology.has_polyhedra:
+        if not data.topology.mixed:
             for_each(_gradients, data, "cells", field, out)
             return out
         for group in data.launch_groups("cells", [field]):
@@ -385,7 +385,7 @@ def _scalar_gradients(data, field, at):
     start_of, total = corner_layout(data.topology)
     corners = _vectors(total, data.dtype)
     # Each shape's corners say; a polyhedron's (its cell's gradient) never are.
-    singular = (tack.zeros if data.topology.has_polyhedra else tack.empty)((total,), tack.i32)
+    singular = (tack.zeros if data.topology.mixed else tack.empty)((total,), tack.i32)
     for group in data.launch_groups("cells", [field]):
         if not group.count:
             continue

@@ -24,6 +24,23 @@
   polyhedra. A mixed topology's `reference_cells` is false, so `H1` above
   order 1 and `L2` refuse it by name.
 
+- Polygons beside triangles and quads in one `UnstructuredTopology` (#307):
+  type 7 among the types, a polygon's connectivity its loop. Its edges are
+  derived from the loops (`has_polygons`; `mixed` is true with polyhedra or
+  polygons), and every algorithm that takes polyhedra beside shapes takes
+  them. `dataset_to_vtk` writes them.
+- Filters that build a topology take polyhedra beside shapes (#307, phase 3):
+  `contour` and `slice` give the shapes' triangles beside the polyhedra's
+  polygons, one surface whose crossings both share; `clip` keeps whole shapes
+  as they are and makes every other kept cell the polyhedron of its kept part;
+  `extract_surface` gives a polyhedron's faces of five points or more as
+  polygons beside the triangles and quads; `tetrahedralize` cones each
+  polyhedron from a point it adds, its quads split as a shape's are (so they
+  conform) and its larger faces fanned from points they add; `merge_points`
+  matches the polyhedra's faces again; `as_polyhedra`, `check_winding`,
+  `as_polygons`, `triangulate`, `surface_normals` and `feature_edges` take
+  them too.
+
 ### Fixed
 
 - Hiding cells by their hidden points (`hidden_by_points`, which

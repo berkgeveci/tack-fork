@@ -90,7 +90,7 @@ def _keep_cells(data, keep, fields=None, keep_points=None):
     from tack.dataset.ghosts import without_hidden
 
     keep = without_hidden(data, keep)
-    if data.topology.has_polyhedra:
+    if data.topology.mixed:
         return _mixed_keep_cells(data, keep, fields, keep_points)
     if not getattr(data.topology, "reference_cells", True):
         return _polyhedral_keep_cells(data, keep, fields, keep_points)
@@ -209,8 +209,8 @@ def _polyhedral_keep_cells(data, keep, fields=None, keep_points=None):
 
 
 def _mixed_keep_cells(data, keep, fields=None, keep_points=None):
-    """``_keep_cells`` of shaped cells and polyhedra together (`UnstructuredTopology`
-    with ``polyhedra``): each kept cell's run of the connectivity and its type,
+    """``_keep_cells`` of shaped cells beside polyhedra or polygons (a mixed
+    `UnstructuredTopology`): each kept cell's run of the connectivity and its type,
     and the kept polyhedra's faces once, numbered in their old order. A kept face
     is turned around when the cell its winding points out of is gone and a kept
     polyhedron is now its only side 0 (``_polyhedral_keep_cells``); that cell may
@@ -234,43 +234,45 @@ def _mixed_keep_cells(data, keep, fields=None, keep_points=None):
         _kept_types(t.types, kept_cells, types)
     offsets = _gather_offsets(starts, kept_cells, length)
 
-    nf = t.num_polyhedral_faces
-    used = tack.zeros((nf,), tack.i32)
-    owned = tack.zeros((nf,), tack.i32)
-    if n:
-        _kept_faces(t.cell_face_offsets, t.cell_faces, t.cell_face_sides, keep, used, owned, n)
-    unowned = tack.zeros((1,), tack.i32)
-    side_zero = tack.zeros((nf,), tack.i32)
-    if n:
-        _polyhedral_side_zero(t.cell_face_offsets, t.cell_faces, t.cell_face_sides, side_zero, n)
-    if nf:
-        _count_shaped_side_zero(used, owned, side_zero, unowned)
-    if unowned[0]:
-        # Faces whose side 0 is a shaped cell: kept as they are wound where that
-        # cell is kept too.
-        _owned_by_kept_cells(t.faces().sides, keep, used, owned)
-    new_face, kept_faces, kept_nf = _compact(used, idt)
+    # Polyhedra's faces kept with them; polygons' edges are derived again.
     polyhedra = None
-    if kept_nf:
-        face_sizes = tack.empty((nf,), tack.i32)
-        _kept_face_sizes(t.face_offsets, used, face_sizes)
-        face_starts = tack.empty((nf + 1,), idt)
-        total = exclusive_scan(face_sizes, face_starts, nf)
-        face_points = tack.empty((total,), idt)
-        flipped = tack.zeros((kept_nf,), tack.i32)
-        _copy_faces(t.face_offsets, t.face_points, used, owned, new_face, face_starts,
-                    face_points, flipped, point_used)
-        counts = tack.empty((n,), tack.i32)
-        _kept_entry_counts(t.cell_face_offsets, keep, counts, n)
-        entry_starts = tack.empty((n + 1,), idt)
-        entries = exclusive_scan(counts, entry_starts, n)
-        cell_faces = tack.empty((entries,), idt)
-        cell_sides = tack.empty((entries,), tack.u8)
-        if entries:
-            _copy_entries(t.cell_face_offsets, t.cell_faces, t.cell_face_sides, keep, new_face,
-                          flipped, entry_starts, cell_faces, cell_sides, n)
-        polyhedra = [_gather_offsets(face_starts, kept_faces, total), face_points,
-                     _gather_offsets(entry_starts, kept_cells, entries), cell_faces, cell_sides]
+    if t.has_polyhedra:
+        nf = t.num_polyhedral_faces
+        used = tack.zeros((nf,), tack.i32)
+        owned = tack.zeros((nf,), tack.i32)
+        if n:
+            _kept_faces(t.cell_face_offsets, t.cell_faces, t.cell_face_sides, keep, used, owned, n)
+        unowned = tack.zeros((1,), tack.i32)
+        side_zero = tack.zeros((nf,), tack.i32)
+        if n:
+            _polyhedral_side_zero(t.cell_face_offsets, t.cell_faces, t.cell_face_sides, side_zero, n)
+        if nf:
+            _count_shaped_side_zero(used, owned, side_zero, unowned)
+        if unowned[0]:
+            # Faces whose side 0 is a shaped cell: kept as they are wound where that
+            # cell is kept too.
+            _owned_by_kept_cells(t.faces().sides, keep, used, owned)
+        new_face, kept_faces, kept_nf = _compact(used, idt)
+        if kept_nf:
+            face_sizes = tack.empty((nf,), tack.i32)
+            _kept_face_sizes(t.face_offsets, used, face_sizes)
+            face_starts = tack.empty((nf + 1,), idt)
+            total = exclusive_scan(face_sizes, face_starts, nf)
+            face_points = tack.empty((total,), idt)
+            flipped = tack.zeros((kept_nf,), tack.i32)
+            _copy_faces(t.face_offsets, t.face_points, used, owned, new_face, face_starts,
+                        face_points, flipped, point_used)
+            counts = tack.empty((n,), tack.i32)
+            _kept_entry_counts(t.cell_face_offsets, keep, counts, n)
+            entry_starts = tack.empty((n + 1,), idt)
+            entries = exclusive_scan(counts, entry_starts, n)
+            cell_faces = tack.empty((entries,), idt)
+            cell_sides = tack.empty((entries,), tack.u8)
+            if entries:
+                _copy_entries(t.cell_face_offsets, t.cell_faces, t.cell_face_sides, keep, new_face,
+                              flipped, entry_starts, cell_faces, cell_sides, n)
+            polyhedra = [_gather_offsets(face_starts, kept_faces, total), face_points,
+                         _gather_offsets(entry_starts, kept_cells, entries), cell_faces, cell_sides]
     if keep_points is not None and data.num_points:
         _or_flags(keep_points, point_used)
     point_new, kept_points, kept_np = _compact(point_used, idt)

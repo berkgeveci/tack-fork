@@ -67,7 +67,7 @@ def upwind_flux(data, field, velocity):
     if _on_cells(data, field):
         for_each(_cell_upwind, data, "faces", materialize(field.values), normals.values,
                  areas.values, vx, vy, vz, out)
-    elif data.topology.has_polyhedra:
+    elif data.topology.mixed:
         # Point data beside polyhedra is order-1 H1, continuous: the upwind side's
         # value at a face's center is either side's, the mean of the face's points
         # (a polygon's fan meets there), so no traces, which hold no polygons.

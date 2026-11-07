@@ -347,8 +347,10 @@ def _mixed_cell_values(data, field, measures):
                             *_tables(data, group.shape, _per_axis(group.shape, n)), out)
         elif isinstance(space, Constant):
             _times_measures(cells, values, measures, out)
-        else:
+        elif group.shape.DIMENSION == 3:
             _polyhedron_integrals(cells, values, out)
+        else:
+            _polygon_integrals(cells, values, out)
     return out
 
 
@@ -370,7 +372,7 @@ def _piece(data, names):
         field_units[name] = field.unit
         if not getattr(data.topology, "reference_cells", True):
             field = field.space.stored(field, data)
-        if data.topology.has_polyhedra:
+        if data.topology.mixed:
             # Polyhedra beside the shapes: each group its own way, cell by cell.
             per_cell = _top_cells(data, _mixed_cell_values(data, field, measures.values))
             values[name] = np.asarray(owned_values(data, Field(Values(data, "cells"), per_cell))

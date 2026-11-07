@@ -195,6 +195,57 @@ def _polyhedral_corner_keys(cells, start, corners, keys):
 
 
 @tack.kernel
+def _polygon_edge_counts(types, offsets, counts):
+    for c in range(counts.shape[0]):
+        counts[c] = offsets[c + 1] - offsets[c] if types[c] == shapes.POLYGON else 0
+
+
+@tack.kernel
+def _polygon_edge_keys(types, offsets, connectivity, starts, keys, firsts, n_cells):
+    # Each polygon's edge k, from its point k to the next round its loop: its key
+    # (low, high) and the point it starts from.
+    for c in range(n_cells):
+        if types[c] == shapes.POLYGON:
+            begin = offsets[c]
+            n = offsets[c + 1] - begin
+            for k in range(n):
+                p = connectivity[begin + k]
+                q = connectivity[begin + (k + 1 if k + 1 < n else 0)]
+                keys[starts[c] + k] = [min(p, q), max(p, q)]
+                firsts[starts[c] + k] = p
+
+
+@tack.kernel
+def _polygon_edges_from_runs(order, runs, keys, firsts, face_points, cell_faces,
+                             cell_face_sides, problems, count):
+    # Each run of equal keys one edge, stored as its first polygon walks it (side
+    # 0); a second polygon walking it the other way is its side 1. problems: [0]
+    # an edge of three or more polygons, [1] two polygons walking it the same way.
+    for r in range(count):
+        begin = runs[r]
+        end = runs[r + 1]
+        first = order[begin]
+        a = firsts[first]
+        key = keys[first]
+        face_points[2 * r] = a
+        face_points[2 * r + 1] = key[1] if key[0] == a else key[0]
+        if end - begin > 2:
+            tack.atomic_add(problems, 0, 1)
+        for i in range(begin, end):
+            e = order[i]
+            cell_faces[e] = r
+            cell_face_sides[e] = tack.u8(0 if i == begin else 1)
+            if i > begin and firsts[e] == a and key[0] != key[1]:
+                tack.atomic_add(problems, 1, 1)
+
+
+@tack.kernel
+def _every_other(out):
+    for i in range(out.shape[0]):
+        out[i] = 2 * i
+
+
+@tack.kernel
 def _point_counts(cells, counts):
     for c in cells:
         counts[cells.index(c)] = cells.num_points(c)
@@ -313,11 +364,11 @@ def _refuse_mixed(data, what):
     pieces = data if isinstance(data, (list, tuple)) or type(data).__name__ == \
         "PartitionedDataSet" else [data]
     for piece in pieces:
-        if getattr(getattr(piece, "topology", None), "has_polyhedra", False):
+        if getattr(getattr(piece, "topology", None), "mixed", False):
             raise NotImplementedError(
-                f"{what} does not take an unstructured topology with polyhedra yet (#307); "
-                "vtk_to_dataset(..., polyhedral=True) reads every cell as a polyhedron, "
-                "which it does take")
+                f"{what} does not take polyhedra or polygons beside shaped cells yet (#307); "
+                "as_polyhedra (as_polygons, of a surface) makes every cell one, which it "
+                "does take, as does vtk_to_dataset(..., polyhedral=True)")
 
 
 def _checks_ids():
@@ -392,6 +443,15 @@ class _Topology:
     _polyhedral_corners = None
     #: Whether polyhedra stand beside shaped cells (`UnstructuredTopology`'s).
     has_polyhedra = False
+    #: Whether polygons stand beside shaped cells (`UnstructuredTopology`'s; known
+    #: once its groups are).
+    has_polygons = False
+
+    @property
+    def mixed(self):
+        """Whether cells without a reference element -- polyhedra or polygons --
+        stand beside shaped cells: what an algorithm goes group by group for."""
+        return self.has_polyhedra
     #: The last `CellLocator` made for this topology's cells without one given
     #: (`locator.cached_locator`), for whatever geometry it was made from.
     _locator = None
@@ -536,12 +596,21 @@ class UnstructuredTopology(_Topology):
                    "cell_face_sides")
 
     @property
+    def mixed(self):
+        """Whether polyhedra or polygons stand beside the shapes (polygons are
+        found by grouping the cells)."""
+        if self.has_polyhedra:
+            return True
+        self.groups()
+        return self.has_polygons
+
+    @property
     def reference_cells(self):
-        """Whether every cell has a reference element: not where polyhedra stand
-        beside the shapes. What spaces that need one everywhere read (``H1``
-        above order 1, ``L2``); an algorithm chooses its path per group by
-        ``group.shape.REFERENCE``."""
-        return not self.has_polyhedra
+        """Whether every cell has a reference element: not where polyhedra or
+        polygons stand beside the shapes. What spaces that need one everywhere
+        read (``H1`` above order 1, ``L2``); an algorithm chooses its path per
+        group by ``group.shape.REFERENCE``."""
+        return not self.mixed
 
     @on_inputs_device
     def __init__(self, types, offsets, connectivity, num_points=None, id_dtype=None,
@@ -702,25 +771,69 @@ class UnstructuredTopology(_Topology):
         return groups
 
     def _known(self, present):
-        """Refuse cell types that are neither linear shapes nor, given their faces,
-        polyhedra."""
-        polyhedral = int(shapes.POLYHEDRON)
-        unknown = [t for t in present if t not in shapes._BY_ID and t != polyhedral]
+        """Refuse cell types that are neither linear shapes, polygons nor, given their
+        faces, polyhedra; derive the polygons' edges when there are polygons."""
+        polyhedral, polygon = int(shapes.POLYHEDRON), int(shapes.POLYGON)
+        unknown = [t for t in present if t not in shapes._BY_ID and t not in (polyhedral,
+                                                                               polygon)]
         if unknown:
-            raise ValueError(f"cell types {unknown} are not linear shapes or polyhedra")
+            raise ValueError(f"cell types {unknown} are not linear shapes, polygons or "
+                             "polyhedra")
         if polyhedral in present and not self.has_polyhedra:
             raise ValueError("polyhedra (type 42) need their faces: pass polyhedra=(face_offsets, "
                              "face_points, cell_face_offsets, cell_faces, cell_face_sides)")
+        if polygon in present:
+            if self.has_polyhedra:
+                raise NotImplementedError("polygons beside polyhedra in one topology")
+            self._polygon_edges()
+
+    def _polygon_edges(self):
+        """The polygons' edges, laid out as polyhedra's faces are: each edge once
+        (``face_offsets``/``face_points``, two points, as the first polygon walking
+        it goes), each polygon's in its loop's order (``cell_face_offsets`` per
+        cell, a shape's range empty, ``cell_faces``, ``cell_face_sides``: 0 for the
+        first polygon, 1 for a second walking it the other way). Edges are shared
+        among polygons only; a shape's edge takes the free side of a polygon's in
+        ``faces()``, as a shape's face takes a polyhedron's."""
+        n, idt = self.num_cells, self.id_dtype
+        counts = tack.empty((n,), idt)
+        _polygon_edge_counts(self.types, self.offsets, counts)
+        starts = tack.empty((n + 1,), idt)
+        total = exclusive_scan(counts, starts, n, close=True)
+        keys = tack.empty((total,), tack.vec(2, idt))
+        firsts = tack.empty((total,), idt)
+        _polygon_edge_keys(self.types, self.offsets, self.connectivity, starts, keys, firsts, n)
+        order = key_order(keys, self.num_points, idt)
+        runs, count = run_offsets(keys, order)
+        face_points = tack.empty((2 * count,), idt)
+        cell_faces = tack.empty((total,), idt)
+        cell_face_sides = tack.empty((total,), tack.u8)
+        problems = tack.zeros((2,), tack.i32)
+        if count:
+            _polygon_edges_from_runs(order, runs, keys, firsts, face_points, cell_faces,
+                                     cell_face_sides, problems, count)
+        if problems[0]:
+            raise ValueError(f"{problems[0]} edges are shared by more than two polygons")
+        if problems[1]:
+            raise ValueError(f"{problems[1]} edges are walked the same way by both their "
+                             "polygons: neighbouring polygons wound opposite ways")
+        face_offsets = tack.empty((count + 1,), idt)
+        _every_other(face_offsets)
+        (self.face_offsets, self.face_points, self.cell_face_offsets, self.cell_faces,
+         self.cell_face_sides) = face_offsets, face_points, starts, cell_faces, cell_face_sides
+        self.num_polyhedral_faces = count
+        self.has_polygons = True
 
     def _gathered(self, t, order, start, count, bad):
         """The group of the ``count`` cells of type ``t``, ``order[start:start +
         count]``: their ids, and their point ids gathered into rows; for polyhedra,
         their ids, which their views read the topology's arrays by."""
-        if t == int(shapes.POLYHEDRON):
+        if t in (int(shapes.POLYHEDRON), int(shapes.POLYGON)):
             cell_ids = tack.empty((count,), self.id_dtype)
             if count:
                 _ids_from(order, start, cell_ids)
-            return DomainGroup(_MixedPolyhedra, shapes.Polyhedron,
+            return DomainGroup(_MixedPolyhedra, shapes.Polyhedron if t == int(
+                shapes.POLYHEDRON) else shapes.Polygon,
                                (self.cell_face_offsets, self.cell_faces, self.cell_face_sides,
                                 self.face_offsets, self.face_points, self.offsets,
                                 self.connectivity, cell_ids, count), count, start)
@@ -1276,11 +1389,11 @@ def _structured_face_tables(shape):
 @tack.kernel
 def _polyhedral_candidates(face_offsets, sides, flags):
     # A polyhedral face a shaped cell may be the other side of: three or four
-    # points, and one side so far.
+    # points (a polygon's edge, two), and one side so far.
     for f in range(flags.shape[0]):
         n = face_offsets[f + 1] - face_offsets[f]
         one = 1 if (sides[f][0] < 0) != (sides[f][2] < 0) else 0
-        flags[f] = 1 if one == 1 and n >= 3 and n <= 4 else 0
+        flags[f] = 1 if one == 1 and n >= 2 and n <= 4 else 0
 
 
 @tack.kernel
@@ -1292,9 +1405,11 @@ def _candidate_rows(flags, slots, face_offsets, face_points, at, rows, kinds, ca
             k = at + slots[f]
             begin = face_offsets[f]
             n = face_offsets[f + 1] - begin
-            rows[k] = [face_points[begin], face_points[begin + 1], face_points[begin + 2],
+            rows[k] = [face_points[begin], face_points[begin + 1],
+                       face_points[begin + 2] if n >= 3 else _NO_POINT,
                        face_points[begin + 3] if n == 4 else _NO_POINT]
-            kinds[k] = shapes.QUAD if n == 4 else shapes.TRIANGLE
+            kinds[k] = (shapes.QUAD if n == 4 else
+                        (shapes.TRIANGLE if n == 3 else shapes.LINE))     # a polygon's edge
             candidates[slots[f]] = f
 
 
@@ -1423,7 +1538,7 @@ class Faces(_OnItsArrays):
     def _derive(cls, topology):
         if isinstance(topology, StructuredTopology) and topology.dimension >= 2:
             return cls._derive_structured(topology)
-        if topology.has_polyhedra:
+        if topology.mixed:
             return cls._derive_mixed(topology)
         derived = cls._derive_bucketed(topology)
         return derived if derived is not None else cls._derive_sorted(topology)
@@ -1737,7 +1852,7 @@ class Faces(_OnItsArrays):
             groups.append(DomainGroup(_Faces, shape, (group_rows, face_ids, group_sides, count),
                                       count, 0))
         topology = getattr(self, "topology", None)
-        if topology is not None and topology.has_polyhedra:
+        if topology is not None and topology.mixed:
             # Polyhedral faces of more than four points: their points are the
             # topology's face_points, under their own (stored) ids.
             flags = tack.empty((n,), tack.i32)
@@ -1961,7 +2076,7 @@ class Edges(_OnItsArrays):
         # With polyhedra, their faces' edges follow the shaped cells' entries,
         # indexed like face_points (edge j of a face from its point j to the next),
         # as a polyhedral topology's are (``PolygonEdges``).
-        polyhedral = size_of(topology.face_points) if topology.has_polyhedra else 0
+        polyhedral = size_of(topology.face_points) if topology.mixed else 0
         total = shaped + polyhedral
         keys = tack.empty((total,), tack.vec(2, idt))
         signs = tack.empty((total,), tack.i32)

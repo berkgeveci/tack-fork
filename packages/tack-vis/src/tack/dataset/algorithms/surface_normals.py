@@ -13,7 +13,7 @@ from tack.dataset.algorithms._links import _average_links
 from tack.dataset.carry import Same, _take, carry
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import Values
-from tack.dataset.topology import UnstructuredTopology, corner_layout
+from tack.dataset.topology import UnstructuredTopology, corner_layout, polyhedral_corners
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['surface_normals']
@@ -34,6 +34,30 @@ def _edge_relations(cells, sides, pairs, relations):
                 f = cells.face_id(c, k)
                 pairs[f] = [sides[f][0], cells.entity_id(c)]
                 relations[f] = 1 - cells.face_orientation(c, k) % 2
+
+
+@tack.kernel
+def _loop_relations(cells, sides, pairs, relations):
+    # A polygon beside shapes on side 1 of an edge: the other polygon on it walks it
+    # the other way, as a mixed topology's polygons all do (consistent).
+    for c in cells:
+        for k in range(cells.num_faces(c)):
+            if cells.face_side(c, k) == 1:
+                f = cells.face_id(c, k)
+                pairs[f] = [sides[f][0], cells.entity_id(c)]
+                relations[f] = 0
+
+
+@tack.kernel
+def _rewound_loops(cells, parents, offsets, connectivity):
+    # A polygon that winds against its region's first cell, its loop the other way
+    # round from its first point.
+    for c in cells:
+        e = cells.entity_id(c)
+        if parents[e] % 2 == 1:
+            n = cells.num_points(c)
+            for j in range(n):
+                connectivity[offsets[e] + j] = cells.point_id(c, (n - j) % n)
 
 
 @tack.kernel
@@ -134,6 +158,19 @@ def _corner_normals(cells, normals, areas, weighted, start, out):
 
 
 @tack.kernel
+def _loop_corner_normals(cells, normals, areas, weighted, start, corners, out):
+    # A polygon beside shapes: its normal at each of its points, in `corner_layout`'s
+    # order (`polyhedral_corners`' offsets).
+    for c in cells:
+        first = start + corners[cells.index(c)]
+        n = normals[cells.entity_id(c)]
+        if weighted == 1:
+            n = n * areas[cells.entity_id(c)]
+        for j in range(cells.num_points(c)):
+            out[first + j] = n
+
+
+@tack.kernel
 def _weighted(corners, owners, areas):
     for k in range(corners.shape[0]):
         corners[k] = corners[k] * areas[owners[k]]
@@ -166,8 +203,11 @@ def _consistent(data):
     relations = tack.zeros((nf,), tack.i32)
     for group in data.launch_groups("cells", []):
         if group.count and group.shape.DIMENSION == 2:      # lines and vertices: no edges
-            _edge_relations(data.domain_view("cells", group, incidence="faces"),
-                            faces.sides, pairs, relations)
+            if group.shape.REFERENCE:
+                _edge_relations(data.domain_view("cells", group, incidence="faces"),
+                                faces.sides, pairs, relations)
+            else:                                           # polygons beside shapes
+                _loop_relations(group.view(), faces.sides, pairs, relations)
     parents = tack.array(2 * np.arange(n, dtype=pdt.numpy_dtype), pdt)
     changed = tack.zeros((1,), tack.i32)
     while nf:
@@ -190,6 +230,8 @@ def _consistent(data):
         if group.count and group.shape in _REVERSED:
             _rewound(data.domain_view("cells", group), parents, offsets,
                      _table(("reversed", group.shape), _REVERSED[group.shape]), connectivity)
+        elif group.count and not group.shape.REFERENCE:
+            _rewound_loops(group.view(), parents, offsets, connectivity)
     out = UnstructuredTopology(topology.types, topology.offsets, connectivity,
                                num_points=data.num_points, id_dtype=topology.id_dtype)
     return carry(data, out, points=Same(), cells=Same())
@@ -258,13 +300,19 @@ def _normals(data, consistent, weights):
     points.fill(0)
     # Each cell's normal at each of its corners, as point_links lays them out
     # (by cell and corner on shapes, by cell_points' entries elsewhere).
-    if getattr(data.topology, "reference_cells", True):
+    if getattr(data.topology, "reference_cells", True) or data.topology.mixed:
         start_of, total = corner_layout(data.topology)
         corners = _vectors(total, data.dtype)
         for group in data.launch_groups("cells", []):
-            if group.count:
+            if not group.count:
+                continue
+            if group.shape.REFERENCE:
                 _corner_normals(group.view(), cell_normals, areas, int(weights == "area"),
                                 start_of[group.root], corners)
+            else:                                           # polygons beside shapes
+                _loop_corner_normals(group.view(), cell_normals, areas,
+                                     int(weights == "area"), start_of[group.root],
+                                     polyhedral_corners(data.topology)[0], corners)
     else:
         point_offsets, point_ids = data.topology.cell_points()
         total = point_ids.shape[0]

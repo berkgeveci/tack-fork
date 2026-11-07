@@ -8,7 +8,6 @@ from tack.algorithms.scan import exclusive_scan
 from tack.dataset import shapes
 from tack.dataset.carry import Same, carry
 from tack.dataset.polyhedra import PolygonalTopology
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['as_polygons']
@@ -30,15 +29,29 @@ def _polygon_loops(cells, offsets, loops):
             loops[at + k] = cells.point_id(c, kk)
 
 
+@tack.kernel
+def _own_sizes(cells, sizes):
+    for c in cells:
+        sizes[cells.entity_id(c)] = cells.num_points(c)
+
+
+@tack.kernel
+def _own_loops(cells, offsets, loops):
+    # A polygon beside the shapes: its connectivity is its loop.
+    for c in cells:
+        at = offsets[cells.entity_id(c)]
+        for k in range(cells.num_points(c)):
+            loops[at + k] = cells.point_id(c, k)
+
+
 @on_inputs_device
 def as_polygons(data, fields=None):
     """A shape-based dataset of 2D cells -- triangles, quads, pixels -- as a polygonal
     one: each cell's points in order become its loop. Fields carry as
     ``as_polyhedra``'s do, but values on faces and edges, whose numbering the
     polygonal topology derives afresh, are dropped. A polygonal dataset comes
-    back as it is (a new dataset on the same topology)."""
-    _refuse_mixed(data, "as_polygons")
-
+    back as it is (a new dataset on the same topology); polygons beside shapes
+    keep their loops."""
     topology = data.topology
     if isinstance(topology, PolygonalTopology):
         return carry(data, topology, points=Same(), cells=Same(), fields=fields)
@@ -50,13 +63,14 @@ def as_polygons(data, fields=None):
     sizes = tack.zeros((n,), tack.i32)
     for group in topology.groups():
         if group.count:
-            _polygon_sizes(group.view(), sizes)
+            (_polygon_sizes if group.shape.REFERENCE else _own_sizes)(group.view(), sizes)
     offsets = tack.empty((n + 1,), idt)
     total = exclusive_scan(sizes, offsets, n, close=True)
     loops = tack.empty((total,), idt)
     for group in topology.groups():
         if group.count:
-            _polygon_loops(group.view(), offsets, loops)
+            (_polygon_loops if group.shape.REFERENCE else _own_loops)(group.view(), offsets,
+                                                                      loops)
     out = PolygonalTopology(offsets, loops, num_points=data.num_points)
     # The same points and cells; edge numbering is derived afresh.
     return carry(data, out, points=Same(), cells=Same(), fields=fields)

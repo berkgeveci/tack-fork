@@ -573,7 +573,7 @@ def hidden_by_points(topology, ghosts):
         tack.copyto(marks, ghosts.cells)
     else:
         marks.fill(0)
-    if not getattr(topology, "reference_cells", True) and not topology.has_polyhedra:
+    if not getattr(topology, "reference_cells", True) and not topology.mixed:
         offsets, members = _rows(topology)
         if topology.num_cells:
             _hide_rows_by_points(offsets, members, ghosts.points, marks)

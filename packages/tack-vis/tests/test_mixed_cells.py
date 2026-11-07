@@ -477,7 +477,23 @@ READY = {
     "gradients", "gradients_at_points", "cell_centers", "values_at_centers", "to_cells",
     "to_points", "project", "integrate", "flow_quantities", "cell_quality", "traces",
     "jump", "upwind_flux", "divergence",
+    # Phase 3: filters that build a topology.
+    "as_polyhedra", "merge_points", "merge_points_polyhedra", "clip", "clip_polyhedra",
+    "clip_boolean", "tetrahedralize", "extract_surface", "external_faces", "surface_normals",
+    "feature_edges", "contour_2d", "contour", "slice",
 }
+
+#: Calls of `READY` whose answer is not the shaped mesh's but that of the same call
+#: on ``as_polyhedra`` of it: clip makes every cut cell a polyhedron, where the
+#: shapes' tables cut it into shapes, and keeps whole cells as they are.
+AS_POLYHEDRA = {"clip", "clip_boolean"}
+
+#: Calls of `READY` with tests of their own: tetrahedralize adds points.
+OWN_TESTS = {"tetrahedralize"}
+
+#: Calls of `READY` whose cells are not the shaped mesh's: a polyhedron's cut is one
+#: polygon where a shape's is triangles. Its points and measure are the same.
+JOINED = {"contour", "slice"}
 
 #: Calls of `READY` whose answer, a field on the cells, is the shaped mesh's on the
 #: shaped cells and the all-polyhedra mesh's on the polyhedra: measures that differ
@@ -496,7 +512,9 @@ def _summary(value):
     if isinstance(value, td.Field):
         v = np.asarray(tack.arrays.to_host(value.values), float)
         v = v.reshape(v.shape[0], -1)
-        return ("field", v.shape, tuple(np.round(np.sort(v.reshape(-1)), 5)))
+        # NaN (an empty bin's mean) as None, which equals itself.
+        return ("field", v.shape, tuple(None if np.isnan(a) else a
+                                        for a in np.round(np.sort(v.reshape(-1)), 5)))
     if isinstance(value, td.Set):
         ids = value.ids.numpy()
         if value.on == "faces":         # face ids are numbered differently: their points
@@ -528,6 +546,17 @@ def test_an_algorithm_takes_mixed_cells_or_refuses_them(name):
         if name not in READY:
             with pytest.raises(NotImplementedError, match="polyhedra|Polyhedron"):
                 call(mixed)
+            return
+        if name in OWN_TESTS:
+            call(mixed)
+            return
+        if name in JOINED:
+            got, expected = _summary(call(mixed)), _summary(call(shaped))
+            assert got[:1] + got[2:] == expected[:1] + expected[2:]
+            return
+        if name in AS_POLYHEDRA:
+            every = devices._with_fields(td.as_polyhedra(shaped), cpu)
+            assert _summary(call(mixed)) == _summary(call(every))
             return
         if name in PER_CELL:
             every = devices._with_fields(td.as_polyhedra(shaped), cpu)
@@ -807,3 +836,377 @@ def test_hidden_points_hide_the_polyhedra_around_them():
     ghosts = hidden_by_points(mixed.topology, td.Ghosts(points=tack.array(marks)))
     hidden = (ghosts.cells.numpy() & td.Ghosts.HIDDENCELL) != 0
     assert hidden.tolist() == [c == 0 for c in range(mixed.num_cells)]
+
+
+def _exploded(data):
+    """``data`` (mixed) with every cell on its own copies of its points, and every
+    polyhedron's faces its own one-sided copies, wound out of it: what pieces
+    written without merging look like, cell by cell."""
+    t = data.topology
+    offsets, conn = t.offsets.numpy(), t.connectivity.numpy()
+    fo, fp = t.face_offsets.numpy(), t.face_points.numpy()
+    cfo, cf, cs = (a.numpy() for a in (t.cell_face_offsets, t.cell_faces, t.cell_face_sides))
+    face_points, face_offsets, cell_faces, cell_face_offsets = [], [0], [], [0]
+    for c in range(t.num_cells):
+        own = {int(p): offsets[c] + j for j, p in enumerate(conn[offsets[c]:offsets[c + 1]])}
+        for k in range(cfo[c], cfo[c + 1]):
+            walk = fp[fo[cf[k]]:fo[cf[k] + 1]]
+            walk = walk if cs[k] == 0 else walk[::-1]
+            cell_faces.append(len(face_offsets) - 1)
+            face_points.extend(own[int(p)] for p in walk)
+            face_offsets.append(len(face_points))
+        cell_face_offsets.append(len(cell_faces))
+    topology = td.UnstructuredTopology(
+        t.types.numpy(), offsets, np.arange(len(conn)), num_points=len(conn),
+        polyhedra=(np.array(face_offsets), np.array(face_points), np.array(cell_face_offsets),
+                   np.array(cell_faces), np.zeros(len(cell_faces), np.uint8)))
+    return td.DataSet(topology, tack.array(data.positions()[conn], tack.vec3(tack.f64)))
+
+
+# ── Phase 3: filters that build a topology ──────────────────────────
+
+def test_as_polyhedra_of_a_mixed_mesh_is_the_all_polyhedra_mesh():
+    shaped, mixed, every = _three_ways()
+    out = td.as_polyhedra(mixed)
+    assert isinstance(out.topology, td.PolyhedralTopology)
+    for values in (lambda d: td.cell_geometry(d).measure.values.numpy(),
+                   lambda d: td.gradients(d, "f").values.numpy()):
+        np.testing.assert_allclose(values(out), values(every), rtol=1e-12)
+    prisms = _pentagonal_prisms()
+    np.testing.assert_allclose(td.cell_geometry(td.as_polyhedra(prisms)).measure.values.numpy(),
+                               td.cell_geometry(prisms).measure.values.numpy(), rtol=1e-12)
+
+
+def test_merging_an_exploded_mixed_mesh_gives_it_back():
+    _, mixed, _ = _three_ways()
+    exploded = _exploded(mixed)
+    assert exploded.topology.faces().num_faces > mixed.topology.faces().num_faces
+    merged = td.merge_points(exploded)
+    merged.topology.validate()
+    assert merged.num_points == mixed.num_points
+    assert merged.topology.faces().num_faces == mixed.topology.faces().num_faces
+    assert merged.topology.faces().boundary().shape[0] == \
+        mixed.topology.faces().boundary().shape[0]
+    # The same faces, the merged points numbered otherwise: by their positions.
+    def faces_at(data):
+        x = data.positions()
+        return {frozenset(tuple(x[p]) for p in points) for points in _face_records(data.topology)}
+
+    assert faces_at(merged) == faces_at(mixed)
+    np.testing.assert_allclose(td.cell_geometry(merged).measure.values.numpy(),
+                               td.cell_geometry(mixed).measure.values.numpy(), rtol=1e-12)
+
+
+def test_check_winding_lists_the_polyhedra_wound_wrong():
+    _, mixed, _ = _three_ways()
+    assert td.check_winding(mixed).ids.numpy().size == 0
+    t = mixed.topology
+    sides = t.cell_face_sides.numpy().copy()
+    sides[t.cell_face_offsets.numpy()[CHOSEN[1]]] ^= 1
+    wrong = td.UnstructuredTopology(t.types, t.offsets, t.connectivity, num_points=t.num_points,
+                                    polyhedra=(t.face_offsets, t.face_points,
+                                               t.cell_face_offsets, t.cell_faces,
+                                               tack.array(sides)))
+    assert td.check_winding(wrong).ids.numpy().tolist() == [CHOSEN[1]]
+
+
+@pytest.mark.parametrize("inside", [False, True])
+@pytest.mark.parametrize("level", [0.9, 1.7, 3.2])
+def test_clipping_a_mixed_mesh_keeps_whole_shapes_and_cuts_into_polyhedra(level, inside):
+    shaped, mixed, every = _three_ways()
+    out, expected = (td.clip(d, "f", level, inside=inside) for d in (mixed, every))
+    out.topology.validate()
+    # Cut cells are the all-polyhedra clip's; whole shapes stay shapes, whose
+    # faces the polyhedra beside them share.
+    assert (out.num_cells, out.num_points) == (expected.num_cells, expected.num_points)
+    assert out.topology.faces().boundary().shape[0] == \
+        expected.topology.faces().boundary().shape[0]
+    assert td.cell_geometry(out).measure.values.numpy().sum() == pytest.approx(
+        td.cell_geometry(expected).measure.values.numpy().sum(), rel=1e-12)
+    np.testing.assert_allclose(np.sort(out.positions(), 0), np.sort(expected.positions(), 0),
+                               atol=1e-12)
+    f = mixed.fields["f"].values.numpy()
+    corners = mixed.topology.connectivity.numpy().reshape(-1, 8)
+    kept = (f >= level) if not inside else (f <= level)
+    whole = [c for c in range(mixed.num_cells) if c not in CHOSEN and kept[corners[c]].all()]
+    types = out.topology.types.numpy()
+    assert (types == 12).sum() == len(whole)
+    assert set(types.tolist()) <= {12, POLYHEDRON}
+
+
+@pytest.mark.parametrize("make", ["straight", "distorted", "prisms"])
+def test_tetrahedralized_polyhedra_meet_their_neighbours_face_to_face(make):
+    if make == "straight":
+        shaped = _hexes()
+        data = td.DataSet(_mixed(shaped.topology, CHOSEN), shaped.geometry.values)
+        data.fields["f"] = td.Field(td.H1(data), tack.array(data.positions()[:, 0] ** 2))
+    elif make == "distorted":
+        shaped, data, _ = _three_ways()
+    else:
+        shaped, data = None, _pentagonal_prisms()
+        data.fields["f"] = td.Field(td.H1(data), tack.array(data.positions()[:, 1] ** 2))
+    out = td.tetrahedralize(data)
+    out.topology.validate()
+    assert set(out.topology.types.numpy().tolist()) == {int(shapes.TETRA)}
+    volumes = td.cell_geometry(out).measure.values.numpy()
+    assert volumes.min() > 0
+    # Face to face: the boundary is the input's, each quad split in two; the
+    # shaped mesh tetrahedralized splits its boundary alike.
+    boundary = out.topology.faces().boundary().shape[0]
+    if shaped is not None:
+        assert boundary == td.tetrahedralize(shaped).topology.faces().boundary().shape[0]
+    if make != "distorted":         # planar faces: the volume is the input's
+        assert volumes.sum() == pytest.approx(
+            td.cell_geometry(data).measure.values.numpy().sum(), rel=1e-12)
+    # The input points as they were, then each added point at its points' mean,
+    # with their values' mean.
+    n = data.num_points
+    f = data.fields["f"].values.numpy()
+    np.testing.assert_allclose(out.positions()[:n], data.positions())
+    np.testing.assert_array_equal(out.fields["f"].values.numpy()[:n], f)
+    t = data.topology
+    conn, offsets = t.connectivity.numpy(), t.offsets.numpy()
+    polyhedra = [c for c in range(t.num_cells) if t.types.numpy()[c] == POLYHEDRON]
+    for k, c in enumerate(polyhedra):
+        points = conn[offsets[c]:offsets[c + 1]]
+        np.testing.assert_allclose(out.positions()[n + k], data.positions()[points].mean(0))
+        assert out.fields["f"].values.numpy()[n + k] == pytest.approx(f[points].mean())
+
+
+# ── 2D: polygons beside triangles and quads ─────────────────────────
+
+POLYGON = int(shapes.POLYGON)
+
+
+def _as_polygons_beside(data, chosen):
+    """``data`` (a surface of triangles and quads) with the cells ``chosen`` made
+    polygons of the same loops: a triangle's and a quad's points go round them."""
+    t = data.topology
+    types = t.types.numpy().copy()
+    types[list(chosen)] = POLYGON
+    topology = td.UnstructuredTopology(types, t.offsets.numpy(), t.connectivity.numpy(),
+                                       num_points=t.num_points)
+    out = td.DataSet(topology, data.geometry.values)
+    for key, field in data.fields.items():
+        if isinstance(field.space, td.H1):
+            out.fields[key] = td.Field(td.H1(out), field.values)
+    return out
+
+
+def _quads(n=(5, 4), z=None):
+    """A surface of quads over an ``n``-point grid in the plane z = 0 (or at heights
+    ``z(x, y)``), x fastest."""
+    nx, ny = n
+    pts = np.array([[i, j, 0.0] for j in range(ny) for i in range(nx)], np.float64)
+    if z is not None:
+        pts[:, 2] = z(pts[:, 0], pts[:, 1])
+    pid = lambda i, j: i + nx * j
+    conn = [pid(i + a, j + b) for j in range(ny - 1) for i in range(nx - 1)
+            for a, b in ((0, 0), (1, 0), (1, 1), (0, 1))]
+    cells = len(conn) // 4
+    topology = td.UnstructuredTopology(np.full(cells, 9, np.uint8),
+                                       np.arange(0, 4 * cells + 1, 4), np.array(conn),
+                                       num_points=len(pts))
+    return td.DataSet(topology, tack.array(pts, tack.vec3(tack.f64)))
+
+
+def _surfaces(z=None):
+    """A flat surface of 12 quads with the device sweep's fields, and the same with
+    some quads made polygons. Flat: an edge's normal is then the opposite of
+    itself seen from its other cell, so fluxes do not depend on which of the two
+    is its side 0, which the shaped and the mixed derivations choose apart."""
+    import test_dataset_devices as devices
+
+    cpu = tack.device("cpu")
+    shaped = devices._with_fields(_quads(z=z), cpu)
+    mixed = devices._with_fields(_as_polygons_beside(shaped, [0, 3, 5, 10]), cpu)
+    return shaped, mixed
+
+
+def test_a_surface_of_quads_and_polygons_has_the_quads_faces():
+    shaped, mixed = _surfaces()
+    t = mixed.topology
+    assert t.mixed and t.has_polygons and not t.has_polyhedra
+    assert sorted(g.shape.__name__ for g in t.groups()) == ["Polygon", "Quad"]
+    assert t.faces().num_faces == shaped.topology.faces().num_faces
+    assert _cells_by_face(t) == _cells_by_face(shaped.topology)
+    assert t.faces().boundary().shape[0] == shaped.topology.faces().boundary().shape[0]
+    t.validate()
+
+
+def test_polygons_wound_against_their_neighbours_are_refused():
+    shaped, _ = _surfaces()
+    t = shaped.topology
+    types, conn = t.types.numpy().copy(), t.connectivity.numpy().copy()
+    offsets = t.offsets.numpy()
+    types[[0, 1]] = POLYGON
+    # Turn every cell but polygon 0 round: polygon 0 now walks its edges the way
+    # its neighbours do.
+    for c in range(1, t.num_cells):
+        conn[offsets[c]:offsets[c + 1]] = conn[offsets[c]:offsets[c + 1]][::-1]
+    turned = td.UnstructuredTopology(types, offsets, conn, num_points=t.num_points)
+    with pytest.raises(ValueError, match="wound|either direction|same way"):
+        turned.faces()
+
+
+@pytest.mark.parametrize("name", sorted(__import__("test_dataset_devices").CALLS))
+def test_an_algorithm_takes_polygons_beside_shapes_or_refuses_them(name):
+    import warnings
+
+    import test_dataset_devices as devices
+
+    shaped, mixed = _surfaces()
+    call = CALLS_2D.get(name, devices.CALLS[name])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            expected = call(shaped)
+        except Exception as error:             # what a surface of shapes refuses
+            with pytest.raises((type(error), NotImplementedError)):
+                call(mixed)
+            return
+        if name not in READY_2D:
+            with pytest.raises(NotImplementedError, match="polyhedra|Polyhedron|polygon"):
+                call(mixed)
+            return
+        got = call(mixed)
+        if name in ORIENTED_2D:
+            # Values on faces out of their side 0, which the two derivations may
+            # choose apart: each face's by its points, out of the same cell.
+            assert _out_of(shaped, expected) == pytest.approx(_out_of(mixed, got))
+            return
+        if name in POSITIONS_2D:
+            np.testing.assert_allclose(np.sort(got.positions(), 0),
+                                       np.sort(expected.positions(), 0), atol=1e-12)
+            return
+        assert _summary(got) == _summary(expected)
+
+
+def _out_of(data, field):
+    """A field on faces as ``{(face's points, cell on its side 0): value}``, the value
+    turned to be out of the face's lower cell: what does not depend on which side
+    is which."""
+    faces = data.topology.faces()
+    sides = faces.sides.numpy()
+    values = np.asarray(tack.arrays.to_host(field.values), float)
+    out = {}
+    for points, (_, s) in _face_records(data.topology).items():
+        f = _face_id(data.topology, points)
+        cells = [c for c in (s[0], s[2]) if c >= 0]
+        sign = 1.0 if sides[f, 0] == min(cells) else -1.0
+        out[points] = sign * values[f]
+    return out
+
+
+#: The calls of `test_dataset_devices.CALLS` that take a surface of polygons beside
+#: triangles and quads, each held to the shaped surface's answer.
+READY_2D = set(READY) - {"clip", "clip_boolean", "clip_polyhedra", "as_polyhedra",
+                         "merge_points_polyhedra"} | {"triangulate", "as_polygons"}
+
+#: Calls made otherwise on surfaces: perot of a flux out of each face's side 0
+#: (the sweep's ones are not turned with the sides, which the shaped and mixed
+#: derivations may choose apart).
+CALLS_2D = {"perot": lambda d: td.perot(d, td.upwind_flux(d, "s", (1.0, 0.5, 0.0)))}
+
+#: ... whose values on faces are out of side 0 (`_out_of`); perot's of a field
+#: given on the faces, which is not turned with them, only where both choose alike.
+ORIENTED_2D = {"upwind_flux"}
+
+#: ... compared by their positions: a map that curves the cells measures a polygon
+#: (fanned) and a quad (bilinear) apart.
+POSITIONS_2D = {"spherical", "cylindrical"}
+
+
+def _merged_quads():
+    """`_quads` with its first two quads one polygon of six points (two of them on
+    its straight bottom and top), the other quads as they were."""
+    shaped = _quads()
+    t = shaped.topology
+    conn = t.connectivity.numpy().reshape(-1, 4)
+    a, b = conn[0], conn[1]                          # (0,0) (1,0) (1,1) (0,1), and right
+    loop = [a[0], a[1], b[1], b[2], b[3], a[3]]
+    cells = [loop] + [list(q) for q in conn[2:]]
+    types = [POLYGON] + [9] * (len(cells) - 1)
+    offsets = np.concatenate([[0], np.cumsum([len(c) for c in cells])])
+    topology = td.UnstructuredTopology(np.array(types, np.uint8), offsets,
+                                       np.concatenate(cells), num_points=t.num_points)
+    out = td.DataSet(topology, shaped.geometry.values)
+    x = out.positions()
+    out.fields["u"] = td.Field(td.H1(out), tack.array(np.sin(x[:, 0]) + x[:, 1] ** 2))
+    return shaped, out
+
+
+def test_a_six_point_polygon_shares_its_edges_with_the_quads_beside_it():
+    shaped, merged = _merged_quads()
+    faces = merged.topology.faces()
+    # One edge fewer, the one the two quads shared; the boundary is the same.
+    assert faces.num_faces == shaped.topology.faces().num_faces - 1
+    assert faces.boundary().shape[0] == shaped.topology.faces().boundary().shape[0]
+    # The polygon's six edges: its bottom two and its left on the boundary, its
+    # right and its top two each shared with a quad.
+    mine = [cells for cells in _cells_by_face(merged.topology).values()
+            if 0 in {c for c, _ in cells}]
+    assert sorted(len(cells) for cells in mine) == [1, 1, 1, 2, 2, 2]
+    merged.topology.validate()
+    np.testing.assert_allclose(td.cell_geometry(merged).measure.values.numpy(),
+                               [2.0] + [1.0] * (merged.num_cells - 1))
+    x = merged.positions()
+    merged.fields["l"] = td.Field(td.H1(merged), tack.array(x @ [2.0, -1.0, 0.0]))
+    np.testing.assert_allclose(td.gradients(merged, "l").values.numpy(),
+                               np.tile([2.0, -1.0, 0.0], (merged.num_cells, 1)), atol=1e-12)
+    # The integral of 2x - y over the rectangle [0, 4] x [0, 3].
+    assert td.integrate(merged, "l").values["l"] == pytest.approx(2 * 8 * 3 - 4.5 * 4)
+
+
+def test_triangulating_polygons_beside_quads():
+    shaped, merged = _merged_quads()
+    out = td.triangulate(merged)
+    out.topology.validate()
+    assert set(out.topology.types.numpy().tolist()) == {int(shapes.TRIANGLE)}
+    # A quad's two triangles, the six-point polygon's four.
+    assert out.num_cells == 2 * (merged.num_cells - 1) + 4
+    assert td.cell_geometry(out).measure.values.numpy().sum() == pytest.approx(12.0)
+    assert td.cell_geometry(out).measure.values.numpy().min() > 0
+    np.testing.assert_array_equal(out.fields["u"].values.numpy(),
+                                  merged.fields["u"].values.numpy())
+    # The quads split as a shape-based surface's are.
+    quads = td.triangulate(td.extract_cells(shaped, list(range(2, shaped.num_cells))))
+    kept = td.triangulate(td.extract_cells(merged, list(range(1, merged.num_cells))))
+    np.testing.assert_array_equal(kept.topology.connectivity.numpy(),
+                                  quads.topology.connectivity.numpy())
+
+
+def test_as_polygons_of_polygons_beside_quads_keeps_every_loop():
+    _, merged = _merged_quads()
+    out = td.as_polygons(merged)
+    assert isinstance(out.topology, td.PolygonalTopology)
+    offsets, loops = out.topology.loops()
+    np.testing.assert_array_equal(offsets.numpy(), merged.topology.offsets.numpy())
+    np.testing.assert_array_equal(loops.numpy(), merged.topology.connectivity.numpy())
+
+
+@pytest.mark.parametrize("level", [1.7, 3.2, (1.2, 2.5)])
+def test_a_mixed_contour_is_each_cells_own_and_conforms(level):
+    shaped, mixed, every = _three_ways()
+    for d in (shaped, mixed, every):
+        d.fields["id"] = td.Field(td.Constant(d), tack.array(np.arange(d.num_cells, dtype=float)))
+    out = {k: td.contour(d, "f", level) for k, d in (("s", shaped), ("m", mixed), ("e", every))}
+
+    def area_by_cell(o):
+        return np.bincount(o.fields["id"].values.numpy().astype(int),
+                           td.cell_geometry(o).measure.values.numpy(), shaped.num_cells)
+
+    got = out["m"]
+    got.topology.validate()
+    assert got.topology.mixed
+    assert set(got.topology.types.numpy().tolist()) == {int(shapes.TRIANGLE), POLYGON}
+    # The shapes' triangles and the polyhedra's polygons, each cell's as the shaped
+    # and the all-polyhedra contours have it.
+    np.testing.assert_allclose(area_by_cell(got),
+                               _per_cell(shaped, every, lambda d: area_by_cell(out[
+                                   "s" if d is shaped else "e"])), rtol=1e-12, atol=1e-14)
+    # One point per crossing, shared across the faces between shapes and polyhedra:
+    # no open edges but the mesh boundary's.
+    assert got.num_points == out["s"].num_points
+    assert got.topology.faces().boundary().shape[0] == \
+        out["s"].topology.faces().boundary().shape[0]

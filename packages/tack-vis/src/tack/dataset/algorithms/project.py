@@ -269,7 +269,7 @@ def _onto_points(data, field, values):
         link_offsets, entries = topology.point_links()
         _average_cell_values(link_offsets, entries, groups[0].view(), values, out)
         return out
-    if not getattr(topology, "reference_cells", True) and not topology.has_polyhedra:
+    if not getattr(topology, "reference_cells", True) and not topology.mixed:
         offsets, point_ids = topology.cell_points()
         total = int(point_ids.shape[0])
         contributions = _like(values, total)

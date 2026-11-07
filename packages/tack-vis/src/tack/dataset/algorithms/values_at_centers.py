@@ -42,7 +42,7 @@ def values_at_centers(data, field):
     from tack.dataset.algorithms.project import _distinct_point_means
 
     values = materialize(field.values)
-    if isinstance(field.space, Constant) and not data.topology.has_polyhedra:
+    if isinstance(field.space, Constant) and not data.topology.mixed:
         tack.copyto(out, values)
     for group in data.launch_groups("cells", [field]):
         if not group.count:
@@ -53,7 +53,7 @@ def values_at_centers(data, field):
             _at_centers(view, field.view(group), out)
         elif isinstance(field.space, H1):
             _distinct_point_means(view, values, out, float("nan"))
-        elif data.topology.has_polyhedra:
+        elif data.topology.mixed:
             _own_values(view, values, out)
     return Field(Values(data, "cells"), out, field.unit)
 

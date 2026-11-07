@@ -36,7 +36,7 @@ def traces(data, field):
         raise TypeError(f"traces are taken from a field with a basis on the cells, "
                         f"not {space!r}")
     topology = data.topology
-    if topology.has_polyhedra:
+    if topology.mixed:
         if any(g.count and not g.shape.REFERENCE for g in topology.faces().groups()):
             raise NotImplementedError("traces of a mesh whose polyhedra have faces of more "
                                       "than four points, which SideTraces does not hold")
@@ -57,9 +57,8 @@ def traces(data, field):
             # Polyhedra beside the shapes: a point field's values at the face's
             # points, in the face's row (its stored walk); a cell field's own.
             on_points = space.on == "points"
-            if group.shape.DIMENSION == 3:
-                _polyhedral_traces(group.view(), arrays.materialize(field.values),
-                                   1 if on_points else 0, out)
+            _polyhedral_traces(group.view(), arrays.materialize(field.values),
+                               1 if on_points else 0, out)
         elif group.root in starts:
             _traces(data.domain_view("cells", group, incidence="faces"), field.view(group),
                     out)

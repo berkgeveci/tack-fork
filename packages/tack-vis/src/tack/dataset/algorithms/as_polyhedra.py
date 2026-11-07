@@ -5,10 +5,10 @@
 
 import tack
 from tack.algorithms.scan import exclusive_scan
+from tack.arrays import size_of
 from tack.dataset import ids, shapes
 from tack.dataset.carry import Same, carry
 from tack.dataset.polyhedra import PolyhedralTopology
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['as_polyhedra']
@@ -21,11 +21,41 @@ def _face_sizes(kinds, sizes):
 
 
 @tack.kernel
-def _face_rows(rows, starts, sizes, out):
-    for f in range(sizes.shape[0]):
+def _face_rows(rows, starts, sizes, out, first):
+    for f in range(first, sizes.shape[0]):
         row = rows[f]
         for j in range(sizes[f]):
             out[starts[f] + j] = row[j]
+
+
+@tack.kernel
+def _stored_sizes(face_offsets, sizes):
+    # A mixed topology's polyhedral faces, the first ones: their stored sizes.
+    for f in range(face_offsets.shape[0] - 1):
+        sizes[f] = face_offsets[f + 1] - face_offsets[f]
+
+
+@tack.kernel
+def _stored_faces(face_offsets, face_points, starts, out):
+    # ... and their stored walks, which wind them out of their side 0 as a row does.
+    for f in range(face_offsets.shape[0] - 1):
+        for j in range(face_offsets[f + 1] - face_offsets[f]):
+            out[starts[f] + j] = face_points[face_offsets[f] + j]
+
+
+@tack.kernel
+def _polyhedral_face_counts(cells, counts):
+    for c in cells:
+        counts[cells.entity_id(c)] = cells.num_faces(c)
+
+
+@tack.kernel
+def _polyhedral_face_entries(cells, offsets, cell_faces, cell_face_sides):
+    for c in cells:
+        at = offsets[cells.entity_id(c)]
+        for k in range(cells.num_faces(c)):
+            cell_faces[at + k] = cells.face_id(c, k)
+            cell_face_sides[at + k] = tack.u8(cells.face_side(c, k))
 
 
 @tack.kernel
@@ -67,7 +97,6 @@ def as_polyhedra(data, fields=None):
     ``Constant`` and ``H1`` order-1 fields, values on points, cells, faces and
     edges, and sets carry over; fields needing a reference element are dropped.
     """
-    _refuse_mixed(data, "as_polyhedra")
     from tack.dataset.spaces import H1
 
     if not isinstance(data.geometry.space, H1) or data.geometry.space.order != 1:
@@ -79,9 +108,10 @@ def as_polyhedra(data, fields=None):
                              "topology is of 3D cells (as_polygons takes 2D ones)")
     faces = topology.faces()
     same_way = tack.zeros((1,), tack.i32)
-    for group in topology.groups():
-        if group.count:
-            _same_way(data.domain_view("cells", group, incidence="faces"), same_way)
+    # The shapes' only: a mixed topology's polyhedra are on the sides they say.
+    shaped = [g for g in topology.groups() if g.count and g.shape.REFERENCE]
+    for group in shaped:
+        _same_way(data.domain_view("cells", group, incidence="faces"), same_way)
     if same_way[0]:
         raise ValueError(f"{same_way[0]} faces are wound the same way by both their cells "
                          "(an inside-out cell beside an upright one, as cell_geometry's "
@@ -91,29 +121,41 @@ def as_polyhedra(data, fields=None):
     idt = topology.id_dtype
     # The faces' points: 4 a face, past 12 a cell when faces are not shared (a
     # hexahedron has 24), and the polyhedral topology holds twice that.
-    fdt = ids.at_least(idt, 8 * nf)
+    # A mixed topology's faces start with its polyhedra's, of any size.
+    stored = topology.num_polyhedral_faces if topology.has_polyhedra else 0
+    fdt = ids.at_least(idt, 8 * nf + (2 * size_of(topology.face_points) if stored else 0))
     sizes = tack.empty((nf,), tack.i32)
     starts = tack.empty((nf + 1,), fdt)
     if nf:
         _face_sizes(faces.kinds, sizes)
+    if stored:
+        _stored_sizes(topology.face_offsets, sizes)
     total = exclusive_scan(sizes, starts, nf, close=True)
     face_points = tack.empty((total,), fdt)
-    if nf:
-        _face_rows(faces.rows, starts, sizes, face_points)
+    if nf > stored:
+        _face_rows(faces.rows, starts, sizes, face_points, stored)
+    if stored:
+        _stored_faces(topology.face_offsets, topology.face_points, starts, face_points)
 
     n = data.num_cells
     counts = tack.zeros((n,), tack.i32)
     for group in topology.groups():
         if group.count:
-            _cell_face_counts(group.view(), counts)
+            (_cell_face_counts if group.shape.REFERENCE
+             else _polyhedral_face_counts)(group.view(), counts)
     cell_offsets = tack.empty((n + 1,), idt)
     entries = exclusive_scan(counts, cell_offsets, n, close=True)
     cell_faces = tack.empty((entries,), idt)
     cell_face_sides = tack.empty((entries,), tack.u8)
     for group in topology.groups():
-        if group.count:
+        if not group.count:
+            continue
+        if group.shape.REFERENCE:
             _cell_face_entries(data.domain_view("cells", group, incidence="faces"),
                                cell_offsets, cell_faces, cell_face_sides)
+        else:
+            _polyhedral_face_entries(group.view(), cell_offsets, cell_faces,
+                                     cell_face_sides)
     out = PolyhedralTopology(starts, face_points, cell_offsets, cell_faces, cell_face_sides,
                              num_points=data.num_points)
 

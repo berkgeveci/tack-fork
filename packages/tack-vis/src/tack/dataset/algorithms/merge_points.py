@@ -4,6 +4,8 @@
 """``merge_points``: a dataset's coincident points made one, as VTK's
 vtkStaticCleanUnstructuredGrid and Viskores' CleanGrid merge them."""
 
+from types import SimpleNamespace
+
 import numpy as np
 
 import tack
@@ -24,7 +26,7 @@ from tack.dataset.polyhedra import (
     _side_counts,
 )
 from tack.dataset.spaces import H1
-from tack.dataset.topology import StructuredTopology, UnstructuredTopology, _refuse_mixed
+from tack.dataset.topology import StructuredTopology, UnstructuredTopology
 from tack.runtime.dispatch import get_backend, on_inputs_device
 
 __all__ = ["merge_points"]
@@ -186,7 +188,6 @@ def merge_points(data, tolerance=0.0, fields=None):
     more than two cells, are refused. Polygonal and polyline topologies derive
     their facets from the merged loops and lines. Hidden cells are dropped
     first, as every filter that makes cells drops them."""
-    _refuse_mixed(data, "merge_points")
     tolerance = _length(data, tolerance, "merge_points's tolerance")
     if not tolerance >= 0:
         raise ValueError(f"tolerance must be at least zero, not {tolerance!r}")
@@ -213,6 +214,20 @@ def merge_points(data, tolerance=0.0, fields=None):
         merged = PolylineTopology(topology.line_offsets,
                                   _renumber(topology.line_points, new_id, data.id_dtype),
                                   num_points=count, id_dtype=data.id_dtype)
+    elif topology.has_polyhedra:
+        # The polyhedra's faces matched again as a polyhedral topology's are, the
+        # shapes beside them renumbered. Face ids change (the shapes' faces come
+        # after the polyhedra's), so values on faces are not carried.
+        polyhedra, _ = _merged_polyhedra(SimpleNamespace(
+            num_faces=topology.num_polyhedral_faces, face_offsets=topology.face_offsets,
+            face_points=topology.face_points, cell_offsets=topology.cell_face_offsets,
+            cell_faces=topology.cell_faces, cell_face_sides=topology.cell_face_sides,
+            id_dtype=topology.id_dtype), new_id, count)
+        merged = UnstructuredTopology(
+            topology.types, topology.offsets,
+            _renumber(topology.connectivity, new_id, data.id_dtype), num_points=count,
+            polyhedra=(polyhedra.face_offsets, polyhedra.face_points, polyhedra.cell_offsets,
+                       polyhedra.cell_faces, polyhedra.cell_face_sides))
     else:
         merged = UnstructuredTopology(topology.types, topology.offsets,
                                       _renumber(topology.connectivity, new_id, data.id_dtype),

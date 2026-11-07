@@ -16,29 +16,38 @@ from tack.dataset.carry import Pieces, Same, Take, _take, carry, selected
 from tack.dataset.dataset import Field
 from tack.dataset.sets import Set
 from tack.dataset.spaces import H1
-from tack.dataset.topology import UnstructuredTopology, _face_row, _refuse_mixed, _same_key
+from tack.dataset.topology import UnstructuredTopology, _face_row, _same_key
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['extract_surface']
 
 
 @tack.kernel
-def _surface_sizes(ids, kinds, sizes):
+def _surface_sizes(ids, kinds, face_offsets, sizes):
+    # A polygon face (a mixed topology's polyhedra's, of five points or more) has
+    # its points in the topology's face arrays, by its own id.
     for i in range(ids.shape[0]):
-        kind = kinds[ids[i]]
-        sizes[i] = 2 if kind == 3 else (3 if kind == 5 else 4)
+        f = ids[i]
+        kind = kinds[f]
+        sizes[i] = (2 if kind == 3 else (3 if kind == 5 else (
+            4 if kind != shapes.POLYGON else face_offsets[f + 1] - face_offsets[f])))
 
 
 @tack.kernel
-def _surface_cells(ids, kinds, rows, starts, types, offsets, connectivity, length, n):
+def _surface_cells(ids, kinds, rows, face_offsets, face_points, starts, types, offsets,
+                   connectivity, length, n):
     for i in range(n):
         f = ids[i]
         at = starts[i]
         types[i] = tack.u8(kinds[f])
         offsets[i] = at
-        row = rows[f]
-        for j in range(2 if kinds[f] == 3 else (3 if kinds[f] == 5 else 4)):
-            connectivity[at + j] = row[j]
+        if kinds[f] == shapes.POLYGON:
+            for j in range(face_offsets[f + 1] - face_offsets[f]):
+                connectivity[at + j] = face_points[face_offsets[f] + j]
+        else:
+            row = rows[f]
+            for j in range(2 if kinds[f] == 3 else (3 if kinds[f] == 5 else 4)):
+                connectivity[at + j] = row[j]
         if i == 0:
             offsets[n] = length
 
@@ -137,7 +146,7 @@ def _fresh_boundary(data, fields):
 
     topology = data.topology
     if (not isinstance(topology, UnstructuredTopology) or topology._faces is not None
-            or topology.dimension != 3 or data.ghosts is not None
+            or topology.dimension != 3 or data.ghosts is not None or topology.mixed
             or any(isinstance(f.space, H1) and f.space.order != 1
                    for f in data.fields.values())):
         return None
@@ -255,7 +264,6 @@ def extract_surface(data, faces=None, fields=None):
     is on a boundary, and each piece's surface is its own, its ghost faces
     marked. The surface's points are owned once (``generate_global_ids`` marks
     them where the pieces had no ghost cells)."""
-    _refuse_mixed(data, "extract_surface")
     from tack.dataset.ghosts import refuse_hidden, visible
     from tack.dataset.partitioned import PartitionedDataSet
 
@@ -282,25 +290,30 @@ def extract_surface(data, faces=None, fields=None):
         from tack.dataset.algorithms.boundary_faces import boundary_faces
         faces = boundary_faces(data)
     ids = _face_ids(data, faces)
-    if not getattr(data.topology, "reference_cells", True):
+    topology = data.topology
+    if not getattr(topology, "reference_cells", True) and not topology.mixed:
         return _polygon_surface(data, ids, fields)
-    faces = data.topology.faces()
+    faces = topology.faces()
     idt = data.id_dtype
     n = ids.shape[0]
+    # Polyhedra beside shapes: their faces of five points or more become polygons
+    # beside the triangles and quads (a mixed surface).
+    face_offsets, face_points = ((topology.face_offsets, topology.face_points)
+                                 if topology.mixed else (ids, ids))
     # Up to 4 points a face: past the topology's own bound (12 a cell) for a
-    # surface of faces that share no points.
-    odt = id_types.for_output(data, 4 * n)
+    # surface of faces that share no points; a polygon's as many as it has.
+    odt = id_types.for_output(data, 4 * n + (arrays.size_of(face_points) if topology.mixed else 0))
     sizes = tack.empty((n,), tack.i32)
     starts = tack.empty((n,), odt)
     if n:
-        _surface_sizes(ids, faces.kinds, sizes)
+        _surface_sizes(ids, faces.kinds, face_offsets, sizes)
     length = exclusive_scan(sizes, starts, n) if n else 0
     types = tack.empty((n,), tack.u8)
     offsets = tack.zeros((n + 1,), odt)
     connectivity = tack.empty((length,), odt)
     if n:
-        _surface_cells(ids, faces.kinds, faces.rows, starts, types, offsets, connectivity,
-                       length, n)
+        _surface_cells(ids, faces.kinds, faces.rows, face_offsets, face_points, starts, types,
+                       offsets, connectivity, length, n)
     cells = tack.empty((n,), idt)
     if n:
         _face_cells(ids, faces.sides, cells)
