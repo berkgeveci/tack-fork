@@ -16,7 +16,7 @@ from tack.dataset.ghosts import Ghosts
 from tack.dataset.global_ids import GlobalIds
 from tack.dataset.partitioned import PartitionedDataSet, common_origin
 from tack.dataset.spaces import H1, Constant, Values
-from tack.dataset.topology import StructuredTopology, UnstructuredTopology, _refuse_mixed
+from tack.dataset.topology import StructuredTopology, UnstructuredTopology
 
 __all__ = ["merge_pieces"]
 
@@ -35,13 +35,14 @@ def merge_pieces(data, root=0, fields=None, device=None, tolerance=0.0):
     Structured pieces that tile a box of cells (each placed by its
     ``topology.offset``) give one structured grid of the box -- ``split``'s
     input back -- with its offset and its coordinates (uniform, rectilinear
-    or explicit); other pieces give an unstructured dataset.
+    or explicit); other pieces give an unstructured dataset. Polyhedra beside
+    shapes come along with their faces, matched again by their points, so a
+    face two pieces' polyhedra share is one face.
 
     Across MPI ranks every rank passes its pieces and the result is on the
     ``root`` rank (``None`` elsewhere), on ``device`` (by default the device
     of the root rank's first piece). A root with no pieces gets the merge made
     on the first rank that has some, moved to it (on its default device)."""
-    _refuse_mixed(data, "merge_pieces")
     if not isinstance(data, PartitionedDataSet):
         raise TypeError(f"merge_pieces takes a PartitionedDataSet, not {type(data).__name__}")
     from tack.dataset.algorithms.ghost_cells import _carried, _kind
@@ -109,7 +110,9 @@ def _described(data):
     else:
         shape = ("unstructured", topology.num_points, topology.id_dtype,
                  put("\0types", topology.types), put("\0offsets", topology.offsets),
-                 put("\0connectivity", topology.connectivity))
+                 put("\0connectivity", topology.connectivity),
+                 tuple(put("\0" + name, getattr(topology, name))
+                       for name in topology._POLYHEDRAL) if topology.has_polyhedra else None)
     coordinates = data.geometry.values
     if isinstance(coordinates, UniformCoordinates):
         geometry = ("uniform", coordinates.dims, tuple(coordinates._origin),
@@ -142,7 +145,9 @@ def _rebuilt(description, received):
     else:
         topology = UnstructuredTopology(received[shape[3]], received[shape[4]],
                                         received[shape[5]], num_points=shape[1],
-                                        id_dtype=shape[2])
+                                        id_dtype=shape[2],
+                                        polyhedra=None if shape[6] is None else
+                                        tuple(received[name] for name in shape[6]))
     if geometry[0] == "uniform":
         values = UniformCoordinates(geometry[1], geometry[2], geometry[3], geometry[4],
                                     dtype=dtype)
@@ -305,6 +310,11 @@ def _merged_unstructured(blocks, pieces, names, kind_of, target, device, toleran
         converted.append(piece)
     numbered = list(generate_global_ids(PartitionedDataSet(converted, world=blocks.world),
                                         tolerance=tolerance))
+    # Polyhedra beside shapes anywhere: every piece sends its owned cells' faces,
+    # wound out of them (none for a shape), on the merged points.
+    rings = bool(blocks.all_reduce({g: int(getattr(p.topology, "has_polyhedra", False))
+                                    for g, p in zip(blocks.local, converted)}, "max")) \
+        if blocks.count else False
     outgoing = {}
     for g, piece, original in zip(blocks.local, numbered, converted):
         if not isinstance(piece.topology, UnstructuredTopology):
@@ -330,6 +340,8 @@ def _merged_unstructured(blocks, pieces, names, kind_of, target, device, toleran
                    "sizes": tack.array(sizes.astype(np.int64), tack.i64, device=dev),
                    "connectivity": tack.array(point_ids[rows].astype(np.int64), tack.i64,
                                               device=dev)}
+        if rings:
+            message.update(_owned_rings(piece.topology, owned_cells, point_ids, dev))
         _add_values(message, original, names, kind_of, owned_points, owned_cells, dev,
                     explicit=True)
         outgoing[g] = {target: message}
@@ -352,11 +364,52 @@ def _merged_unstructured(blocks, pieces, names, kind_of, target, device, toleran
         conn = np.concatenate(conn_in) if nc else np.zeros(0, np.int64)
         connectivity, ordered = _csr_rows(starts, conn, order)
         offsets = np.concatenate(([0], np.cumsum(ordered)))
-        topology = UnstructuredTopology(types, offsets, connectivity, num_points=np_,
-                                        id_dtype=first.topology.id_dtype)
+        if rings:
+            topology = _merged_rings(messages, order, types, offsets, connectivity, np_,
+                                     first.topology.id_dtype)
+        else:
+            topology = UnstructuredTopology(types, offsets, connectivity, num_points=np_,
+                                            id_dtype=first.topology.id_dtype)
         parts = _placed(messages, np_, nc)
         return _assembled(topology, parts["points"].pop("\0positions"), first, names,
                           kind_of, parts)
+
+
+def _owned_rings(topology, cells, point_ids, device):
+    """The ``cells`` of a piece's ``topology`` as rings wound out of them, on the
+    points' global ids ``point_ids``: ``ring_counts`` a cell (0 for a shape),
+    ``ring_sizes`` a ring, ``ring_points``."""
+    from tack.dataset.polyhedra import outward_rings
+
+    if getattr(topology, "has_polyhedra", False):
+        cell_rings, ring_offsets, ring_points = outward_rings(
+            *(getattr(topology, name) for name in topology._POLYHEDRAL))
+    else:
+        cell_rings = np.zeros(topology.num_cells + 1, np.int64)
+        ring_offsets, ring_points = np.zeros(1, np.int64), np.zeros(0, np.int64)
+    chosen, counts = _csr_rows(cell_rings, np.arange(len(ring_offsets) - 1), cells)
+    taken, sizes = _csr_rows(ring_offsets, ring_points, chosen)
+    return {"ring_counts": tack.array(counts.astype(np.int64), tack.i64, device=device),
+            "ring_sizes": tack.array(sizes.astype(np.int64), tack.i64, device=device),
+            "ring_points": tack.array(point_ids[taken].astype(np.int64), tack.i64,
+                                      device=device)}
+
+
+def _merged_rings(messages, order, types, offsets, connectivity, num_points, id_dtype):
+    """The merged cells, in the global order ``order`` gives the messages' cells, with
+    their polyhedra's faces matched again by point set (``mixed_from_rings``)."""
+    from tack.dataset.polyhedra import mixed_from_rings
+
+    counts = np.concatenate([m["ring_counts"].numpy() for m in messages])
+    sizes = np.concatenate([m["ring_sizes"].numpy() for m in messages])
+    points = np.concatenate([m["ring_points"].numpy() for m in messages])
+    ring_starts = np.concatenate(([0], np.cumsum(counts)))
+    ring_offsets = np.concatenate(([0], np.cumsum(sizes)))
+    rings, ordered_counts = _csr_rows(ring_starts, np.arange(len(sizes)), order)
+    ring_points, ordered_sizes = _csr_rows(ring_offsets, points, rings)
+    return mixed_from_rings(types, offsets, connectivity, ordered_counts,
+                            np.concatenate(([0], np.cumsum(ordered_sizes))), ring_points,
+                            num_points, id_dtype=id_dtype)
 
 
 def _add_values(message, piece, names, kind_of, points, cells, device, explicit):

@@ -1066,6 +1066,56 @@ def _match_rings(ring_offsets, ring_points):
     return (face_offsets, face_points, ring_face, (~is_face).astype(np.uint8), same_way)
 
 
+def outward_rings(face_offsets, face_points, cell_offsets, cell_faces, sides):
+    """Cells' faces wound out of them, on the host: ``(cell_offsets, ring_offsets,
+    ring_points)``, cell ``c``'s rings ``cell_offsets[c]`` to ``cell_offsets[c + 1]``
+    -- a face it is side 1 of run the other way -- from a polyhedral topology's
+    five arrays or a mixed one's (``cell_offsets`` an entry a cell, a shape's
+    range empty)."""
+    face_offsets, face_points, cell_offsets, cell_faces, sides = (
+        np.asarray(a if isinstance(a, np.ndarray) else to_host(a), np.int64).reshape(-1)
+        for a in (face_offsets, face_points, cell_offsets, cell_faces, sides))
+    starts = face_offsets[cell_faces]
+    sizes = face_offsets[cell_faces + 1] - starts
+    ring_offsets = np.concatenate(([0], np.cumsum(sizes))).astype(np.int64)
+    within = np.arange(int(ring_offsets[-1]), dtype=np.int64) - np.repeat(ring_offsets[:-1],
+                                                                            sizes)
+    flipped = np.repeat(sides == 1, sizes)
+    at = np.repeat(starts, sizes) + np.where(flipped, np.repeat(sizes, sizes) - 1 - within,
+                                             within)
+    return cell_offsets, ring_offsets, face_points[at]
+
+
+def mixed_from_rings(types, offsets, connectivity, ring_counts, ring_offsets, ring_points,
+                     num_points, id_dtype=None):
+    """An ``UnstructuredTopology`` of the cells ``types``/``offsets``/``connectivity``
+    (host arrays), its polyhedra's faces given as rings wound out of them --
+    ``ring_counts`` a cell, 0 for a shape -- matched by point set
+    (``_match_rings``), so a face two polyhedra both list is one face with both;
+    one a polyhedron shares with a shape is its ring, which ``faces()`` matches.
+    Without polyhedra, the cells alone. What pieces joined from other pieces'
+    cells (``ghost_cells``, ``merge_pieces``) are made of."""
+    from tack.dataset.topology import UnstructuredTopology
+
+    types = np.asarray(types, np.uint8)
+    if not np.any(types == int(shapes.POLYHEDRON)):
+        return UnstructuredTopology(types, offsets, connectivity, num_points=num_points,
+                                    id_dtype=id_dtype)
+    ring_points = np.asarray(ring_points)
+    if ring_points.dtype not in (np.int32, np.int64):
+        ring_points = ring_points.astype(np.int64)
+    face_offsets, face_points, cell_faces, sides, same_way = _match_rings(
+        np.asarray(ring_offsets, np.int64), ring_points)
+    if same_way:
+        raise ValueError(f"{same_way} faces two polyhedra share are wound the same way by "
+                         "both")
+    cell_face_offsets = np.concatenate(([0], np.cumsum(ring_counts))).astype(np.int64)
+    return UnstructuredTopology(types, offsets, connectivity, num_points=num_points,
+                                id_dtype=id_dtype,
+                                polyhedra=(face_offsets, face_points, cell_face_offsets,
+                                           cell_faces, sides))
+
+
 def _opposite(stored, walked):
     """Whether ``walked`` goes round the same polygon as ``stored`` the other way."""
     n = len(stored)

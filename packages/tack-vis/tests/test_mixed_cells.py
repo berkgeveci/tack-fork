@@ -1361,3 +1361,174 @@ def test_a_surface_of_quads_and_polygons_locates_and_probes_as_the_quads():
         np.testing.assert_allclose(out.fields["u"].values.numpy(),
                                    2 * where[:, 0] - 3 * where[:, 1] + 1, rtol=1e-12,
                                    atol=1e-12)
+
+
+# ── Pieces (phase 5) ────────────────────────────────────────────────
+
+def _slabs(data, cuts=(2.0, 3.5)):
+    """``data`` cut into pieces by its cells' centres along x, at ``cuts``."""
+    x = td.cell_centers(data).values.numpy()[:, 0]
+    from itertools import pairwise
+
+    edges = (-np.inf, *cuts, np.inf)
+    return td.PartitionedDataSet([td.extract_cells(data, np.flatnonzero((x >= a) & (x < b)))
+                                  for a, b in pairwise(edges)])
+
+
+def _cells_by_centre(data):
+    """Each cell's type, centre and measure, in the order of their centres: what a
+    piece's cells are, however they are numbered."""
+    centres = np.round(td.cell_centers(data).values.numpy(), 9)
+    order = np.lexsort(centres.T[::-1])
+    return (data.topology.types.numpy()[order], centres[order],
+            np.round(td.cell_geometry(data).measure.values.numpy()[order], 9))
+
+
+def _first_slab_polyhedra():
+    """``(shaped, mixed)``: ``_located``'s distorted mesh, its cells left of x = 2 made
+    polyhedra, so its later slabs have none of their own."""
+    shaped, _, _, _, _ = _located(distorted=True)
+    x = td.cell_centers(shaped).values.numpy()[:, 0]
+    mixed = td.DataSet(_mixed(shaped.topology, np.flatnonzero(x < 2.0)), shaped.geometry.values)
+    mixed.fields["c"] = td.Field(td.Constant(mixed), shaped.fields["c"].values)
+    return shaped, mixed
+
+
+@pytest.mark.parametrize("make", ["every third", "first slab"])
+@pytest.mark.parametrize("layers", [1, 2])
+def test_ghost_cells_of_mixed_pieces_are_the_shaped_pieces_ghosts(make, layers):
+    if make == "every third":
+        shaped, mixed, _, _, _ = _located(distorted=True)
+    else:
+        shaped, mixed = _first_slab_polyhedra()
+    wanted = _cells_by_centre(mixed)
+    got = td.ghost_cells(_slabs(mixed), layers=layers)
+    expected = td.ghost_cells(_slabs(shaped), layers=layers)
+    if make == "first slab":
+        # The middle piece has no polyhedra of its own, and gains some as ghosts.
+        assert not _slabs(mixed)[1].topology.has_polyhedra
+        assert got[1].topology.has_polyhedra
+    for mine, theirs in zip(got, expected):
+        mine.topology.validate()
+        assert mine.num_points == theirs.num_points
+        types, centres, measures = _cells_by_centre(mine)
+        _, their_centres, their_measures = _cells_by_centre(theirs)
+        np.testing.assert_array_equal(centres, their_centres)
+        # Each cell, ghost or not, is the mixed mesh's cell there: a polyhedron
+        # where it was one, with its measure.
+        place = {tuple(c): i for i, c in enumerate(wanted[1])}
+        at = np.array([place[tuple(c)] for c in centres])
+        np.testing.assert_array_equal(types, wanted[0][at])
+        np.testing.assert_allclose(measures, wanted[2][at], rtol=1e-9)
+        # A face a ghost polyhedron shares with the piece's own cell is one face.
+        assert mine.topology.faces().num_faces == theirs.topology.faces().num_faces
+        assert (mine.topology.faces().boundary().shape[0]
+                == theirs.topology.faces().boundary().shape[0])
+
+
+def test_ghost_values_of_mixed_pieces_are_refreshed_from_their_owners():
+    _, mixed = _first_slab_polyhedra()
+    pieces = td.ghost_cells(_slabs(mixed), fields=["c"])
+    kept = [p.fields["c"].values.numpy().copy() for p in pieces]
+    for p in pieces:
+        ghost = (p.ghosts.cells.numpy() & td.Ghosts.DUPLICATECELL) != 0
+        values = p.fields["c"].values.numpy()
+        values[ghost] = -1.0
+        tack.copyto(p.fields["c"].values, values)
+    td.update_ghosts(pieces, "c")
+    for p, k in zip(pieces, kept):
+        np.testing.assert_array_equal(p.fields["c"].values.numpy(), k)
+
+
+@pytest.mark.parametrize("make", ["every third", "first slab"])
+def test_merging_mixed_pieces_gives_the_mixed_mesh(make):
+    if make == "every third":
+        _, mixed, _, _, _ = _located(distorted=True)
+    else:
+        _, mixed = _first_slab_polyhedra()
+    for pieces in (_slabs(mixed), td.ghost_cells(_slabs(mixed))):
+        merged = td.merge_pieces(pieces)
+        merged.topology.validate()
+        assert merged.topology.has_polyhedra
+        assert merged.num_points == mixed.num_points
+        for a, b in zip(_cells_by_centre(merged), _cells_by_centre(mixed)):
+            np.testing.assert_allclose(a, b, rtol=1e-9)
+        assert merged.topology.faces().num_faces == mixed.topology.faces().num_faces
+        assert (merged.topology.faces().boundary().shape[0]
+                == mixed.topology.faces().boundary().shape[0])
+
+
+def test_mixed_pieces_number_and_join_as_the_shaped_ones():
+    shaped, mixed, _, _, _ = _located(distorted=True)
+    for got, expected in zip(td.generate_global_ids(_slabs(mixed)),
+                             td.generate_global_ids(_slabs(shaped))):
+        np.testing.assert_array_equal(got.global_ids.points.numpy(),
+                                      expected.global_ids.points.numpy())
+        np.testing.assert_array_equal(got.global_ids.cells.numpy(),
+                                      expected.global_ids.cells.numpy())
+    # Two regions: the cells left of x = 1.5 and right of x = 3.5, in three pieces.
+    x = td.cell_centers(mixed).values.numpy()[:, 0]
+    apart = [td.extract_cells(d, np.flatnonzero((x < 1.5) | (x > 3.5)))
+             for d in (shaped, mixed)]
+    apart.append(td.as_polyhedra(apart[0]))        # all polyhedra too
+    regions = [[p.fields["region"].values.numpy() for p in
+                td.connected_components(_slabs(d, cuts=(1.0, 4.0)))] for d in apart]
+    for theirs in regions[1:]:
+        for a, b in zip(regions[0], theirs):
+            np.testing.assert_array_equal(b, a)
+    assert len(np.unique(np.concatenate(regions[1]))) == 2
+
+
+def test_ghost_cells_of_pieces_of_quads_and_polygons_are_the_quads_ghosts():
+    shaped, mixed = _surfaces()
+    got = td.ghost_cells(_slabs(mixed, cuts=(1.5, 2.5)))
+    expected = td.ghost_cells(_slabs(shaped, cuts=(1.5, 2.5)))
+    for mine, theirs in zip(got, expected):
+        mine.topology.validate()
+        assert mine.topology.mixed
+        assert (mine.num_cells, mine.num_points) == (theirs.num_cells, theirs.num_points)
+        np.testing.assert_array_equal(_cells_by_centre(mine)[1], _cells_by_centre(theirs)[1])
+    merged = td.merge_pieces(_slabs(mixed, cuts=(1.5, 2.5)))
+    for a, b in zip(_cells_by_centre(merged), _cells_by_centre(mixed)):
+        np.testing.assert_allclose(a, b)
+
+
+def _described(piece):
+    """A piece as plain values: its cells by centre, its faces' and points' counts,
+    and its global ids if it has them."""
+    types, centres, measures = _cells_by_centre(piece)
+    faces = piece.topology.faces()
+    ids = piece.global_ids
+    return (types.tolist(), centres.tolist(), measures.tolist(), piece.num_points,
+            faces.num_faces, int(faces.boundary().shape[0]),
+            None if ids is None else (ids.points.numpy().tolist(), ids.cells.numpy().tolist()))
+
+
+def mixed_pieces_across(world, root=0):
+    """Ghost cells, global ids and the merge of this rank's share of six slabs of a
+    mixed mesh (polyhedra in the first slab, and every third cell): ``(ghosts,
+    ids, merged)``, the pieces' ``{gid: description}`` and the merged mesh's
+    description on ``root``, else ``None``."""
+    from tack import communication as tc
+
+    shaped, _, _, chosen, _ = _located(distorted=True)
+    x = td.cell_centers(shaped).values.numpy()[:, 0]
+    chosen = np.union1d(chosen, np.flatnonzero(x < 1.0))
+    mixed = td.DataSet(_mixed(shaped.topology, chosen), shaped.geometry.values)
+    every = list(_slabs(mixed, cuts=(0.8, 1.6, 2.4, 3.2, 4.0)))
+    share = len(every) // world.size
+    mine = td.PartitionedDataSet(every[world.rank * share:(world.rank + 1) * share], world)
+    blocks = tc.Blocks([p.device for p in mine], world)
+    ghosts = {g: _described(p) for g, p in zip(blocks.local, td.ghost_cells(mine, layers=2))}
+    ids = {g: _described(p) for g, p in zip(blocks.local, td.generate_global_ids(mine))}
+    merged = td.merge_pieces(mine, root=root)
+    return ghosts, ids, None if merged is None else _described(merged)
+
+
+def test_mixed_pieces_across_mpi_ranks(mpiexec):
+    import os
+
+    script = os.path.join(os.path.dirname(__file__), "_mixed_pieces_mpi.py")
+    for ranks in (2, 3):
+        run = mpiexec(ranks, script)
+        assert run.returncode == 0 and "ok" in run.stdout, run.stdout + run.stderr

@@ -47,11 +47,30 @@
   into a concave polyhedron's kernel as before -- with no cost to meshes
   without them. On AhmedML, probes in polyhedra match the all-polyhedra
   reading to rounding.
+- Pieces of polyhedra beside shapes (#307, phase 5): `ghost_cells`
+  (a polyhedron sent with its faces, matched again where it lands, so a piece
+  without polyhedra of its own takes them as ghosts), `update_ghosts`,
+  `merge_pieces`, `generate_global_ids` and `connected_components` over
+  pieces take mixed meshes, in one process and across MPI ranks.
+- Deprecations (`tack._deprecation`): a deprecated feature warns with
+  `tack.TackDeprecationWarning`, a `DeprecationWarning`, at the line that uses
+  it; a test fails once a release reaches a deprecation's removal, and the
+  docs list the current ones (Reference, Deprecations). The CHANGELOG has a
+  Deprecated section.
+
+### Deprecated
+
+- `vtk_to_dataset(..., polyhedral="split")` (#307, #337), to be removed in
+  0.9: the default reading holds polyhedra beside the shaped cells in one
+  topology, without the slivers between the two pieces' surfaces where a
+  hexahedron and a polyhedron share a face that is not planar.
 
 ### Fixed
 
 - Hiding cells by their hidden points (`hidden_by_points`, which
   `vtk_to_dataset` calls) compiles for polyhedra beside shaped cells.
+- `connected_components` over pieces of polyhedra (a `PolyhedralTopology`)
+  finds their boundary points; it read face rows they do not have.
 
 ### Changed
 

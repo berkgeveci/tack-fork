@@ -35,11 +35,12 @@ def test_what_does_not_parse_is_refused_with_where(text, message):
 def test_a_release_goes_above_the_last_one_breaking_changes_first(tmp_path):
     (tmp_path / "a.md").write_text("### Changed\n\n- Plain.\n")
     (tmp_path / "b.md").write_text("### Fixed\n\n- Fix.\n\n### Changed\n\n"
-                                   "- **Breaking:** renamed.\n")
+                                   "- **Breaking:** renamed.\n\n### Deprecated\n\n"
+                                   "- Old.\n")
     (tmp_path / "README.md").write_text("not an entry\n")
     body = changelog.render(changelog.gather(changelog.files(tmp_path)))
     assert body == ("### Changed\n\n- **Breaking:** renamed.\n- Plain.\n\n"
-                    "### Fixed\n\n- Fix.")
+                    "### Deprecated\n\n- Old.\n\n### Fixed\n\n- Fix.")
     old = "# Changelog\n\nPreamble.\n\n## 0.6.0 — 2026-10-28\n\nOld.\n"
     new = changelog.insert(old, "0.7.0", "2026-11-30", body)
     assert new.startswith("# Changelog\n\nPreamble.\n\n## 0.7.0 — 2026-11-30\n\n"

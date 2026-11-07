@@ -6,16 +6,17 @@ This catalog records format mappings and geometric restrictions.
 ## Reading and writing other formats
 
 **VTK unstructured grids.** Linear cells read as the shapes above. A grid with
-polyhedra reads as a `PolyhedralTopology`, every cell a polyhedron of its faces,
-since one topology holds either shapes or polyhedra for now (a topology holding
-both is planned). For a large mesh that mixes them, read it with
-`vtk_to_dataset(grid, polyhedral="split")`: a `PartitionedDataSet` of two
-pieces over the same points, the shaped cells as themselves and the polyhedra
-as polyhedra, each point owned by one of them so reductions count it once
-(filters' outputs need `generate_global_ids` for that, or ghost cells:
-`ghost_cells` of the two with the shaped piece made polyhedral). A
-CFD mesh of 21M hexahedra and 508K polyhedra reads in under 5 seconds this way
-(with `copy=False`); read as polyhedra throughout, 27 seconds and 19 GB.
+polyhedra reads as one `UnstructuredTopology` with the polyhedra beside the
+shaped cells, as VTK holds them: one numbering of points and cells, each cell on
+its own path (a hexahedron through its shape functions, a polyhedron through its
+faces), and a face a hexahedron and a polyhedron share one face with both.
+`polyhedral=True` reads every cell as a polyhedron instead, a
+`PolyhedralTopology`. A CFD mesh of 21M hexahedra and 508K polyhedra reads in
+about 10 seconds this way, with `merge_points` and `orient`; as polyhedra
+throughout, in 35. `polyhedral="split"`, two pieces over the same points, is
+[deprecated](../../reference/deprecations.md): the pieces' surfaces differ where
+a hexahedron and a polyhedron share a face that is not planar, leaving slivers
+no piece holds.
 
 A mesh written per processor and put together without merging (OpenFOAM's
 `foamToVTK` of a decomposed case) repeats every point on a processor
@@ -23,10 +24,7 @@ boundary. `vtk_to_dataset(grid, merge_points=True)` (or a tolerance in VTK's
 coordinates) merges them before anything else is read, as
 [`merge_points`](algorithms.md#tack.dataset.algorithms.merge_points.merge_points)
 would after: the polyhedra's faces are matched once, so the boundary is the
-mesh's, and with `polyhedral="split"` each piece's owned points are decided
-on the merged points, so every point is owned once. Merging after a split
-reading is not the same: ownership was decided on the copies, and the pieces
-merged apart can disagree on it.
+mesh's.
 
 Cells whose corners are in the reverse of VTK's order -- inside out, with negative
 volumes and inward faces, as some converters write prisms -- are found on every

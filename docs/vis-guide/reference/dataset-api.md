@@ -1417,7 +1417,7 @@ so the paths are the whole mesh's, up to rounding, wherever a step
 a particle crosses by the short step to the boundary and the push out, so
 it differs by about a step. Pieces whose shared faces are not one surface
 (a hexahedron's bilinear face against a polyhedron's fanned one, in a
-`polyhedral="split"` reading) leave slivers that no piece holds: a particle
+deprecated `polyhedral="split"` reading) leave slivers that no piece holds: a particle
 pushed into one goes on from where the push would have ended going the way
 to the boundary again, if a piece holds that, the move counted in its time
 and length and drawn in its stretch. `advect` returns a `PartitionedDataSet` of the

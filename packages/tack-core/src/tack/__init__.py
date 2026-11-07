@@ -25,6 +25,7 @@ except _NotInstalled:          # a source tree that was never installed
     __version__ = "0+unknown"
 del _NotInstalled, _installed_version
 
+from tack._deprecation import TackDeprecationWarning
 from tack.lang.array import (
     Array,
     ExportedMemory,
@@ -225,6 +226,7 @@ __all__ = [
     "ExportedMemory",
     "ScalarType",
     "SoaArray",
+    "TackDeprecationWarning",
     "Texture3D",
     "arange",
     "array",

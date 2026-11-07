@@ -247,6 +247,8 @@ shape up to 4×4. See [Vectors and Matrices](../core/vectors-and-matrices.md).
 
 ::: tack.lang.source_validation.UnsupportedSyntaxError
 
+::: tack.TackDeprecationWarning
+
 ## Inspection
 
 ::: tack.inspect

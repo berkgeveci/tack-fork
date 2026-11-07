@@ -62,6 +62,10 @@ theme:
         icon: material/weather-sunny
         name: Switch to light mode
 
+# Writes the deprecations page's table from Tack's registry.
+hooks:
+  - docs/_ext/deprecations.py
+
 markdown_extensions:
   - admonition
   - attr_list
@@ -217,6 +221,7 @@ nav:
           - Algorithms: vis-guide/reference/algorithms.md
           - Interoperability: vis-guide/reference/interop.md
       - Glossary: reference/glossary.md
+      - Deprecations: reference/deprecations.md
       - Performance: performance.md
   - Developer's guide:
       - developers-guide/index.md

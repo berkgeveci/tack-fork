@@ -1100,7 +1100,8 @@ def vtk_to_dataset(grid, dtype=_DEFAULT_FLOAT, polyhedral=None, orient=False, id
     (``_mixed_polyhedra``); with ``polyhedral=True`` (or ``"all"``) the grid becomes
     a ``PolyhedralTopology`` instead, every cell a polyhedron of its faces, and with
     ``polyhedral="split"`` a ``PartitionedDataSet``: its shaped cells one piece,
-    its polyhedra another, over the same points (``_split_polyhedra``). A grid of
+    its polyhedra another, over the same points (``_split_polyhedra``; deprecated
+    since 0.8, to be removed in 0.9: the default reading holds both). A grid of
     polylines becomes a ``PolylineTopology`` (its lines two-point polylines, and
     no other cells allowed), and one of polygons (``VTK_POLYGON``) a
     ``PolygonalTopology`` (its triangles and quads polygons too, and no other
@@ -1591,6 +1592,9 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
         present = ({int(types.value.numpy().reshape(-1)[0])} if isinstance(types, ConstantArray)
                    else _present_types(np.asarray(types)))
         if polyhedral == "split":
+            from tack.dataset._deprecations import SPLIT
+
+            SPLIT.warn()
             return _split_polyhedra(grid, options)
         if polyhedral == "all":
             polyhedral = True

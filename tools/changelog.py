@@ -12,7 +12,8 @@ entries under the CHANGELOG's own headings::
     - `contour` interpolates each crossing from ...
 
 A file may hold several sections (``### Added``, ``### Changed``,
-``### Fixed``), each a list of bullets. Since every change adds its own
+``### Deprecated``, ``### Fixed``, in that order in the CHANGELOG), each a list
+of bullets; a deprecation (``tack._deprecation``) goes under Deprecated. Since every change adds its own
 file, no two pull requests touch one file, and none conflicts with
 another however they are merged.
 
@@ -36,7 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DIRECTORY = ROOT / "changelog.d"
 CHANGELOG = ROOT / "CHANGELOG.md"
-SECTIONS = ("Added", "Changed", "Fixed")
+SECTIONS = ("Added", "Changed", "Deprecated", "Fixed")
 _HEADING = re.compile(r"^### (\S.*?)\s*$")
 
 

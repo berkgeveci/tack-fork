@@ -15,7 +15,7 @@ from tack.dataset.dataset import DataSet
 from tack.dataset.ghosts import Ghosts
 from tack.dataset.global_ids import GlobalIds
 from tack.dataset.partitioned import PartitionedDataSet, common_origin
-from tack.dataset.topology import StructuredTopology, _refuse_mixed
+from tack.dataset.topology import StructuredTopology
 
 __all__ = ["generate_global_ids"]
 
@@ -53,7 +53,6 @@ def generate_global_ids(data, world=None, tolerance=0.0):
     ``tack.communication.World`` they live in (``data.world`` by default).
     The matching runs on the host and the exchanges on the pieces' devices.
     """
-    _refuse_mixed(data, "generate_global_ids")
     if not isinstance(data, PartitionedDataSet):
         raise TypeError(f"generate_global_ids takes a PartitionedDataSet, not "
                         f"{type(data).__name__}")
@@ -130,17 +129,25 @@ def _marks(piece, lost=False):
 
 def _boundary_points(topology):
     """The points on ``topology``'s boundary faces, sorted: from the faces' rows (four
-    ids a face, padded with -1), or a polyhedral topology's faces, of any size."""
+    ids a face, padded with -1), or a polyhedral topology's faces, of any size; a
+    mixed one's stored polyhedral faces (its first face ids) from their points,
+    since one of more than four has no row."""
+    from tack.dataset.polyhedra import _ranges
+
     faces = topology.faces()
     boundary = arrays.to_host(faces.boundary()).astype(np.int64)
-    if hasattr(faces, "rows"):
-        chosen = arrays.to_host(faces.rows).reshape(-1, 4)[boundary]
+    stored = None
+    if not hasattr(faces, "rows"):
+        stored = boundary
+        chosen = np.zeros(0, np.int64)
     else:
-        from tack.dataset.polyhedra import _ranges
-
+        chosen = arrays.to_host(faces.rows).reshape(-1, 4)[boundary].reshape(-1)
+        if getattr(topology, "has_polyhedra", False):
+            stored = boundary[boundary < topology.num_polyhedral_faces]
+    if stored is not None and len(stored):
         offsets = arrays.to_host(topology.face_offsets).astype(np.int64)
-        chosen = arrays.to_host(topology.face_points)[
-            _ranges(offsets[boundary], offsets[boundary + 1] - offsets[boundary])]
+        chosen = np.concatenate([chosen, arrays.to_host(topology.face_points)[
+            _ranges(offsets[stored], offsets[stored + 1] - offsets[stored])]])
     chosen = np.unique(chosen)
     return chosen[chosen >= 0].astype(np.int64)
 

@@ -319,10 +319,9 @@ def _components_pieces(data, least=None):
         if numbered or duplicates:
             chosen = np.arange(piece.num_points, dtype=np.int64)
         else:
-            faces = piece.topology.faces()
-            rows = arrays.to_host(faces.rows).reshape(-1, 4)
-            chosen = np.unique(rows[arrays.to_host(faces.boundary()).astype(np.int64)])
-            chosen = chosen[chosen >= 0].astype(np.int64)
+            from tack.dataset.algorithms.generate_global_ids import _boundary_points
+
+            chosen = _boundary_points(piece.topology)
         if numbered:
             columns = [piece.global_ids.points.numpy()[chosen].astype(np.int64).view(np.uint64)]
         else:

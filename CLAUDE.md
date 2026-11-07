@@ -25,12 +25,21 @@ The docs site has the same catch: Griffe (mkdocstrings) loads tack-core's `tack`
 
 **The CHANGELOG is gathered, not edited.** A change's entries go in a file
 of its own in `changelog.d/` (named for the change, under `### Added`,
-`### Changed`, `### Fixed`; `- **Breaking:**` entries under Changed), so pull
-requests never conflict over `CHANGELOG.md`. `python tools/changelog.py
+`### Changed`, `### Deprecated`, `### Fixed`; `- **Breaking:**` entries under
+Changed), so pull requests never conflict over `CHANGELOG.md`. `python tools/changelog.py
 check` (CI's lint job) parses them, `preview` shows the next release's
 sections, and `release VERSION YYYY-MM-DD` writes them into `CHANGELOG.md`
 and deletes the files; edit `CHANGELOG.md` only at a release (its summary).
-`tools/` tests itself alone (`cd tools && uv run --no-project --with pytest
+**Deprecations** go through `tack._deprecation`: declare one with
+`deprecated(what, since=, removed_in=, use=, package=)` in the package's
+declaration module (`DECLARED_IN`: tack-core's in `_deprecation.py`, tack-vis's
+in `tack/dataset/_deprecations.py`, so the registry needs no VTK), call its
+`warn()` where the feature is used (a `tack.TackDeprecationWarning` at the first
+line outside Tack's directories), and add a `### Deprecated` entry.
+`test_deprecations.py` fails once a package's version reaches a `removed_in`, and
+`docs/_ext/deprecations.py` (an MkDocs hook) writes `reference/deprecations.md`'s
+table from the registry. Deprecate in one minor release, remove in the next or
+later. `tools/` tests itself alone (`cd tools && uv run --no-project --with pytest
 pytest`; its `pytest.ini` keeps the repository's conftest out).
 
 **Every source file opens with an SPDX header** (ParaView's form: `#

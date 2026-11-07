@@ -296,9 +296,8 @@ the same moved hexahedra cost this many times their time as hexahedra
 | `streamlines` | 1.3× | 1.6× |
 
 So keep shaped cells as shapes where you can. A VTK grid that mixes shapes
-and polyhedra can be read as two pieces over the same points with
-`vtk_to_dataset(grid, polyhedral="split")`: the shaped cells in one piece,
-the polyhedra in the other, each on its fastest path.
+and polyhedra reads that way by default: the polyhedra beside the shaped cells
+in one `UnstructuredTopology`, each cell on its fastest path.
 
 ### Limits
 

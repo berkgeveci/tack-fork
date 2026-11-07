@@ -1410,6 +1410,17 @@ def _mixed_vtu_grid():
     return grid
 
 
+def _split(grid, **options):
+    """``vtk_to_dataset(grid, polyhedral="split")``, which warns that it is deprecated,
+    at this line."""
+    from tack.interop.vtk import vtk_to_dataset
+
+    with pytest.warns(tack.TackDeprecationWarning, match='polyhedral="split"') as caught:
+        out = vtk_to_dataset(grid, polyhedral="split", **options)
+    assert {w.filename for w in caught} == {__file__}
+    return out
+
+
 @pytest.mark.parametrize("copy", [True, False])
 def test_split_reads_shapes_and_polyhedra_over_one_set_of_points(copy):
     """``vtk_to_dataset(..., polyhedral="split")``: the shaped cells one piece and the
@@ -1420,7 +1431,7 @@ def test_split_reads_shapes_and_polyhedra_over_one_set_of_points(copy):
 
     grid = _mixed_vtu_grid()
     types = np.asarray(grid.cell_types)
-    pieces = vtk_to_dataset(grid, polyhedral="split", copy=copy)
+    pieces = _split(grid, copy=copy)
     shaped, polyhedral = pieces[0], pieces[1]
     assert isinstance(shaped.topology, td.UnstructuredTopology)
     assert isinstance(polyhedral.topology, td.PolyhedralTopology)
@@ -1452,7 +1463,7 @@ def test_split_readings_outputs_reduce_once_marked():
     from tack.interop.vtk import vtk_to_dataset
 
     grid = _mixed_vtu_grid()
-    pieces = vtk_to_dataset(grid, polyhedral="split")
+    pieces = _split(grid)
     whole = vtk_to_dataset(grid, polyhedral=True)
     for level in (-2.0, 2.0, 6.0):
         cuts = td.PartitionedDataSet([td.contour(p, "T", level) for p in pieces])
@@ -1498,7 +1509,8 @@ def test_reading_merges_repeated_points(polyhedral):
                                   np.sort(expected.fields["T"].values.numpy()))
     assert (merged.topology.faces().boundary().size
             == expected.topology.faces().boundary().size)
-    pieces = vtk_to_dataset(repeated, polyhedral=polyhedral, merge_points=True)
+    pieces = (_split(repeated, merge_points=True) if polyhedral == "split" else
+              vtk_to_dataset(repeated, polyhedral=polyhedral, merge_points=True))
     if polyhedral == "split":
         assert td.statistics(pieces, "T").n == grid.number_of_points
     else:
@@ -1518,7 +1530,7 @@ def test_split_readings_surface_is_the_wholes():
     from tack.interop.vtk import vtk_to_dataset
 
     grid = _mixed_vtu_grid()
-    pieces = vtk_to_dataset(grid, polyhedral="split")
+    pieces = _split(grid)
     surface = td.extract_surface(pieces)
     whole = td.extract_surface(vtk_to_dataset(grid, polyhedral=True))
     assert sum(int(((p.ghosts.cells.numpy() & 1) == 0).sum()) for p in surface) == whole.num_cells
@@ -1531,7 +1543,7 @@ def test_split_reading_ghosted_as_polyhedra_reduces_exactly():
     from tack.interop.vtk import vtk_to_dataset
 
     grid = _mixed_vtu_grid()
-    shaped, polyhedral = vtk_to_dataset(grid, polyhedral="split")
+    shaped, polyhedral = _split(grid)
     pieces = td.ghost_cells(td.PartitionedDataSet([td.as_polyhedra(shaped), polyhedral]))
     whole = vtk_to_dataset(grid, polyhedral=True)
     for level in (-2.0, 2.0, 6.0):
@@ -1544,12 +1556,9 @@ def test_split_of_one_kind_is_one_piece():
     import vtkmodules.vtkCommonDataModel as dm
     from vtkmodules.vtkFiltersSources import vtkCellTypeSource
 
-    from tack.interop.vtk import vtk_to_dataset
-
     for kind, topology in ((dm.VTK_HEXAHEDRON, td.UnstructuredTopology),
                            (dm.VTK_POLYHEDRON, td.PolyhedralTopology)):
-        pieces = vtk_to_dataset(vtkCellTypeSource(cell_type=kind, blocks_dimensions=(2, 2, 2))(),
-                                polyhedral="split")
+        pieces = _split(vtkCellTypeSource(cell_type=kind, blocks_dimensions=(2, 2, 2))())
         assert len(pieces) == 1 and isinstance(pieces[0].topology, topology)
 
 
