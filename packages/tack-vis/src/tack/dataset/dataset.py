@@ -86,6 +86,18 @@ class Field:
                                  f"not {arrays.width_of(gradient.values) or 1}")
         self.gradient = gradient
 
+    @classmethod
+    def _assembled(cls, space, values, unit=None):
+        """``Field(space, values, unit)`` without its checks: ``values`` an array of
+        ``space.size`` values on its topology's device, ``unit`` canonical or None.
+        For the thousands of boxes of an AMR hierarchy."""
+        out = cls.__new__(cls)
+        out.space = space
+        out.values = values
+        out._unit = unit
+        out.gradient = None
+        return out
+
     @property
     def unit(self):
         """The values' unit, a string, or ``None`` if unknown."""
@@ -804,15 +816,15 @@ class DataSet:
         self.global_ids = global_ids
         _ = self._device                    # refuses parts on two devices
 
-    def _with_ghosts(self, ghosts):
+    def _with_ghosts(self, ghosts, check=True):
         """A copy with ``ghosts`` for marks, sharing everything else, and checked only
-        for the marks: its parts passed their checks when it was made. Its fields
+        for the marks (not at all without ``check``: marks made for it, of its sizes
+        on its device): its parts passed their checks when it was made. Its fields
         and sets are its own containers, so changing them leaves this one's alone.
         What makes many boxes at once (``AMRDataSet``) uses it: the constructor's
         checks cost about 60 us a box."""
-        import copy
-
-        out = copy.copy(self)
+        out = type(self).__new__(type(self))
+        out.__dict__.update(self.__dict__)          # copy.copy's, without its protocol
         fields = Fields.__new__(Fields)
         fields._topology = self.topology
         fields._entries = [list(entry) for entry in self._fields._entries]
@@ -821,7 +833,7 @@ class DataSet:
         sets._topology = self.topology
         dict.update(sets, self._sets)
         out._sets = sets
-        if ghosts is not None:
+        if ghosts is not None and check:
             ghosts._check(self.topology)
             same_device("DataSet", (self.topology, ghosts))
         out._ghosts_lost = False

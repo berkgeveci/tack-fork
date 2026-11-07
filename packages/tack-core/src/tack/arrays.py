@@ -429,6 +429,25 @@ class UniformCoordinates(_Implicit):
         self._origin, self._spacing, self._matrix = origin, spacing, matrix
         _metadata(self, math.prod(dims), 3, dtype)
 
+    @classmethod
+    def _assembled(cls, dims, origin, spacing, dtype, device):
+        """``UniformCoordinates(dims, origin, spacing, dtype=dtype, device=device)``
+        without a direction, its checks or conversions: ``dims`` three Python ints,
+        ``origin`` and ``spacing`` three Python floats, ``device`` a `tack.Device`. For the
+        thousands of boxes of an AMR hierarchy."""
+        out = cls.__new__(cls)
+        out.dims = dims
+        out.px, out.py = dims[0], dims[1]
+        out.ox, out.oy, out.oz = origin
+        out.sx, out.sy, out.sz = spacing
+        out.direction = _identity(dtype, device)
+        out._origin, out._spacing, out._matrix = origin, spacing, _EYE3
+        # In the constructor's order (``_metadata``'s): a template's attribute layout
+        # is learned per order of names.
+        out._size, out._width, out._dtype = dims[0] * dims[1] * dims[2], 3, dtype
+        out.length = out._size
+        return out
+
     @property
     def point_dims(self):
         return _point_dims(self.dims)

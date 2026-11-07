@@ -544,6 +544,27 @@ class StructuredTopology(_Topology):
         # or the default device when it is made.
         self._found_device = backend_of(device)
 
+    @classmethod
+    def _assembled(cls, point_dims, offset, id_dtype, backend):
+        """``StructuredTopology(point_dims, id_dtype, backend, offset)`` without its
+        checks or conversions: ``point_dims`` and ``offset`` tuples of Python ints of
+        one length (1 to 3, sizes at least 2), ``id_dtype`` one ``ids.choose`` gives
+        for them, ``backend`` a backend. For the thousands of boxes of an AMR
+        hierarchy (``test_assembled_datasets_are_constructed_ones``)."""
+        out = cls.__new__(cls)
+        out.point_dims = point_dims
+        out.offset = offset
+        dims = point_dims + (1,) * (3 - len(point_dims))
+        nx, ny, nz = dims
+        cells = (nx - 1) * max(ny - 1, 1) * max(nz - 1, 1)
+        out.num_cells = cells
+        out.num_points = nx * ny * nz
+        out.id_dtype = id_dtype
+        kind, shape = cls._KINDS[len(point_dims)]
+        out._groups = [DomainGroup(kind, shape, (*dims, cells), cells, 0)]
+        out._found_device = backend
+        return out
+
     def _moved(self, target):
         return StructuredTopology(self.point_dims, id_dtype=self.id_dtype, device=target,
                                   offset=self.offset)

@@ -111,11 +111,25 @@ class Space:
 
     def __new__(cls, where, *args, **kwargs):
         topology = getattr(where, "topology", where)
-        params = cls._params(*args, **cls._defaults(topology, args, kwargs))
-        # An array parameter (an order per cell) is not hashable: the space is
-        # one per array object, which it keeps alive, so its id stays unique.
-        key = (cls, tuple(sorted((k, ("array", id(v)) if _is_array(v) else v)
-                                 for k, v in params.items())))
+        plain = None if args or kwargs else cls.__dict__.get("_plain")
+        if plain is None:
+            params = cls._params(*args, **cls._defaults(topology, args, kwargs))
+            # An array parameter (an order per cell) is not hashable: the space is
+            # one per array object, which it keeps alive, so its id stays unique.
+            key = (cls, tuple(sorted((k, ("array", id(v)) if _is_array(v) else v)
+                                     for k, v in params.items())))
+            # A property of the same name resolves the parameter itself (L2's
+            # layout, whose "auto" depends on the device).
+            kept = [(name, value) for name, value in params.items()
+                    if not isinstance(getattr(cls, name, None), property)]
+            if not args and not kwargs:
+                # Without parameters the defaults do not depend on the mesh (H1's
+                # and L2's basis does only above order 2), so the parameters and
+                # key are the class's, worked out once: an AMR hierarchy makes
+                # spaces on thousands of topologies.
+                type.__setattr__(cls, "_plain", (params, key, kept))
+        else:
+            params, key, kept = plain
         # Weak references in a plain dict: a WeakValueDictionary costs 20 us to make,
         # once a topology, and an AMR hierarchy has a topology a box. A dead entry
         # stays until its key is asked for again; a topology has a few.
@@ -127,12 +141,9 @@ class Space:
         if space is None:
             space = super().__new__(cls)
             space.topology = topology
-            space.params = params
-            for name, value in params.items():
-                # A property of the same name resolves the parameter itself (L2's
-                # layout, whose "auto" depends on the device).
-                if not isinstance(getattr(cls, name, None), property):
-                    setattr(space, name, value)
+            space.params = dict(params)
+            for name, value in kept:
+                setattr(space, name, value)
             interned[key] = weakref.ref(space)
         return space
 

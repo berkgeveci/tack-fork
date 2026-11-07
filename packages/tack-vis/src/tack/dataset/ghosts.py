@@ -162,6 +162,16 @@ class Ghosts:
         self.points = _marks(points, "points")
         _ = self._device                    # refuses marks on two devices
 
+    @classmethod
+    def _assembled(cls, cells, points):
+        """``Ghosts(cells, points)`` without its checks: each one-dimensional u8 marks
+        or None, both on one device. For the thousands of boxes of an AMR
+        hierarchy."""
+        out = cls.__new__(cls)
+        out.cells = cells
+        out.points = points
+        return out
+
     @property
     def _device(self):
         return same_device("Ghosts", (self.__dict__.get("cells"), self.__dict__.get("points")))

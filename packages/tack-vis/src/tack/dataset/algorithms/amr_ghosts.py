@@ -17,6 +17,7 @@ their siblings, or interpolated in the coarse cells.
 """
 
 import functools
+import math
 
 import numpy as np
 
@@ -25,7 +26,7 @@ from tack import arrays
 from tack import communication as tc
 from tack.algorithms import exclusive_scan
 from tack.arrays import CartesianProduct, UniformCoordinates
-from tack.dataset import _box_pairs, _matching
+from tack.dataset import _box_pairs, _matching, ids
 from tack.dataset.amr import AMRDataSet, _mark
 from tack.dataset.carry import _point_values
 from tack.dataset.dataset import DataSet, Field, _split_key
@@ -33,6 +34,7 @@ from tack.dataset.ghosts import Ghosts
 from tack.dataset.partitioned import common_origin
 from tack.dataset.spaces import H1, Constant, Values
 from tack.dataset.topology import StructuredTopology
+from tack.runtime.dispatch import backend_of
 
 __all__ = ["average_down"]
 
@@ -1328,16 +1330,19 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden_p
     # small-array calls were a good part of a box's cost.
     own, (low, high) = box[0].tolist(), ext.tolist()
     dims = tuple(high[a] - low[a] + 1 for a in range(d))
-    with device:
-        topology = StructuredTopology(dims, id_dtype=piece.topology.id_dtype,
-                                      offset=tuple(low[:d]))
+    # Every part is made here, consistent: assembled without the constructors'
+    # checks of each (AMR-Wind's grown boxes are 15,598).
+    num_points, num_cells = math.prod(dims), math.prod(n - 1 for n in dims)
+    topology = StructuredTopology._assembled(
+        dims, tuple(low[:d]), ids.choose(piece.topology.id_dtype, max(num_points, 12 * num_cells)),
+        backend_of(device))
     coordinates = piece.geometry.values
-    if isinstance(coordinates, UniformCoordinates):
+    if isinstance(coordinates, UniformCoordinates):          # axis-aligned, as boxes are
         spacing = coordinates._spacing
         origin = tuple(o - (own[a] - low[a]) * spacing[a] if a < d else o - 0.0
                        for a, o in enumerate(coordinates._origin))
-        geometry = UniformCoordinates(dims, origin, spacing, dtype=coordinates.dtype,
-                                      device=device)
+        geometry = UniformCoordinates._assembled(dims + (1,) * (3 - d), origin, spacing,
+                                                 coordinates.dtype, device)
     else:
         grid = positions.numpy().reshape(-1, 3).astype(np.float64)
         grid = _extrapolated(grid, hidden_points, dims)
@@ -1356,8 +1361,6 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden_p
         else:
             with device:
                 geometry = tack.array(grid.astype(piece.dtype.numpy_dtype), tack.vec3(piece.dtype))
-    # Every part is made here, consistent: assembled without the constructor's checks
-    # of each (12 us a box; AMR-Wind's grown boxes are 15,598).
     entries = []
     for name in names:
         field = piece.fields[name]
@@ -1366,8 +1369,10 @@ def _grown_box(piece, device, box, ext, d, assembled, names, positions, hidden_p
         else:
             space = Constant(topology) if isinstance(field.space, Constant) else \
                 Values(topology, "cells")
-        entries.append((_split_key(name)[0], Field(space, assembled[name], field.unit)))
-    return DataSet._assembled(topology, Field(H1(topology), geometry, piece.unit), entries,
+        entries.append((_split_key(name)[0], Field._assembled(space, assembled[name],
+                                                              field.unit)))
+    return DataSet._assembled(topology, Field._assembled(H1(topology), geometry, piece.unit),
+                              entries,
                               ghosts, origin=piece.origin, time=piece.time,
                               time_unit=piece.time_unit)
 
@@ -1435,7 +1440,7 @@ def _grown_ghosts(amr, groups, extents, hidden):
                     _set_bits(at, _HIDDEN[kind], whole)
                 views[kind] = whole._row_views(starts)
         for n, i in enumerate(members):
-            out[i] = Ghosts(cells=views["cells"][n], points=views["points"][n])
+            out[i] = Ghosts._assembled(views["cells"][n], views["points"][n])
     return out
 
 

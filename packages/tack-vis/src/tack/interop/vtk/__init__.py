@@ -56,6 +56,7 @@ cannot be shared.
 """
 
 import itertools
+import math
 
 import tack
 
@@ -520,11 +521,13 @@ def _units_label(array):
 
     if array is None or not isinstance(array, vtkDataArray):
         return None
+    # The key's own calls: the information object's are overloaded on every kind of
+    # key, and resolving them took 3 us a call (an AMR hierarchy makes thousands).
     information = array.GetInformation()
     key = vtkDataArray.UNITS_LABEL()
-    if not information.Has(key):
+    if not key.Has(information):
         return None
-    label = information.Get(key)
+    label = key.Get(information)
     if not label or not label.strip():
         return None
     try:
@@ -1798,6 +1801,8 @@ def _amr_to_dataset(amr, options, world=None):
         stage = _SharedSpans([block for _, _, block in blocks], options["dtype"])
     else:
         stage = None
+    images = None if stage is None else _ImageBoxes(options, stage)
+    time_key = _time_key()
     levels = [[] for _ in range(amr.GetNumberOfLevels())]
     for k, (level, index, block) in enumerate(blocks):
         boxes = levels[level]
@@ -1805,11 +1810,15 @@ def _amr_to_dataset(amr, options, world=None):
         amr.GetAMRBox(level, index).GetDimensions(lo, hi)   # cells, hi inclusive
         # Placed as it is made, on the hierarchy's origin (``options``, chosen
         # for the whole), not one a box's own bounds would choose.
+        data = None
         if stage is not None:
             stage.box = k
-        data = _vtk_to_dataset(block, **options, placement=lo, _stage=stage)
-        if block.GetInformation().Has(_time_key()):
-            _stamp(data, block.GetInformation().Get(_time_key()))
+            data = images.box(block, lo)
+        if data is None:
+            data = _vtk_to_dataset(block, **options, placement=lo, _stage=stage)
+        information = block.GetInformation()
+        if time_key.Has(information):           # the key's call: see _units_label
+            _stamp(data, time_key.Get(information))
         topology = data.topology
         n = len(topology.point_dims)
         cells = [h - lo_ + 1 for lo_, h in zip(lo, hi) if h >= lo_][:n]   # 2D: hi -1
@@ -1823,6 +1832,106 @@ def _amr_to_dataset(amr, options, world=None):
     ratios = [int(amr.GetRefinementRatio(level))
               for level in range(amr.GetNumberOfLevels() - 1)]
     return AMRDataSet(levels, ratios, world=world)
+
+
+class _ImageBoxes:
+    """The image boxes of a ``vtkOverlappingAMR`` converted with a stage (`_Staging`,
+    `_SharedSpans`), each made as ``_vtk_to_dataset(block, placement=lo,
+    _stage=stage)`` makes it, from parts made without their checks: a hierarchy
+    has thousands (AMR-Wind 15,598, 48 us a box that way, about 20 this way).
+    ``box`` gives None for a block it does not take -- not an image, an image of
+    no cells, or one with an array on a device -- which the caller converts the
+    long way. ``test_staged_boxes_are_the_boxes_converted_one_by_one`` holds the
+    two alike."""
+
+    def __init__(self, options, stage):
+        from vtkmodules.vtkCommonCore import vtkDataArray
+        from vtkmodules.vtkCommonDataModel import vtkImageData
+
+        from tack.arrays import UniformCoordinates
+        from tack.dataset import H1, Constant, DataSet, Field, StructuredTopology, ids
+        from tack.dataset.dataset import as_origin
+        from tack.dataset.ghosts import Ghosts, hidden_by_points
+        from tack.dataset.global_ids import GlobalIds
+        from tack.runtime.dispatch import backend_of
+
+        self._stage = stage
+        self._float = options["dtype"]
+        self._geometry_dtype = tack.f64 if options["dtype"] is None else options["dtype"]
+        self._id_dtype = options["id_dtype"]
+        self._share = not options["copy"]
+        self._origin = as_origin(options["origin"])
+        self._backend = backend_of(None)
+        self._device = tack.get_default_device()
+        self._image = vtkImageData
+        self._data_array = vtkDataArray
+        self._units_key = vtkDataArray.UNITS_LABEL()
+        self._parts = (UniformCoordinates, H1, Constant, DataSet, Field, StructuredTopology,
+                       ids.choose, Ghosts, hidden_by_points, GlobalIds)
+
+    def box(self, block, lo):
+        if not isinstance(block, self._image):
+            return None
+        (UniformCoordinates, H1, Constant, DataSet, Field, StructuredTopology, choose,
+         Ghosts, hidden_by_points, GlobalIds) = self._parts
+        dims = block.GetDimensions()
+        axes = tuple(d for d in dims if d != 1)
+        if 0 in dims or not axes:
+            return None                             # points without cells
+        stage, share = self._stage, self._share
+        point_data, cell_data = block.GetPointData(), block.GetCellData()
+        # Arrays the stage does not take, each converted alone: only where none is
+        # on a device (the long way makes the whole box there).
+        taken = {}
+        for what, attributes in (("points", point_data), ("cells", cell_data)):
+            ids = attributes.GetGlobalIds()
+            skipped = (_GHOST_ARRAY, ids.GetName() if ids is not None else None)
+            for name, array in _arrays_of(attributes):
+                if name in skipped:
+                    if share and _device_type(array) is not None:
+                        return None
+                    continue
+                if not isinstance(array, self._data_array):
+                    continue
+                values = stage.take(what, name, array)
+                if values is None:
+                    if share and _device_type(array) is not None:
+                        return None
+                    values = _array_to_field(array, self._float, share, None)
+                taken[what, name] = (values, self._unit(array))
+        offset = tuple(o for o, d in zip(lo, dims) if d != 1)
+        n_points = axes[0] * (axes[1] if len(axes) > 1 else 1) * \
+            (axes[2] if len(axes) > 2 else 1)
+        n_cells = math.prod(d - 1 for d in axes)
+        topology = StructuredTopology._assembled(
+            axes, offset, choose(self._id_dtype, max(n_points, 12 * n_cells)), self._backend)
+        # Points are origin + ijk * spacing, ijk from the extent's start (as the long
+        # way's NumPy computes them, in that order), less the hierarchy's origin.
+        origin, spacing, extent = block.GetOrigin(), block.GetSpacing(), block.GetExtent()
+        shift = self._origin
+        start = tuple((origin[a] + extent[2 * a] * spacing[a]) - shift[a] for a in range(3))
+        geometry = UniformCoordinates._assembled(dims, start, tuple(spacing),
+                                                 self._geometry_dtype, self._device)
+        points, cells = H1(topology), Constant(topology)
+        entries = []
+        for (what, name), (values, unit) in taken.items():
+            entries.append((name, Field._assembled(points if what == "points" else cells,
+                                                   values, unit)))
+        marks = (_ghost_marks(cell_data, share, None, stage, "cells"),
+                 _ghost_marks(point_data, share, None, stage, "points"))
+        ghosts = None if marks == (None, None) else Ghosts(cells=marks[0], points=marks[1])
+        ghosts = hidden_by_points(topology, ghosts)
+        ids = (_global_ids(cell_data, share, None), _global_ids(point_data, share, None))
+        global_ids = None if ids == (None, None) else GlobalIds(cells=ids[0], points=ids[1])
+        return DataSet._assembled(topology, Field._assembled(points, geometry), entries,
+                                  ghosts, global_ids, origin=shift)
+
+    def _unit(self, array):
+        """``_units_label(array)``, without making the array an information object it
+        lacks (``GetInformation`` makes one)."""
+        if not array.HasInformation() or not self._units_key.Has(array.GetInformation()):
+            return None
+        return _units_label(array)
 
 
 class _Staging:

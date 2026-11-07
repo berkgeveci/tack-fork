@@ -816,14 +816,74 @@ def test_assembled_datasets_are_constructed_ones(parts):
     assert assembled.unit == made.unit == "m" and assembled.dtype == made.dtype
 
 
+def _same_vars(a, b, what):
+    """``a`` and ``b`` have the same attributes, in the same order, of equal values:
+    numbers, tuples, types; device arrays the same object (an image's shared
+    identity); NumPy arrays equal; domain groups by their own attributes."""
+    from tack.dataset.views import DomainGroup
+
+    assert list(vars(a)) == list(vars(b)), what
+    for key, x in vars(a).items():
+        y = vars(b)[key]
+        if isinstance(x, np.ndarray):
+            np.testing.assert_array_equal(x, y, err_msg=f"{what}.{key}")
+        elif isinstance(x, list) and x and isinstance(x[0], DomainGroup):
+            assert [vars(g) for g in x] == [vars(g) for g in y], f"{what}.{key}"
+        elif isinstance(x, tack.Array):
+            assert x is y, f"{what}.{key}"
+        elif key == "topology":                 # each its own box's (the caller's check)
+            continue
+        elif key != "_spaces":                  # weak references, per topology
+            assert type(x) is type(y) and x == y, f"{what}.{key}"
+
+
+@pytest.mark.parametrize("dims", [(3,), (3, 4), (3, 4, 5)])
+def test_assembled_parts_are_constructed_ones(dims):
+    """The parts an AMR hierarchy's boxes are made of by the thousand, assembled
+    without their constructors' checks (``StructuredTopology._assembled``,
+    ``UniformCoordinates._assembled``, ``Field._assembled``), are the ones the
+    constructors make: attribute for attribute, in order."""
+    from tack.arrays import UniformCoordinates
+    from tack.dataset import StructuredTopology, ids
+    from tack.runtime.dispatch import backend_of
+
+    offset = tuple(range(2, 2 + len(dims)))
+    made = StructuredTopology(dims, offset=offset)
+    n = max(made.num_points, 12 * made.num_cells)
+    _same_vars(StructuredTopology._assembled(dims, offset, ids.choose(None, n),
+                                             backend_of(None)), made, "topology")
+    three = dims + (1,) * (3 - len(dims))
+    for dtype in (tack.f32, tack.f64):
+        made = UniformCoordinates(dims, (0.5, -1.0, 2.0), (0.25, 0.5, 1.0), dtype=dtype)
+        _same_vars(UniformCoordinates._assembled(three, (0.5, -1.0, 2.0), (0.25, 0.5, 1.0),
+                                                 dtype, tack.get_default_device()),
+                   made, "coordinates")
+    topology = StructuredTopology(dims)
+    values = tack.zeros(topology.num_points, tack.f32)
+    made = td.Field(td.H1(topology), values, "K")
+    assembled = td.Field._assembled(td.H1(topology), values, "K")
+    assert list(vars(assembled)) == list(vars(made))
+    assert all(vars(assembled)[k] is v or vars(assembled)[k] == v for k, v in vars(made).items())
+    cells = tack.zeros(topology.num_cells, tack.u8)
+    points = tack.zeros(topology.num_points, tack.u8)
+    for given in ((cells, points), (cells, None), (None, points)):
+        made, assembled = Ghosts(*given), Ghosts._assembled(*given)
+        assert list(vars(assembled)) == list(vars(made))
+        assert all(vars(assembled)[k] is v for k, v in vars(made).items())
+
+
 @needs_vtk
-@pytest.mark.parametrize("source", ["pulse", "hierarchy"])
-def test_staged_boxes_are_the_boxes_converted_one_by_one(source):
-    """``vtk_to_dataset`` copying a ``vtkOverlappingAMR`` stages its boxes' values in
-    one array a field and assembles each box without the constructor's checks
-    (``DataSet._assembled``); with ``copy=False`` each box is converted alone, by
-    the constructor. The boxes are alike: attributes, topology, geometry, fields
-    (name, space, unit, values), marks and frame."""
+@pytest.mark.parametrize("copy", [True, False])
+@pytest.mark.parametrize("source", ["pulse", "hierarchy", "ghosts"])
+def test_staged_boxes_are_the_boxes_converted_one_by_one(source, copy, monkeypatch):
+    """``vtk_to_dataset`` of a ``vtkOverlappingAMR`` stages its boxes' values in one
+    array a field (copying; or shares blocks lying end to end, ``copy=False``) and
+    makes each image box from parts made without their checks
+    (``_ImageBoxes``, ``DataSet._assembled``). The boxes are the ones the long
+    way, ``_vtk_to_dataset`` of each block, makes: attribute for attribute, in
+    order (the topology, the coordinates, the fields and their spaces), marks,
+    global ids and frame."""
+    from tack.interop import vtk as interop
     from tack.interop.vtk import dataset_to_vtk, vtk_to_dataset
 
     amr = td.amr_gaussian_pulse() if source == "pulse" else hierarchy("image", 3)
@@ -831,27 +891,47 @@ def test_staged_boxes_are_the_boxes_converted_one_by_one(source):
         for _, box in amr:
             box.fields["p"] = td.Field(box.fields["p"].space, box.fields["p"].values, "K")
     vtk = dataset_to_vtk(amr)
-    staged, alone = vtk_to_dataset(vtk), vtk_to_dataset(vtk, copy=False)
-    for (_, a), (_, b) in zip(staged, alone):
+    if source == "ghosts":                      # VTK's own marks, and global ids
+        from vtkmodules.vtkCommonCore import vtkIdTypeArray
+
+        for block in _vtk_blocks(vtk):
+            ids = vtkIdTypeArray(np.arange(block.GetNumberOfCells()))
+            ids.SetName("ids")
+            block.GetCellData().SetGlobalIds(ids)
+    quick_box, made = interop._ImageBoxes.box, []
+    monkeypatch.setattr(interop._ImageBoxes, "box",
+                        lambda self, block, lo: made.append(quick_box(self, block, lo))
+                        or made[-1])
+    quick = vtk_to_dataset(vtk, copy=copy)
+    assert made and None not in made                   # every box the quick way
+    monkeypatch.setattr(interop._ImageBoxes, "box", lambda self, block, lo: None)
+    long = vtk_to_dataset(vtk, copy=copy)
+    for (_, a), (_, b) in zip(quick, long, strict=True):
         assert vars(a).keys() == vars(b).keys()
-        assert (a.topology.point_dims, a.topology.offset, a.topology.id_dtype) == \
-            (b.topology.point_dims, b.topology.offset, b.topology.id_dtype)
-        ga, gb = a.geometry, b.geometry
-        assert type(ga.space) is type(gb.space) and ga.unit == gb.unit
-        assert (ga.values._origin, ga.values._spacing, ga.values.dtype) == \
-            (gb.values._origin, gb.values._spacing, gb.values.dtype)
+        _same_vars(a.topology, b.topology, "topology")
+        _same_vars(a.geometry.values, b.geometry.values, "coordinates")
+        assert type(a.geometry.space) is type(b.geometry.space)
+        assert a.geometry.unit == b.geometry.unit and a.geometry.gradient is None
         assert [(n, type(f.space), f.unit) for n, f in a.fields.entries()] == \
             [(n, type(f.space), f.unit) for n, f in b.fields.entries()]
         for (_, fa), (_, fb) in zip(a.fields.entries(), b.fields.entries()):
+            assert list(vars(fa)) == list(vars(fb)) and fa.gradient is fb.gradient is None
+            assert fa.space.topology is a.topology and fb.space.topology is b.topology
+            _same_vars(fa.space, fb.space, "space")
             np.testing.assert_array_equal(fa.values.numpy(), fb.values.numpy())
         for kind in ("cells", "points"):
             ma, mb = getattr(a.ghosts, kind), getattr(b.ghosts, kind)
             assert (ma is None) == (mb is None)
             if ma is not None:
                 np.testing.assert_array_equal(ma.numpy(), mb.numpy())
+            ia = getattr(a.global_ids, kind, None)
+            ib = getattr(b.global_ids, kind, None)
+            assert (ia is None) == (ib is None)
+            if ia is not None:
+                np.testing.assert_array_equal(ia.numpy(), ib.numpy())
+        assert (a.global_ids is None) == (source != "ghosts")
         assert (a.origin, a.unit, a.time, a.time_unit, a.dtype) == \
             (b.origin, b.unit, b.time, b.time_unit, b.dtype)
-        assert a.global_ids is None and b.global_ids is None
 
 
 def _vtk_blocks(out):

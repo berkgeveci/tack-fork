@@ -455,12 +455,13 @@ def _with_marks(amr, levels):
                         _mark(whole, bit, found, d, closed, lower, level_ids, level_starts)
             views[kind] = whole._row_views(starts)
         for i, k in enumerate(ks):
-            ghosts[k] = Ghosts(cells=views["cells"][i], points=views["points"][i])
+            # Made here, a view a box of its size on its device: unchecked.
+            ghosts[k] = Ghosts._assembled(views["cells"][i], views["points"][i])
     out, k = [], 0
     for pieces in levels:
         level = []
         for piece in pieces:
-            level.append(piece._with_ghosts(ghosts[k]))
+            level.append(piece._with_ghosts(ghosts[k], check=False))
             k += 1
         out.append(level)
     return out
@@ -489,7 +490,8 @@ def _kept(given, counts, mask):
 def _by_device(pieces):
     """``[(device, [k, ...])]``: the indices of ``pieces`` on each device, in order.
     A box's device is its marks' where it has them, as every box of a hierarchy
-    does: ``DataSet.device`` searches the dataset's parts, about 15 us a box."""
+    does, else its topology's (a box's parts are on one device, checked when it
+    was made): ``DataSet.device`` searches the dataset's parts, about 4 us a box."""
     from tack.runtime.dispatch import as_device
 
     groups = []
@@ -497,7 +499,8 @@ def _by_device(pieces):
         ghosts = piece.ghosts
         marks = None if ghosts is None else (ghosts.cells if ghosts.cells is not None
                                              else ghosts.points)
-        device = as_device(marks._backend) if marks is not None else piece.device
+        backend = marks._backend if marks is not None else piece.topology._device
+        device = as_device(backend) if backend is not None else piece.device
         for d, ks in groups:
             if d == device:
                 ks.append(k)
