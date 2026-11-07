@@ -153,6 +153,26 @@ def test_a_corner_where_faces_meet_flat_is_left_out_of_the_points_average(backen
                                rtol=1e-5)
 
 
+@pytest.mark.parametrize("off", [1e-6, -1e-6])
+def test_a_corner_flat_but_for_rounding_is_left_out_too(off):
+    """A flat corner of the test above, moved off its edge by rounding's worth (as
+    AhmedML's are, whose corner gradients reached 1e9): its scaled Jacobian is
+    within ``_FLAT`` of 0, so it is left out as an exact 0 is, rather than inverted,
+    whichever side it went."""
+    flat = [(0, 0, 0), (1, off, 0), (2, 0, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (2, 0, 1),
+            (0, 1, 1)]
+    x = np.array(flat, np.float64)
+    topology = td.UnstructuredTopology(tack.array([12], dtype=tack.u8),
+                                       tack.array([0, 8], dtype=tack.i32),
+                                       tack.array(list(range(8)), dtype=tack.i32), num_points=8)
+    data = td.DataSet(topology, tack.array(x, tack.vec3(tack.f64)))
+    data.fields["u"] = td.Field(td.H1(topology), tack.array(np.sin(x[:, 0]) + x[:, 1] ** 2))
+    g = td.gradients(data, "u", at="points").values.numpy().reshape(-1, 3)
+    assert np.isnan(g[[1, 5]]).all()                # 5 is flat exactly
+    rest = np.delete(g, [1, 5], axis=0)
+    assert np.isfinite(rest).all() and np.abs(rest).max() < 10
+
+
 @pytest.mark.parametrize("at", ["cells", "points"])
 def test_thin_cells_keep_their_gradients_in_f32(at):
     """A cell's Jacobian and its field's parametric derivative are formed from its
@@ -167,3 +187,47 @@ def test_thin_cells_keep_their_gradients_in_f32(at):
     double = td.gradients(_thin_hexahedra(tack.f64), "u", at=at).values.numpy()
     error = np.linalg.norm(single - double, axis=1) / np.linalg.norm(double, axis=1)
     assert error.max() < 1e-6
+
+
+def _tangled():
+    """Eight hexahedra over a 3 x 3 x 3 grid of points, the middle point moved toward
+    the far corner until the last cell folds over (a negative Jacobian at its
+    corner there), and a field that is not linear."""
+    from test_mixed_cells import _hexes
+
+    data = _hexes((3, 3, 3))
+    x = data.positions().copy()
+    x[13] = [1.8, 1.8, 1.8]
+    data = td.DataSet(data.topology, tack.array(x, tack.vec3(tack.f64)))
+    data.fields["u"] = td.Field(td.H1(data), tack.array(np.sin(x[:, 0]) * x[:, 1] ** 2
+                                                        + x[:, 2] ** 3))
+    return data
+
+
+def test_point_gradients_of_a_tangled_hexahedron_are_its_own_as_a_polyhedron():
+    """A cell folded over has no inverse map near the fold, and its corner
+    gradients grow without bound there (AhmedML's tangled hexahedra, to 1e9). Its
+    corners take its gradient as a polyhedron's instead (Green-Gauss over its
+    faces), as the same mesh read as polyhedra gives it; the other cells keep
+    theirs."""
+    data = _tangled()
+    quality = td.cell_quality(data, "scaled_jacobian")["scaled_jacobian"].values.numpy()
+    assert quality[7] < 0 and (quality[:7] > 0).all()
+    at_points = td.gradients(data, "u", at="points").values.numpy()
+    polyhedral = td.gradients(td.as_polyhedra(data), "u").values.numpy()
+    # The far corner, (2, 2, 2), is the tangled cell's alone.
+    np.testing.assert_allclose(at_points[26], polyhedral[7], rtol=1e-12)
+    # The near corner, (0, 0, 0), is the first cell's alone, whose own corner
+    # gradient it keeps.
+    first = td.extract_cells(data, [0])
+    np.testing.assert_allclose(at_points[0], td.gradients(first, "u", at="points")
+                               .values.numpy()[0], rtol=1e-12)
+    assert not np.allclose(at_points[0], polyhedral[0])
+
+
+def test_a_linear_fields_point_gradients_stay_exact_beside_a_tangled_hexahedron():
+    data = _tangled()
+    x = data.positions()
+    data.fields["v"] = td.Field(td.H1(data), tack.array(x @ np.array([1.0, -2.0, 3.0]) + 4))
+    np.testing.assert_allclose(td.gradients(data, "v", at="points").values.numpy(),
+                               np.tile([1.0, -2.0, 3.0], (data.num_points, 1)), atol=1e-12)

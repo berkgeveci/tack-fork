@@ -129,15 +129,45 @@ def _node_gradients(cells, u, out):
             out[cells.node_dof(c, j)] = world_gradient(cells, u, c, cells.node_parametric_point(c, j))
 
 
+#: A corner whose scaled Jacobian (the determinant over its columns' lengths) is
+#: within this of 0 is flat, two of the cell's faces meeting there in one plane,
+#: whatever rounding left of the 0 -- in f32, positions of size 6 round a cell of
+#: size 1e-3 by 4e-4 of it, and AhmedML's flat corners came out at 1e-4 to 2e-4 --
+#: its angle under a tenth of a degree; below its negative, the cell is tangled.
+_FLAT = tack.constant(1e-3)
+
+
 @tack.func
-def _singular(cells, c, pc):
-    """1 where the geometry's Jacobian at parametric `pc` of cell `c` has no inverse:
-    a solid's determinant, or a 2D cell's in-plane one (`_in_plane`'s), exactly 0."""
+def _scaled(m):
+    """A solid's Jacobian ``m``, scaled: its determinant over the product of its
+    columns' lengths (at a hexahedron's corner, its three edges there), 1 for a
+    right angle, 0 flat, negative folded; 0 for a column of no length."""
+    a = tack.vec3(m[0, 0], m[1, 0], m[2, 0])
+    b = tack.vec3(m[0, 1], m[1, 1], m[2, 1])
+    d = tack.vec3(m[0, 2], m[1, 2], m[2, 2])
+    lengths = a.norm() * b.norm() * d.norm()
+    scaled = lengths - lengths
+    if lengths > 0.0:
+        scaled = m.determinant() / lengths
+    return scaled
+
+
+@tack.func
+def _corner_kind(cells, c, pc):
+    """``(singular, folded)`` where the geometry's Jacobian at parametric `pc` of cell
+    `c` is: singular 1 where it has no inverse -- a solid's flat (its scaled
+    Jacobian within ``_FLAT`` of 0), a 2D cell's in-plane determinant
+    (`_in_plane`'s) exactly 0 -- and folded 1 where a solid's is below ``-_FLAT``
+    (a tetrahedron, whose Jacobian is one, never: inside out is ``orient``'s)."""
     m = cells.geometry_jacobian(c, pc)
     s = 0
+    folded = 0
     if cells.DIMENSION == 3:
-        if m.determinant() == 0.0:
+        scaled = _scaled(m)
+        if abs(scaled) <= _FLAT:
             s = 1
+        elif scaled < -_FLAT and cells.ID != shapes.TETRA:
+            folded = 1
     elif cells.DIMENSION == 2:
         a = tack.vec3(m[0, 0], m[1, 0], m[2, 0])
         b = tack.vec3(m[0, 1], m[1, 1], m[2, 1])
@@ -146,13 +176,61 @@ def _singular(cells, c, pc):
         bb = b.dot(b)
         if aa * bb - ab * ab == 0.0:
             s = 1
-    return s
+    return s, folded
+
+
+@tack.func
+def _shape_green_gauss(cells, u, c):
+    """A solid cell's gradient as a polyhedron's (``_polyhedral_gradients``): Green-Gauss
+    over its faces from the shape's tables, each fanned from its points' mean, so a
+    linear field's is exact, without the map's Jacobian. Positions and values from
+    the cell's first corner. Faces wound all outward or all inward give the same
+    gradient, the volume's sign cancelling."""
+    origin = cells.corner_position(c, 0)
+    u0 = u.corner_value(c, 0)
+    six = origin[0] - origin[0]
+    total = origin - origin
+    for k in range(cells.NUM_FACES):
+        size = cells.face_num_points(k)
+        first = cells.corner_position(c, cells.face_corner(k, 0)) - origin
+        u_first = u.corner_value(c, cells.face_corner(k, 0)) - u0
+        a = first
+        ua = u_first
+        points = first
+        values = u_first
+        newell = origin - origin
+        spun = origin - origin
+        along = origin - origin
+        for j in range(1, size + 1):
+            b = first
+            ub = u_first
+            if j < size:
+                b = cells.corner_position(c, cells.face_corner(k, j)) - origin
+                ub = u.corner_value(c, cells.face_corner(k, j)) - u0
+                points += b
+                values += ub
+            n = a.cross(b)
+            both = ua + ub
+            newell += n
+            spun += n * both
+            along += (b - a) * both
+            a = b
+            ua = ub
+        apex = points / size
+        six += apex.dot(newell)
+        total += spun + along.cross(apex) + newell * (values / size)
+    return total / six
 
 
 @tack.kernel
 def _corner_gradients(cells, u, start, out, singular):
     for c in cells:
         first = start + cells.index(c) * cells.NUM_POINTS
+        # Tangled: the map folds over (a corner's scaled Jacobian below -_FLAT), so
+        # its inverse, which the corner gradients take, is wrong near the fold and
+        # unbounded at it. The cell's gradient is then its own as a polyhedron's,
+        # at every corner.
+        tangled = 0
         for j in range(cells.NUM_POINTS):
             singular[first + j] = 0
             if cells.ID == shapes.PYRAMID and j == 4:
@@ -163,15 +241,25 @@ def _corner_gradients(cells, u, start, out, singular):
                 out[first + j] = 2.0 * ga - gb
             else:
                 pc = cells.parametric_point(j)
-                if _singular(cells, c, pc) == 1:
+                flat, folded = _corner_kind(cells, c, pc)
+                if folded == 1:
+                    tangled = 1
+                if flat == 1:
                     # Singular at this corner too, where two of the cell's faces
-                    # meet flat (a corner on a straight edge of a face): its
-                    # gradient grows without bound toward the corner and has no
-                    # value there, so the cell is left out of the point's average.
+                    # meet flat (a corner on a straight edge of a face), or all but
+                    # by rounding (AhmedML's hexahedra, which gave gradients to
+                    # 1e9): its gradient grows without bound toward the corner and
+                    # has no value there, so the cell is left out of the point's
+                    # average.
                     out[first + j] = tack.vec3(0.0, 0.0, 0.0)
                     singular[first + j] = 1
                 else:
                     out[first + j] = world_gradient(cells, u, c, pc)
+        if cells.DIMENSION == 3 and tangled == 1:
+            g = _shape_green_gauss(cells, u, c)
+            for j in range(cells.NUM_POINTS):
+                out[first + j] = g
+                singular[first + j] = 0
 
 
 @tack.kernel
