@@ -486,3 +486,22 @@ def test_a_hidden_point_hides_its_cells_as_in_vtk():
     hidden = np.asarray(data.ghosts.cells.numpy()) & td.Ghosts.HIDDENCELL
     assert np.count_nonzero(hidden) == 8                       # the point's cells
     assert data.ghosts.points.numpy()[62] & td.Ghosts.HIDDENPOINT
+
+
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8, np.int32, np.int64, np.float32,
+                                   np.float64])
+@pytest.mark.parametrize("width", [None, 1, 3, 9])
+def test_the_host_gather_is_numpys_take(dtype, width):
+    """``_host_take`` (the merge's gather of VTK's point data and connectivity) gives
+    NumPy's rows, into new memory of another type or into memory it is given."""
+    from tack.interop.vtk import _host_take
+
+    rng = np.random.default_rng(0)
+    shape = (1000,) if width is None else (1000, width)
+    values = (rng.integers(-100, 100, shape)).astype(dtype)
+    rows = rng.integers(0, 1000, 2500).astype(np.int32)
+    np.testing.assert_array_equal(_host_take(values, rows), values[rows])
+    out = np.empty((2500, *shape[1:]), np.int64)
+    assert _host_take(values, rows, out=out) is out
+    np.testing.assert_array_equal(out, values[rows].astype(np.int64))
+    assert _host_take(values, rows[:0]).shape == (0, *shape[1:])

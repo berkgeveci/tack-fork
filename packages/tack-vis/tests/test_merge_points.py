@@ -306,3 +306,24 @@ def test_faces_merged_to_no_area_stay_as_they_are():
     soup, _ = _polyhedral_pieces(td.as_polyhedra(_hexes((3, 2, 2))), 2)
     assert td.merge_points(soup).topology.num_faces == td.as_polyhedra(
         _hexes((3, 2, 2))).topology.num_faces
+
+
+@pytest.mark.parametrize("dtype", [tack.f32, tack.f64])
+def test_merging_equal_points_by_sorting_is_the_union_finds_merge(dtype):
+    """With no tolerance, points of equal coordinates are merged by sorting their
+    coordinates' bits (``_equal_labels``), not by the locator's union-find: the same
+    sets, roots and numbering. -0 equals 0, and a NaN equals nothing."""
+    from tack.dataset.algorithms.merge_points import _merged_ids
+
+    rng = np.random.default_rng(3)
+    distinct = rng.integers(-3, 4, (400, 3)).astype(np.float64) * 0.25
+    x = distinct[rng.integers(0, 400, 3000)]          # each point repeated about 7 times
+    x[::7, 0] *= -1.0                                 # 0 and -0 among them
+    x[5::97] = np.nan                                 # never merged
+    data = td.point_cloud(x, origin=(0.0, 0.0, 0.0), dtype=dtype)
+    sorted_ = [a.numpy() if hasattr(a, "numpy") else a for a in _merged_ids(data, 0.0)]
+    found = [a.numpy() if hasattr(a, "numpy") else a for a in _merged_ids(data, 1e-30)]
+    assert sorted_[2] == found[2] < len(x)
+    for a, b in zip(sorted_, found):
+        np.testing.assert_array_equal(a, b)
+    assert np.isnan(x[sorted_[1]]).any(axis=1).sum() == np.isnan(x).any(axis=1).sum()

@@ -49,6 +49,34 @@ def _numbered(labels, index, new_id, kept):
 
 
 @tack.kernel
+def _run_starts(positions, order, flags):
+    # 1 where a point, in the order of its coordinates' bits, starts a run of equal
+    # coordinates: compared as numbers, so a NaN starts its own.
+    for i in range(flags.shape[0]):
+        start = 1
+        if i > 0:
+            a = positions[order[i]]
+            b = positions[order[i - 1]]
+            if a[0] == b[0] and a[1] == b[1] and a[2] == b[2]:
+                start = 0
+        flags[i] = start
+
+
+@tack.kernel
+def _run_firsts(order, flags, runs, firsts):
+    # Each run's first point: its smallest, the sort being stable.
+    for i in range(flags.shape[0]):
+        if flags[i] == 1:
+            firsts[runs[i]] = order[i]
+
+
+@tack.kernel
+def _run_labels(order, flags, runs, firsts, labels):
+    for i in range(flags.shape[0]):
+        labels[order[i]] = firsts[runs[i] + flags[i] - 1]
+
+
+@tack.kernel
 def _renumbered(connectivity, new_id, out):
     for e in range(out.shape[0]):
         out[e] = new_id[connectivity[e]]
@@ -126,15 +154,51 @@ def _merged_polyhedra(topology, new_id, count):
     return merged, Take(tack.array(kept.astype(merged.id_dtype.numpy_dtype)))
 
 
+def _equal_labels(positions, dtype, host=None):
+    """Each point's smallest point of equal coordinates, as ``_merged_ids`` with no
+    tolerance labels them, by sorting: the coordinates' bits (taken on the host, a
+    view; -0 made 0 first, as it equals 0) sorted by a stable radix sort, and runs
+    of points whose coordinates compare equal labelled with their first.
+    ``positions`` are 3-vectors (a Tack array), ``host`` the same on the host if
+    the caller has them. No atomics, and no locator: on AhmedML's 24M points
+    0.4-0.8 s against the union-find's 2.3-3.7."""
+    from tack.dataset.buckets import _radix_order
+
+    n = arrays.size_of(positions)
+    if host is None:
+        host = arrays.to_host(positions)
+    host = np.ascontiguousarray(host).reshape(n, 3)
+    host = host + host.dtype.type(0)                  # -0 is 0's bits after this
+    bits = host.view(np.uint32 if host.dtype.itemsize == 4 else np.uint64)
+    keys = tack.array(bits, tack.vec3(tack.u32 if host.dtype.itemsize == 4 else tack.u64))
+    del host, bits
+    order = _radix_order(keys, n, dtype)
+    del keys
+    flags = tack.empty((n,), dtype)
+    _run_starts(positions, order, flags)
+    runs = tack.empty((n,), dtype)
+    count = int(exclusive_scan(flags, runs, n))
+    firsts = tack.empty((count,), dtype)
+    _run_firsts(order, flags, runs, firsts)
+    labels = tack.empty((n,), dtype)
+    _run_labels(order, flags, runs, firsts, labels)
+    return labels
+
+
 def _merged_ids(data, tolerance):
     """``(new_id, kept, count)`` for ``data``'s points within ``tolerance`` of each other
     made one: each point's merged point, each merged point's input point (its set's
-    smallest), and how many there are. Union-find over the points through the
-    locator's bins: each pair hooks the larger root under the smaller (an atomic
-    minimum), until nothing changes, so a set's root is its smallest point
+    smallest), and how many there are. With no tolerance, by sorting the
+    coordinates (``_equal_labels``); otherwise union-find over the points through
+    the locator's bins: each pair hooks the larger root under the smaller (an
+    atomic minimum), until nothing changes, so a set's root is its smallest point
     whatever the order of the hooks."""
     n = data.num_points
     dtype = ids.at_least(tack.i32, n + 1)
+    if tolerance == 0:
+        labels = (_equal_labels(arrays.materialize(data.geometry.values), dtype) if n
+                  else tack.empty((0,), dtype))
+        return _numbered_roots(labels, n, dtype)
     if dtype not in get_backend().supported_atomic_dtypes:
         raise NotImplementedError(f"merging {n} points needs {dtype} atomics, which the "
                                   f"{get_backend().name} backend does not have")
@@ -150,6 +214,12 @@ def _merged_ids(data, tolerance):
             _jump(labels)
             if not int(changed.numpy()[0]):
                 break
+    return _numbered_roots(labels, n, dtype)
+
+
+def _numbered_roots(labels, n, dtype):
+    """``_merged_ids``' result from each point's root (``labels``): the roots numbered
+    in their order, each point its root's number."""
     flags = tack.empty((max(n, 1),), dtype)
     index = tack.empty((max(n, 1),), dtype)
     count = 0
