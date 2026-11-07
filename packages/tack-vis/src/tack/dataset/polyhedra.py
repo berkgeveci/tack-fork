@@ -994,7 +994,186 @@ def _packed_order(ring_points, starts, size):
     return order, (high[order], low[order])
 
 
+@tack.func
+def _mixed_bits(p):
+    """splitmix64's finalizer of ``p``: a point id's bits spread over 64."""
+    z = tack.u64(p) + tack.u64(0x9E3779B97F4A7C15)
+    z = (z ^ (z >> tack.u64(30))) * tack.u64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> tack.u64(27))) * tack.u64(0x94D049BB133111EB)
+    return z ^ (z >> tack.u64(31))
+
+
+@tack.kernel
+def _ring_keys(ring_offsets, ring_points, keys):
+    # Each ring's key, the same for every ring of one point set: its least and
+    # greatest point, packed, and its size plus a sum of its points' mixed bits
+    # (an order-free hash; wrapping).
+    for r in range(keys.shape[0]):
+        s = ring_offsets[r]
+        e = ring_offsets[r + 1]
+        least = tack.u64(ring_points[s])
+        most = least
+        h = tack.u64(e - s)
+        for k in range(s, e):
+            p = tack.u64(ring_points[k])
+            least = min(least, p)
+            most = max(most, p)
+            h += _mixed_bits(p)
+        keys[r] = [(least << tack.u64(32)) | most, h]
+
+
+@tack.func
+def _same_points(ring_offsets, ring_points, a, b):
+    """1 if rings ``a`` and ``b`` hold the same points, as many times each."""
+    sa = ring_offsets[a]
+    n = ring_offsets[a + 1] - sa
+    sb = ring_offsets[b]
+    same = 1 if ring_offsets[b + 1] - sb == n else 0
+    k = 0
+    while same == 1 and k < n:
+        p = ring_points[sa + k]
+        here = 0
+        there = 0
+        for j in range(n):
+            if ring_points[sa + j] == p:
+                here += 1
+            if ring_points[sb + j] == p:
+                there += 1
+        if here != there:
+            same = 0
+        k += 1
+    return same
+
+
+@tack.kernel
+def _ring_run_starts(order, keys, ring_offsets, ring_points, starts, collisions):
+    # 1 where a ring, in key order, starts a point set's run; one with its
+    # neighbour's key but other points is a hash collision, counted.
+    for i in range(starts.shape[0]):
+        start = 1
+        if i > 0:
+            a = order[i]
+            b = order[i - 1]
+            ka = keys[a]
+            kb = keys[b]
+            if ka[0] == kb[0] and ka[1] == kb[1]:
+                if _same_points(ring_offsets, ring_points, a, b) == 1:
+                    start = 0
+                else:
+                    tack.atomic_add(collisions, 0, 1)
+        starts[i] = start
+
+
+@tack.kernel
+def _ring_faces(owner, is_face):
+    for r in range(owner.shape[0]):
+        is_face[r] = 1 if owner[r] == r else 0
+
+
+@tack.kernel
+def _ring_numbers(ring_offsets, owner, number, ring_face, ring_side, face_sizes):
+    # Each ring's face (its set's first ring's number) and side; each face's size.
+    for r in range(owner.shape[0]):
+        o = owner[r]
+        ring_face[r] = number[o]
+        ring_side[r] = 0 if o == r else 1
+        if o == r:
+            face_sizes[number[r]] = ring_offsets[r + 1] - ring_offsets[r]
+
+
+@tack.kernel
+def _ring_face_points(ring_offsets, ring_points, owner, number, face_offsets, face_points):
+    for r in range(owner.shape[0]):
+        if owner[r] == r:
+            at = face_offsets[number[r]]
+            s = ring_offsets[r]
+            for k in range(ring_offsets[r + 1] - s):
+                face_points[at + k] = ring_points[s + k]
+
+
+@tack.kernel
+def _rings_the_same_way(ring_offsets, ring_points, owner, flags):
+    # 1 for a copy that does not go round its face the other way: from the face's
+    # first point, the copy walked backward is the face.
+    for r in range(owner.shape[0]):
+        o = owner[r]
+        flag = 0
+        if o != r:
+            s = ring_offsets[o]
+            w = ring_offsets[r]
+            n = ring_offsets[o + 1] - s
+            k = -1
+            for j in range(n):
+                if k < 0 and ring_points[w + j] == ring_points[s]:
+                    k = j
+            if k < 0:
+                flag = 1
+            else:
+                for j in range(1, n):
+                    if ring_points[w + (k - j + n) % n] != ring_points[s + j]:
+                        flag = 1
+        flags[r] = flag
+
+
 def _match_rings(ring_offsets, ring_points):
+    """Rings (faces as each cell lists them) matched by point set:
+    ``(face_offsets, face_points, ring_face, ring_side, same_way)``, as
+    ``_match_rings_host`` gives them, by Tack kernels on the CPU over the host
+    arrays where they lie: each ring keyed by its least and greatest point and
+    an order-free hash of its points (``_ring_keys``), the keys radix sorted
+    (stably, so a set's first ring comes first), neighbours of one key compared
+    point for point (``_same_points``), and the faces, sides and windings
+    from the runs. A hash collision, or point ids past 32 bits, takes the host
+    path. On AhmedML's 4.5M polyhedral rings, 0.12 s (0.5 the first call in a
+    process) against its 0.75, the same arrays."""
+    from tack.dataset.buckets import _radix_order, run_firsts
+    from tack.lang.types import from_numpy_dtype
+
+    ring_offsets = np.ascontiguousarray(ring_offsets, np.int64)
+    ring_points = np.ascontiguousarray(ring_points)
+    if ring_points.dtype not in (np.int32, np.int64):
+        ring_points = ring_points.astype(np.int64)
+    n = ring_offsets.size - 1
+    if n <= 0 or (ring_points.size and int(ring_points.max()) >= 2**32):
+        return _match_rings_host(ring_offsets, ring_points)
+    cpu = tack.device("cpu")
+    idt = ids.at_least(tack.i32, max(n, ring_points.size) + 1)
+    with cpu:
+        offsets = tack.array_from_ptr(ring_offsets, (n + 1,), tack.i64, device=cpu)
+        points = tack.array_from_ptr(ring_points, (ring_points.size,),
+                                     from_numpy_dtype(ring_points.dtype), device=cpu)
+        keys = tack.empty((n,), tack.vec2(tack.u64))
+        _ring_keys(offsets, points, keys)
+        order = _radix_order(keys, n, idt)
+        starts = tack.empty((n,), idt)
+        collisions = tack.zeros((1,), tack.i32)
+        _ring_run_starts(order, keys, offsets, points, starts, collisions)
+        if int(collisions.numpy()[0]):
+            return _match_rings_host(ring_offsets, ring_points)
+        del keys
+        owner = run_firsts(order, starts, idt)
+        del order, starts
+        is_face = tack.empty((n,), idt)
+        _ring_faces(owner, is_face)
+        number = tack.empty((n,), idt)
+        count = int(exclusive_scan(is_face, number, n))
+        del is_face
+        ring_face = tack.empty((n,), tack.i64)
+        ring_side = tack.empty((n,), tack.u8)
+        face_sizes = tack.empty((max(count, 1),), tack.i64)
+        _ring_numbers(offsets, owner, number, ring_face, ring_side, face_sizes)
+        face_offsets = tack.empty((count + 1,), tack.i64)
+        total = int(exclusive_scan(face_sizes, face_offsets, count, close=True))
+        face_points = tack.empty((max(total, 1),), from_numpy_dtype(ring_points.dtype))
+        _ring_face_points(offsets, points, owner, number, face_offsets, face_points)
+        flags = tack.empty((n,), tack.i32)
+        _rings_the_same_way(offsets, points, owner, flags)
+        same_way = int(flags.numpy().sum())
+    return (face_offsets.numpy(), face_points.numpy()[:total], ring_face.numpy(),
+            ring_side.numpy(), same_way)
+
+
+def _match_rings_host(ring_offsets, ring_points):
     """Rings (faces as each cell lists them) matched by point set, in whole-array steps:
     ``(face_offsets, face_points, ring_face, ring_side, same_way)``. A face is the
     first ring of its point set and is numbered in that ring's order; every later

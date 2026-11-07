@@ -63,20 +63,6 @@ def _run_starts(positions, order, flags):
 
 
 @tack.kernel
-def _run_firsts(order, flags, runs, firsts):
-    # Each run's first point: its smallest, the sort being stable.
-    for i in range(flags.shape[0]):
-        if flags[i] == 1:
-            firsts[runs[i]] = order[i]
-
-
-@tack.kernel
-def _run_labels(order, flags, runs, firsts, labels):
-    for i in range(flags.shape[0]):
-        labels[order[i]] = firsts[runs[i] + flags[i] - 1]
-
-
-@tack.kernel
 def _renumbered(connectivity, new_id, out):
     for e in range(out.shape[0]):
         out[e] = new_id[connectivity[e]]
@@ -162,7 +148,7 @@ def _equal_labels(positions, dtype, host=None):
     ``positions`` are 3-vectors (a Tack array), ``host`` the same on the host if
     the caller has them. No atomics, and no locator: on AhmedML's 24M points
     0.4-0.8 s against the union-find's 2.3-3.7."""
-    from tack.dataset.buckets import _radix_order
+    from tack.dataset.buckets import _radix_order, run_firsts
 
     n = arrays.size_of(positions)
     if host is None:
@@ -176,13 +162,7 @@ def _equal_labels(positions, dtype, host=None):
     del keys
     flags = tack.empty((n,), dtype)
     _run_starts(positions, order, flags)
-    runs = tack.empty((n,), dtype)
-    count = int(exclusive_scan(flags, runs, n))
-    firsts = tack.empty((count,), dtype)
-    _run_firsts(order, flags, runs, firsts)
-    labels = tack.empty((n,), dtype)
-    _run_labels(order, flags, runs, firsts, labels)
-    return labels
+    return run_firsts(order, flags, dtype)
 
 
 def _merged_ids(data, tolerance):

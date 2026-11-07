@@ -368,6 +368,36 @@ def _scatter_run_starts(flags, run_ids, offsets, n, nruns):
             offsets[nruns] = n
 
 
+@tack.kernel
+def _run_firsts(order, flags, runs, firsts):
+    # Each run's first entry: its smallest, the sort being stable.
+    for i in range(flags.shape[0]):
+        if flags[i] == 1:
+            firsts[runs[i]] = order[i]
+
+
+@tack.kernel
+def _run_labels(order, flags, runs, firsts, labels):
+    for i in range(flags.shape[0]):
+        labels[order[i]] = firsts[runs[i] + flags[i] - 1]
+
+
+@on_inputs_device
+def run_firsts(order, flags, dtype):
+    """Each entry's run's first entry, in input order: ``flags`` (1 where a run starts,
+    0 elsewhere, over the entries in ``order``, a stable sort's permutation) scanned
+    into runs, each run's first entry its smallest index. An array of ``dtype``."""
+    n = int(order.shape[0])
+    runs = tack.empty((n,), dtype)
+    count = int(exclusive_scan(flags, runs, n)) if n else 0
+    firsts = tack.empty((max(count, 1),), dtype)
+    labels = tack.empty((n,), dtype)
+    if n:
+        _run_firsts(order, flags, runs, firsts)
+        _run_labels(order, flags, runs, firsts, labels)
+    return labels
+
+
 @on_inputs_device
 def run_offsets(values, order):
     """``(offsets, nruns)``: where each run of equal keys starts among ``values``

@@ -1667,3 +1667,67 @@ def test_inside_out_polyhedra_warn_and_orient_turns_them_outward():
     repaired = vtk_to_dataset(grid, orient=True)
     np.testing.assert_allclose(td.cell_geometry(repaired).measure.values.numpy(), expected,
                                rtol=1e-6)
+
+
+def _random_rings(seed, sets=400):
+    """Rings of 3 to 7 points, each point set listed 1 to 3 times: a copy rotated and
+    mostly run the other way, sometimes the same way; and a ring repeating a point."""
+    rng = np.random.default_rng(seed)
+    rings = []
+    for _ in range(sets):
+        size = int(rng.integers(3, 8))
+        face = rng.choice(60, size, replace=False).tolist()
+        for copy in range(int(rng.integers(1, 4))):
+            ring = face if copy == 0 else (face[::-1] if rng.random() < 0.8 else face[:])
+            turn = int(rng.integers(0, size))
+            rings.append(ring[turn:] + ring[:turn])
+    rings.insert(7, [1, 2, 2, 3])
+    rings.insert(9, [1, 2, 3, 3])                    # the same set, not the same points
+    order = rng.permutation(len(rings))
+    rings = [rings[i] for i in order]
+    offsets = np.concatenate([[0], np.cumsum([len(r) for r in rings])]).astype(np.int64)
+    return offsets, np.array([p for r in rings for p in r], np.int32)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_matching_rings_by_kernels_is_the_hosts_matching(seed, monkeypatch):
+    """``_match_rings`` (keys, a radix sort and exact comparisons in Tack kernels) gives
+    ``_match_rings_host``'s faces, numbering, sides and count of copies run the same
+    way, exactly, without falling back to it."""
+    from tack.dataset import polyhedra
+
+    offsets, points = _random_rings(seed)
+    expected = polyhedra._match_rings_host(offsets, points)
+
+    def refused(*args):
+        raise AssertionError("fell back to the host")
+
+    monkeypatch.setattr(polyhedra, "_match_rings_host", refused)
+    got = polyhedra._match_rings(offsets, points)
+    for a, b in zip(got[:4], expected[:4]):
+        np.testing.assert_array_equal(a, b)
+    assert got[4] == expected[4] > 0
+
+
+def test_a_hash_collision_takes_the_hosts_matching(monkeypatch):
+    """Two different point sets of one key (made here by a hash that is constant)
+    cannot be told apart by the sort: the kernels find it and give way to the host."""
+    from tack.dataset import polyhedra
+
+    offsets, points = _random_rings(3)
+    expected = polyhedra._match_rings_host(offsets, points)
+    used = []
+    host = polyhedra._match_rings_host
+    monkeypatch.setattr(polyhedra, "_match_rings_host",
+                        lambda *a: used.append(1) or host(*a))
+
+    @tack.kernel
+    def constant_keys(ring_offsets, ring_points, keys):
+        for r in range(keys.shape[0]):
+            keys[r] = [tack.u64(0), tack.u64(0)]
+
+    monkeypatch.setattr(polyhedra, "_ring_keys", constant_keys)
+    got = polyhedra._match_rings(offsets, points)
+    assert used == [1]
+    for a, b in zip(got[:4], expected[:4]):
+        np.testing.assert_array_equal(a, b)
