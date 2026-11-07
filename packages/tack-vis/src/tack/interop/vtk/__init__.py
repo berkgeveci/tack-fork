@@ -310,6 +310,22 @@ def _shared(host, element):
     return tack.array_from_ptr(host, (host.shape[0],), element, device="cpu")
 
 
+def _owned(host, element):
+    """``host``, a NumPy view of a VTK array only the conversion holds (one a merge
+    made), as a writable CPU array of ``element``s over the same memory, taken over
+    rather than copied, as a copy would be; ``None`` where the conversion is on
+    another device or the values are of another type, for the caller to copy."""
+    import numpy as np
+
+    scalar = element.scalar_dtype if hasattr(element, "scalar_dtype") else element
+    from tack.runtime.dispatch import get_backend
+
+    if (get_backend().name != "cpu" or not isinstance(host, np.ndarray)
+            or not host.flags.c_contiguous or host.dtype != np.dtype(scalar.numpy_dtype)):
+        return None
+    return tack.array_from_ptr(host, (host.shape[0],), element, device="cpu", writable=True)
+
+
 class _Held:
     """A NumPy view of a Tack array's memory that holds the array: NumPy keeps this
     object as the view's base, so a VTK array over the view keeps the Tack array,
@@ -462,12 +478,15 @@ def _from_vtk(array, dtype=None):
     return np.asarray(array)
 
 
-def _array_to_field(array, float_dtype, share=False, device=None):
+def _array_to_field(array, float_dtype, share=False, device=None, owned=False):
     """A VTK data array's values as a field's: floating point in ``float_dtype`` (in
     its own type when that is ``None``), integers in their own type, bits as u8 0
     and 1; a constant or affine array stays implicit. With ``share``, VTK's memory
     where it can be: ``device``'s (``_shared_on_device``) when the conversion is on
-    one, else the host's (``_shared``)."""
+    one, else the host's (``_shared``). ``owned`` says only the conversion holds the
+    array (a merge made it), which is then taken over, writable, rather than copied
+    (``_owned``). A copy reads VTK's memory once, converting only a type that
+    differs."""
     import numpy as np
     from vtkmodules.vtkCommonCore import vtkBitArray
 
@@ -501,10 +520,15 @@ def _array_to_field(array, float_dtype, share=False, device=None):
         shared = _shared(host, dtype if n == 1 else tack.vec(n, dtype))
         if shared is not None:
             return shared
+    if owned and not share:
+        taken = _owned(host, dtype if n == 1 else tack.vec(n, dtype))
+        if taken is not None:
+            return taken
     values = np.ascontiguousarray(host)
     field = tack.empty((array.number_of_tuples,), dtype if n == 1 else tack.vec(n, dtype))
     if values.size:
-        tack.copyto(field, values.reshape((-1,) if n == 1 else (-1, n)).astype(dtype.numpy_dtype))
+        tack.copyto(field, values.reshape((-1,) if n == 1 else (-1, n))
+                    .astype(dtype.numpy_dtype, copy=False))
     return field
 
 
@@ -562,7 +586,8 @@ def _arrays_of(attributes):
             yield name, attributes.GetAbstractArray(i)
 
 
-def _attributes_to_fields(attributes, space, float_dtype, share=False, device=None):
+def _attributes_to_fields(attributes, space, float_dtype, share=False, device=None,
+                          owned=False):
     from vtkmodules.vtkCommonCore import vtkDataArray
 
     from tack.dataset import Field
@@ -574,8 +599,8 @@ def _attributes_to_fields(attributes, space, float_dtype, share=False, device=No
         # Named data arrays: string and other abstract arrays have no values to compute on,
         # the ghost array becomes the ghost marks and the global ids the global ids.
         if name and name not in skipped and isinstance(array, vtkDataArray):
-            fields[name] = Field(space, _array_to_field(array, float_dtype, share, device),
-                                 _units_label(array))
+            fields[name] = Field(space, _array_to_field(array, float_dtype, share, device,
+                                                        owned), _units_label(array))
     return fields
 
 
@@ -1653,8 +1678,12 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
         pieces = (grid.GetPartition(i) for i in range(grid.number_of_partitions))
         return PartitionedDataSet(vtk_to_dataset(piece, **options)
                                   for piece in pieces if piece is not None)
+    # A merge's point data is the conversion's alone: taken over, not copied.
+    merged = False
     if isinstance(grid, vtkUnstructuredGrid) and merge_points not in (None, False):
+        given = grid
         grid = _merged_grid(grid, 0.0 if merge_points is True else merge_points)
+        merged = grid is not given
         options["merge_points"] = None                   # merged: the pieces need not be
     device = _device
     if share and device is None:
@@ -1799,7 +1828,8 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
     # The classic calls: the pythonic ``point_data``/``cell_data`` set attributes on the
     # wrappers, which VTK 9.7.1 then keeps as ghosts and sweeps on every later wrap.
     point_data, cell_data = grid.GetPointData(), grid.GetCellData()
-    fields = _attributes_to_fields(point_data, H1(topology), dtype, share, device)
+    fields = _attributes_to_fields(point_data, H1(topology), dtype, share, device,
+                                   owned=merged)
     for name, field in _attributes_to_fields(cell_data, Constant(topology), dtype,
                                              share, device).items():
         # A point array and a cell array of one name are two fields of that name.

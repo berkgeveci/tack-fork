@@ -505,3 +505,36 @@ def test_the_host_gather_is_numpys_take(dtype, width):
     assert _host_take(values, rows, out=out) is out
     np.testing.assert_array_equal(out, values[rows].astype(np.int64))
     assert _host_take(values, rows[:0]).shape == (0, *shape[1:])
+
+
+def test_a_merged_reads_point_fields_are_its_own_and_writable():
+    """``vtk_to_dataset(merge_points=True)`` takes over the point data the merge made
+    rather than copying it again: the fields are the merged points' values,
+    writable, and writing them leaves the caller's grid as it was."""
+    import vtkmodules.vtkCommonDataModel  # noqa: F401
+    from vtkmodules.vtkCommonCore import vtkFloatArray, vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkUnstructuredGrid
+
+    from tack.interop.vtk import vtk_to_dataset
+
+    # Two hexahedra, each with its own copy of the four points they share.
+    cube = np.array([[i & 1, (i >> 1) & 1, (i >> 2) & 1] for i in range(8)], np.float32)
+    x = np.r_[cube, cube + np.array([1, 0, 0], np.float32)]
+    order = [0, 1, 3, 2, 4, 5, 7, 6]
+    grid = vtkUnstructuredGrid()
+    grid.points = vtkPoints(data=vtkFloatArray(x))
+    grid.cells = (12, vtkCellArray(offsets=np.array([0, 8, 16]),
+                                   connectivity=np.array(order + [8 + k for k in order])))
+    grid.point_data["T"] = vtkFloatArray(x[:, 0] * 10)
+    grid.point_data["V"] = vtkFloatArray(x)
+    data = vtk_to_dataset(grid, merge_points=True)
+    import gc
+
+    gc.collect()                  # the merged grid is gone; its arrays live on in the fields
+    assert data.num_points == 12
+    t = data.fields["T"].values
+    np.testing.assert_array_equal(t.numpy(), data.positions()[:, 0] * 10)
+    np.testing.assert_array_equal(data.fields["V"].values.numpy(), data.positions())
+    tack.copyto(t, np.full(12, -1.0, np.float32))
+    np.testing.assert_array_equal(data.fields["T"].values.numpy(), -1.0)
+    np.testing.assert_array_equal(np.asarray(grid.point_data["T"]), x[:, 0] * 10)
