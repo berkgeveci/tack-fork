@@ -28,6 +28,18 @@ def _average_links(offsets, entries, contributions, out):
                    empty="keep")
 
 
+@tack.kernel
+def _cell_values_at_corners(cells, values, start, offsets, out):
+    # Each cell's value at each of its corners, in `corner_layout`'s order for
+    # cells of any number of points (a mixed topology's polyhedra, at
+    # `polyhedral_corners`' offsets).
+    for c in cells:
+        first = start + offsets[cells.index(c)]
+        v = values[cells.entity_id(c)]
+        for j in range(cells.num_points(c)):
+            out[first + j] = v
+
+
 @tack.device_class
 class _EntryCells(_Implicit):
     """The cell of each link entry, an entry being a cell's index in ``cells`` (a group

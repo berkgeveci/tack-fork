@@ -186,13 +186,63 @@ def _corner_keys(cells, start, keys):
             keys[first + j] = cells.point_id(c, j)
 
 
+@tack.kernel
+def _polyhedral_corner_keys(cells, start, corners, keys):
+    for c in cells:
+        first = start + corners[cells.index(c)]
+        for j in range(cells.num_points(c)):
+            keys[first + j] = cells.point_id(c, j)
+
+
+@tack.kernel
+def _point_counts(cells, counts):
+    for c in cells:
+        counts[cells.index(c)] = cells.num_points(c)
+
+
 def corner_layout(topology):
     """Where each group's (cell, corner) entries start in the layout of all of them,
-    group by group, a cell's corners together (``index(c)`` within the group)."""
+    group by group, a cell's corners together (``index(c)`` within the group). A
+    shape group's cell ``c`` has its ``NUM_POINTS`` from ``start + index(c) *
+    NUM_POINTS``; the polyhedra of a mixed topology have their connectivity's
+    points from ``start + corners[index(c)]``, ``corners`` from
+    `polyhedral_corners`."""
     groups = topology.groups()
-    starts = np.concatenate([[0], np.cumsum([g.count * g.shape.NUM_POINTS
-                                             for g in groups])]).astype(int)
+    starts = np.concatenate([[0], np.cumsum([
+        g.count * g.shape.NUM_POINTS if g.shape.REFERENCE else polyhedral_corners(topology)[1]
+        for g in groups])]).astype(int)
     return {g: int(s) for g, s in zip(groups, starts[:-1])}, int(starts[-1])
+
+
+@on_inputs_device
+def polyhedral_corners(topology):
+    """Where each polyhedron of a mixed topology has its (cell, corner) entries in
+    its group's part of `corner_layout`, by its position in the group: ``(offsets,
+    total)``, ``offsets`` CSR (one more than the group's cells) in ``id_dtype``.
+    Derived on first use and kept."""
+    if topology._polyhedral_corners is None:
+        group = next(g for g in topology.groups() if not g.shape.REFERENCE)
+        offsets = tack.empty((group.count + 1,), topology.id_dtype)
+        counts = tack.empty((group.count,), topology.id_dtype)
+        if group.count:
+            _point_counts(group.view(), counts)
+        total = exclusive_scan(counts, offsets, group.count, close=True)
+        topology._polyhedral_corners = (offsets, int(total))
+    return topology._polyhedral_corners
+
+
+def corner_keys(topology, start_of, total):
+    """Each (cell, corner) entry's point id, in `corner_layout`'s order."""
+    keys = tack.empty((total,), topology.id_dtype)
+    for group in topology.groups():
+        if not group.count:
+            continue
+        if group.shape.REFERENCE:
+            _corner_keys(group.view(), start_of[group], keys)
+        else:
+            _polyhedral_corner_keys(group.view(), start_of[group],
+                                    polyhedral_corners(topology)[0], keys)
+    return keys
 
 
 class _OnItsArrays:
@@ -338,6 +388,8 @@ class _Topology:
     _faces = None
     _edges = None
     _point_links = None
+    #: Where a mixed topology's polyhedra have their corners (`polyhedral_corners`).
+    _polyhedral_corners = None
     #: Whether polyhedra stand beside shaped cells (`UnstructuredTopology`'s).
     has_polyhedra = False
     #: The last `CellLocator` made for this topology's cells without one given
@@ -410,9 +462,7 @@ class _Topology:
                 # connectivity, and its point ids are the keys as they stand.
                 keys = connectivity
             else:
-                keys = tack.empty((total,), self.id_dtype)
-                for group in groups:
-                    _corner_keys(group.view(), start_of[group], keys)
+                keys = corner_keys(self, start_of, total)
             order, offsets = bucket_order(keys, self.num_points, self.id_dtype)
             self._point_links = (offsets, order)
         return self._point_links
@@ -484,6 +534,15 @@ class UnstructuredTopology(_Topology):
     #: The polyhedra's arrays, when it has any (``polyhedra``).
     _POLYHEDRAL = ("face_offsets", "face_points", "cell_face_offsets", "cell_faces",
                    "cell_face_sides")
+
+    @property
+    def reference_cells(self):
+        """Whether every cell has a reference element: not where polyhedra stand
+        beside the shapes. What spaces that need one everywhere read (``H1``
+        above order 1, ``L2``); an algorithm chooses its path per group by
+        ``group.shape.REFERENCE``."""
+        return not self.has_polyhedra
+
     @on_inputs_device
     def __init__(self, types, offsets, connectivity, num_points=None, id_dtype=None,
                  polyhedra=None):

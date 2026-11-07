@@ -90,10 +90,10 @@ def _keep_cells(data, keep, fields=None, keep_points=None):
     from tack.dataset.ghosts import without_hidden
 
     keep = without_hidden(data, keep)
-    if not getattr(data.topology, "reference_cells", True):
-        return _polyhedral_keep_cells(data, keep, fields, keep_points)
     if data.topology.has_polyhedra:
         return _mixed_keep_cells(data, keep, fields, keep_points)
+    if not getattr(data.topology, "reference_cells", True):
+        return _polyhedral_keep_cells(data, keep, fields, keep_points)
     n = data.num_cells
     sizes = tack.empty((n,), tack.i32)
     for group in data.topology.groups():

@@ -8,11 +8,11 @@ from tack import arrays
 from tack.arrays import materialize, size_of, width_of
 from tack.dataset import shapes, units
 from tack.dataset.algorithms._common import _field, _vectors, _with_basis
-from tack.dataset.algorithms._links import _average_links
+from tack.dataset.algorithms._links import _average_links, _cell_values_at_corners
 from tack.dataset.carry import _take
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import H1, L2, Constant, Values
-from tack.dataset.topology import _refuse_mixed, corner_layout
+from tack.dataset.topology import corner_layout, polyhedral_corners
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['gradients', 'world_gradient', 'world_hessian', 'world_jet']
@@ -279,25 +279,30 @@ def _entry_cells(offsets, cells):
             cells[k] = c
 
 
-def _polyhedral_scalar_gradients(data, field, at):
-    """A scalar field's gradient on a topology without reference elements: per 3D
-    cell Green-Gauss over the fanned faces, per polygon in its plane over its
+def _no_reference_gradients(field, view, values, dimension, out):
+    """The gradients of the cells of ``view``, a group without a reference element:
+    Green-Gauss over a 3D cell's fanned faces, a polygon's in its plane over its
     edges (both exact for a linear field), zero for polylines and for cell data
-    (constant in each cell, as on the shape path), and at the points the mean of
-    the cells' around each point."""
+    (constant in each cell, as on the shape path). ``values`` are the field's,
+    materialized, for point data."""
+    if isinstance(field.space, H1) and dimension == 3:
+        _polyhedral_gradients(view, values, out)
+    elif isinstance(field.space, H1) and dimension == 2:
+        _polygon_gradients(view, values, out)
+    else:
+        _zero_gradients(view, out)
+
+
+def _polyhedral_scalar_gradients(data, field, at):
+    """A scalar field's gradient on a topology without reference elements: each
+    cell's by `_no_reference_gradients`, and at the points the mean of the cells'
+    around each point."""
     cells = _vectors(data.num_cells, data.dtype)
-    on_points = isinstance(field.space, H1)
-    values = materialize(field.values) if on_points else None
+    values = materialize(field.values) if isinstance(field.space, H1) else None
     for group in data.launch_groups("cells", []):
-        if not group.count:
-            continue
-        view = data.domain_view("cells", group)
-        if on_points and group.shape.DIMENSION == 3:
-            _polyhedral_gradients(view, values, cells)
-        elif on_points and group.shape.DIMENSION == 2:
-            _polygon_gradients(view, values, cells)
-        else:
-            _zero_gradients(view, cells)
+        if group.count:
+            _no_reference_gradients(field, data.domain_view("cells", group), values,
+                                    group.shape.DIMENSION, cells)
     if at == "cells":
         return cells
     out = tack.empty((data.num_points,), tack.vec(3, data.dtype))
@@ -353,22 +358,46 @@ def _scalar_gradients(data, field, at):
         for group, view in data._cell_node_views(at, groups):
             _node_gradients(view, field.view(group), out)
         return out
-    if not getattr(data.topology, "reference_cells", True):
+    if not getattr(data.topology, "reference_cells", True) and not data.topology.has_polyhedra:
         return _polyhedral_scalar_gradients(data, field, at)
+    # Polyhedra beside the shapes: theirs as on a polyhedral topology, each
+    # shape's from its basis.
+    values = (materialize(field.values) if data.topology.has_polyhedra
+              and isinstance(field.space, H1) else None)
     if at == "cells":
         out = _vectors(data.num_cells, data.dtype)
-        for_each(_gradients, data, "cells", field, out)
+        if not data.topology.has_polyhedra:
+            for_each(_gradients, data, "cells", field, out)
+            return out
+        for group in data.launch_groups("cells", [field]):
+            if not group.count:
+                continue
+            view = data.domain_view("cells", group)
+            if group.shape.REFERENCE:
+                _gradients(view, field.view(group), out)
+            else:
+                _no_reference_gradients(field, view, values, group.shape.DIMENSION, out)
         return out
     # At the points: each cell's gradient at each of its corners, averaged over
     # the cells around each point, in layout order (VTK's and Viskores' point
-    # gradients). Lines and vertices contribute zero.
+    # gradients). Lines and vertices contribute zero; a polyhedron gives its
+    # cell's gradient at each of its points, as on a polyhedral topology.
     start_of, total = corner_layout(data.topology)
     corners = _vectors(total, data.dtype)
-    singular = tack.empty((total,), tack.i32)
+    # Each shape's corners say; a polyhedron's (its cell's gradient) never are.
+    singular = (tack.zeros if data.topology.has_polyhedra else tack.empty)((total,), tack.i32)
     for group in data.launch_groups("cells", [field]):
-        if group.count:
-            _corner_gradients(data.domain_view("cells", group), field.view(group),
-                              start_of[group.root], corners, singular)
+        if not group.count:
+            continue
+        view = data.domain_view("cells", group)
+        if group.shape.REFERENCE:
+            _corner_gradients(view, field.view(group), start_of[group.root], corners,
+                              singular)
+        else:
+            cells = _vectors(data.num_cells, data.dtype)
+            _no_reference_gradients(field, view, values, group.shape.DIMENSION, cells)
+            _cell_values_at_corners(view, cells, start_of[group.root],
+                                    polyhedral_corners(data.topology)[0], corners)
     out = tack.empty((data.num_points,), tack.vec(3, data.dtype))
     out.fill(0)
     if total:
@@ -419,7 +448,6 @@ def gradients(data, field, at="cells"):
     as on shapes. A polygon's is the same in its plane, over its edges; polylines
     get zero. At the points, the cells' gradients are averaged over the cells
     around each point."""
-    _refuse_mixed(data, "gradients")
     field = _with_basis(data, _field(data, field))
     if not getattr(data.topology, "reference_cells", True) and field.gradient is not None:
         raise NotImplementedError("gradients of a field given its gradient on a mesh without "

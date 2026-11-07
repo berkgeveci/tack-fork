@@ -12,7 +12,6 @@ from tack.dataset.algorithms.traces import traces
 from tack.dataset.carry import _like
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import Values, reference_cells
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['jump']
@@ -69,12 +68,16 @@ def jump(data, field):
     wrong, and each side's basis is evaluated there. Cell data (``Constant``, values on
     cells) is read from each side's cell directly, on any topology, polyhedral
     included."""
-    _refuse_mixed(data, "jump")
     field = _field(data, field)
     faces = data.topology.faces()
     out = _like(field.values, faces.num_faces)
     if _on_cells(data, field):
         for_each(_cell_jump, data, "faces", materialize(field.values), out)
+    elif data.topology.has_polyhedra:
+        # Point data beside polyhedra is order-1 H1, continuous: both sides of
+        # every face, polygons of five or more points too, agree.
+        if faces.num_faces:
+            out.fill(0)
     elif getattr(field.space, "order", 1) <= 1 or getattr(field.space, "varies", False):
         # Up to order 1 a side is linear over the face, so its corner values
         # (traces) give the center exactly -- on a pyramid's triangles too, whose

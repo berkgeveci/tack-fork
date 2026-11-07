@@ -15,6 +15,19 @@
   as polyhedra.
 - `Shape.REFERENCE`: whether a cell group has a reference element, so an
   algorithm can take the polyhedral path per group.
+- Per-cell work on polyhedra beside shaped cells (#307, phase 2): `gradients`
+  (at cells and points), `cell_centers`, `values_at_centers`, `integrate`,
+  `project` between point and cell data, `cell_quality`, `traces`, `jump`,
+  `upwind_flux`, `divergence`, `flow_quantities` and `interpolate` of point
+  values take a mixed mesh, each shape group through its basis and the
+  polyhedra as on a `PolyhedralTopology`; `point_links` covers the
+  polyhedra. A mixed topology's `reference_cells` is false, so `H1` above
+  order 1 and `L2` refuse it by name.
+
+### Fixed
+
+- Hiding cells by their hidden points (`hidden_by_points`, which
+  `vtk_to_dataset` calls) compiles for polyhedra beside shaped cells.
 
 ### Changed
 

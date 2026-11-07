@@ -473,7 +473,16 @@ READY = {
     "point_normals_radius", "connected_components_radius", "deposit", "deposit_cic",
     "sph_interpolate", "sph_density", "connected_components_periodic",
     "point_normals_periodic", "halo_catalog", "halo_catalog_periodic",
+    # Phase 2: per-cell work, each group its own way.
+    "gradients", "gradients_at_points", "cell_centers", "values_at_centers", "to_cells",
+    "to_points", "project", "integrate", "flow_quantities", "cell_quality", "traces",
+    "jump", "upwind_flux", "divergence",
 }
+
+#: Calls of `READY` whose answer, a field on the cells, is the shaped mesh's on the
+#: shaped cells and the all-polyhedra mesh's on the polyhedra: measures that differ
+#: between a hexahedron and the same cell as a polyhedron.
+PER_CELL = {"cell_quality"}
 
 
 def _summary(value):
@@ -519,6 +528,13 @@ def test_an_algorithm_takes_mixed_cells_or_refuses_them(name):
         if name not in READY:
             with pytest.raises(NotImplementedError, match="polyhedra|Polyhedron"):
                 call(mixed)
+            return
+        if name in PER_CELL:
+            every = devices._with_fields(td.as_polyhedra(shaped), cpu)
+            chosen = np.zeros(shaped.num_cells, bool)
+            chosen[[0, 3, 5]] = True
+            expected = np.where(chosen, call(every).values.numpy(), call(shaped).values.numpy())
+            np.testing.assert_allclose(call(mixed).values.numpy(), expected, rtol=1e-6)
             return
         assert _summary(call(mixed)) == _summary(call(shaped))
 
@@ -573,3 +589,221 @@ def _face_id(topology, points):
         if frozenset(row) == points:
             return f
     return None
+
+
+# ── Phase 2: per-cell work, each group its own way ──────────────────
+
+CHOSEN = [0, 3, 5, 7, 10]
+
+
+def _three_ways(seed=0):
+    """A distorted mesh of hexahedra with a field ``f`` that is not linear, as
+    ``(shaped, mixed, every)``: the shaped mesh, the same with the cells
+    ``CHOSEN`` made polyhedra, and every cell a polyhedron (``as_polyhedra``).
+    Per cell, the mixed mesh's answer is the shaped mesh's on its shapes and the
+    all-polyhedra mesh's on its polyhedra."""
+    shaped = _hexes()
+    x = shaped.positions() + np.random.default_rng(seed).uniform(-0.2, 0.2,
+                                                                 (shaped.num_points, 3))
+    shaped = td.DataSet(shaped.topology, tack.array(x, tack.vec3(tack.f64)))
+    mixed = td.DataSet(_mixed(shaped.topology, CHOSEN), shaped.geometry.values)
+    every = td.as_polyhedra(shaped)
+    f = np.sin(x[:, 0]) * x[:, 1] + x[:, 2] ** 2
+    c = np.cos(np.arange(shaped.num_cells, dtype=np.float64))
+    for d in (shaped, mixed, every):
+        d.fields["f"] = td.Field(td.H1(d), tack.array(f))
+        d.fields["c"] = td.Field(td.Constant(d), tack.array(c))
+    return shaped, mixed, every
+
+
+def _per_cell(shaped, every, values):
+    """What a per-cell answer on the mixed mesh must be, from ``values(data)``."""
+    chosen = np.zeros(shaped.num_cells, bool)
+    chosen[CHOSEN] = True
+    a, b = values(shaped), values(every)
+    return np.where(chosen.reshape((-1,) + (1,) * (a.ndim - 1)), b, a)
+
+
+@pytest.mark.parametrize("what", [
+    "gradients", "gradients of cell data", "cell_centers", "values_at_centers",
+    "values_at_centers of cell data", "integral means", "node means", "cell_quality"])
+def test_per_cell_answers_are_each_groups_own(what):
+    shaped, mixed, every = _three_ways()
+    values = {
+        "gradients": lambda d: td.gradients(d, "f").values.numpy(),
+        "gradients of cell data": lambda d: td.gradients(d, "c").values.numpy(),
+        "cell_centers": lambda d: td.cell_centers(d).values.numpy(),
+        "values_at_centers": lambda d: td.values_at_centers(d, "f").values.numpy(),
+        "values_at_centers of cell data": lambda d: td.values_at_centers(d, "c").values.numpy(),
+        "integral means": lambda d: td.project(d, "f", td.Constant(d)).values.numpy(),
+        "node means": lambda d: td.project(d, "f", td.Constant(d),
+                                           average="nodes").values.numpy(),
+        "cell_quality": lambda d: np.stack([v.values.numpy()
+                                            for v in td.cell_quality(d).values()], 1),
+    }[what]
+    np.testing.assert_allclose(values(mixed), _per_cell(shaped, every, values), rtol=1e-12,
+                               atol=1e-12)
+
+
+def test_integrals_sum_each_groups_own():
+    shaped, mixed, every = _three_ways()
+    # Each cell's integral: the shapes' by quadrature, the polyhedra's on their
+    # sub-tetrahedra; a cell field's its value times the cell's measure.
+    measure = lambda d: td.cell_geometry(d).measure.values.numpy()
+    means = lambda d: td.project(d, "f", td.Constant(d)).values.numpy()
+    expected = (_per_cell(shaped, every, means) * _per_cell(shaped, every, measure)).sum()
+    got = td.integrate(mixed, ["f", "c"])
+    assert got.measure == pytest.approx(_per_cell(shaped, every, measure).sum(), rel=1e-12)
+    assert got.values["f"] == pytest.approx(expected, rel=1e-12)
+    c = mixed.fields["c"].values.numpy()
+    assert got.values["c"] == pytest.approx((c * measure(mixed)).sum(), rel=1e-12)
+
+
+def test_point_links_are_the_shaped_meshs_by_cell():
+    shaped, mixed, _ = _three_ways()
+    by_cell = {}
+    for data in (shaped, mixed):
+        t = data.topology
+        start_of, total = td.topology.corner_layout(t)
+        owner = np.empty(total, np.int64)
+        offsets, entries = (a.numpy() for a in t.point_links())
+        # Each entry's cell, from the layout: a shape group's cells NUM_POINTS
+        # apart, the polyhedra by their corners' offsets.
+        for group in t.groups():
+            if not group.count:
+                continue
+            cells = _group_cells(t, group)
+            if group.shape.REFERENCE:
+                k = group.shape.NUM_POINTS
+                owner[start_of[group]:start_of[group] + k * group.count] = np.repeat(cells, k)
+            else:
+                corners = td.topology.polyhedral_corners(t)[0].numpy()
+                owner[start_of[group] + corners[0]:start_of[group] + corners[-1]] = \
+                    np.repeat(cells, np.diff(corners))
+        by_cell[data is mixed] = [sorted(owner[entries[offsets[p]:offsets[p + 1]]])
+                                  for p in range(data.num_points)]
+    assert by_cell[True] == by_cell[False]
+
+
+def _group_cells(topology, group):
+    """A group's cells' global ids, by their position in it."""
+    found = tack.empty((group.count,), tack.i64)
+    _cell_ids_of(group.view(), found)
+    return found.numpy()
+
+
+@tack.kernel
+def _cell_ids_of(cells, out):
+    for c in cells:
+        out[cells.index(c)] = cells.entity_id(c)
+
+
+def test_point_values_from_cells_are_the_shaped_meshs():
+    shaped, mixed, every = _three_ways()
+    for data in (mixed, every):
+        np.testing.assert_allclose(td.project(data, "c", td.H1(data)).values.numpy(),
+                                   td.project(shaped, "c", td.H1(shaped)).values.numpy(),
+                                   rtol=1e-12)
+
+
+def test_point_gradients_average_each_groups_own():
+    shaped, mixed, every = _three_ways()
+    # A linear field's gradient is exact on every cell, so at every point.
+    x = mixed.positions()
+    mixed.fields["l"] = td.Field(td.H1(mixed), tack.array(x @ [2.0, -1.0, 0.5]))
+    np.testing.assert_allclose(td.gradients(mixed, "l", at="points").values.numpy(),
+                               np.tile([2.0, -1.0, 0.5], (mixed.num_points, 1)), atol=1e-12)
+    # A point among shapes alone has the shaped mesh's, among polyhedra alone the
+    # all-polyhedra mesh's.
+    kinds = {}
+    for c, row in enumerate(shaped.topology.connectivity.numpy().reshape(-1, 8)):
+        for p in row:
+            kinds.setdefault(int(p), set()).add(c in CHOSEN)
+    got, a, b = (td.gradients(d, "f", at="points").values.numpy()
+                 for d in (mixed, shaped, every))
+    shapes_only = [p for p, k in kinds.items() if k == {False}]
+    polyhedra_only = [p for p, k in kinds.items() if k == {True}]
+    assert shapes_only and polyhedra_only
+    np.testing.assert_allclose(got[shapes_only], a[shapes_only], rtol=1e-12)
+    np.testing.assert_allclose(got[polyhedra_only], b[polyhedra_only], rtol=1e-12)
+
+
+def test_traces_are_the_shaped_meshs_face_by_face():
+    shaped, mixed, _ = _three_ways()
+
+    def by_points(data, field):
+        values = td.project(data, field, td.SideTraces(data)).values.numpy().reshape(-1, 2, 4)
+        rows, sides = data.topology.faces().rows.numpy(), data.topology.faces().sides.numpy()
+        out = {}
+        for f, row in enumerate(rows):
+            for s in (0, 1):
+                if sides[f, 2 * s] >= 0:
+                    n = int((row >= 0).sum())
+                    out[frozenset(row[:n].tolist()), int(sides[f, 2 * s])] = \
+                        dict(zip(row[:n].tolist(), values[f, s, :n]))
+        return out
+
+    for field in ("f", "c"):
+        mine, theirs = by_points(mixed, field), by_points(shaped, field)
+        assert mine.keys() == theirs.keys()
+        for k in mine:
+            assert mine[k].keys() == theirs[k].keys()
+            np.testing.assert_allclose(list(mine[k].values()),
+                                       [theirs[k][p] for p in mine[k]], rtol=1e-12)
+    for name in ("f", "c"):
+        np.testing.assert_allclose(np.sort(td.jump(mixed, name).values.numpy()),
+                                   np.sort(td.jump(shaped, name).values.numpy()), atol=1e-12)
+    flux = lambda d: td.divergence(d, td.upwind_flux(d, "f", (1.0, 0.5, -0.25))).values.numpy()
+    np.testing.assert_allclose(flux(mixed), flux(shaped), rtol=1e-12)
+
+
+def test_traces_refuse_polygon_faces():
+    data = _pentagonal_prisms()
+    x = data.positions()
+    data.fields["u"] = td.Field(td.H1(data), tack.array(x[:, 0].copy()))
+    with pytest.raises(NotImplementedError, match="more than four points"):
+        td.project(data, "u", td.SideTraces(data))
+
+
+def test_point_data_crosses_polygon_faces_without_traces():
+    # Point data beside polyhedra is continuous: no jump, and the upwind value at
+    # a face's center its points' mean, on pentagons as on quads.
+    data = _pentagonal_prisms()
+    x = data.positions()
+    u = np.sin(x[:, 0]) + x[:, 1] * x[:, 2]
+    data.fields["u"] = td.Field(td.H1(data), tack.array(u))
+    faces = data.topology.faces()
+    assert not td.jump(data, "u").values.numpy().any()
+    v = np.array([1.0, 0.5, -0.25])
+    normals, areas = (f.values.numpy() for f in td.face_geometry(data))
+    means = np.array([u[sorted(_face_points(data.topology, f))].mean()
+                      for f in range(faces.num_faces)])
+    np.testing.assert_allclose(td.upwind_flux(data, "u", tuple(v)).values.numpy(),
+                               normals @ v * areas * means, rtol=1e-12, atol=1e-14)
+
+
+def _face_points(topology, f):
+    """Face ``f``'s point ids, from its row or, for a polygon, its stored walk."""
+    faces = topology.faces()
+    if faces.kinds.numpy()[f] == int(shapes.POLYGON):
+        fo, fp = topology.face_offsets.numpy(), topology.face_points.numpy()
+        return fp[fo[f]:fo[f + 1]].tolist()
+    return [int(p) for p in faces.rows.numpy()[f] if p >= 0]
+
+
+def test_a_mixed_mesh_refuses_spaces_that_need_reference_elements():
+    _, mixed, _ = _three_ways()
+    for space in (td.H1(mixed, order=2), td.L2(mixed)):
+        with pytest.raises(NotImplementedError, match="needs a reference element"):
+            td.project(mixed, "f", space)
+
+
+def test_hidden_points_hide_the_polyhedra_around_them():
+    from tack.dataset.ghosts import hidden_by_points
+
+    _, mixed, _ = _three_ways()
+    marks = np.zeros(mixed.num_points, np.uint8)
+    marks[0] = td.Ghosts.HIDDENPOINT          # a corner of cell 0, a polyhedron, alone
+    ghosts = hidden_by_points(mixed.topology, td.Ghosts(points=tack.array(marks)))
+    hidden = (ghosts.cells.numpy() & td.Ghosts.HIDDENCELL) != 0
+    assert hidden.tolist() == [c == 0 for c in range(mixed.num_cells)]

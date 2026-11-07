@@ -15,7 +15,6 @@ from tack.dataset import shapes
 from tack.dataset.algorithms._common import _table
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import Values
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import get_backend, on_inputs_device
 
 __all__ = ['cell_quality']
@@ -570,7 +569,6 @@ def cell_quality(data, measures=None):
     and hexahedra, and the edge ratio of triangles, quads, tetrahedra and wedges.
     VTK's wedge condition number and hexahedron edge ratio differ (see the
     tests)."""
-    _refuse_mixed(data, "cell_quality")
     names = list(MEASURES if measures is None else
                  [measures] if isinstance(measures, str) else measures)
     unknown = [m for m in names if m not in MEASURES]

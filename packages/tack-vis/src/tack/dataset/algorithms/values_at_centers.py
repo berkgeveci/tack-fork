@@ -9,7 +9,6 @@ from tack.dataset.algorithms._common import _field, _with_basis
 from tack.dataset.carry import _like
 from tack.dataset.dataset import Field, for_each
 from tack.dataset.spaces import H1, Constant, Values
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['values_at_centers']
@@ -30,20 +29,37 @@ def values_at_centers(data, field):
     takes its value there, the mean of the cell's distinct points' values: the
     value of the cell's interpolant, linear on tetrahedra fanned from that
     point. Cell data (``Constant``) is its own value."""
-    _refuse_mixed(data, "values_at_centers")
     field = _with_basis(data, _field(data, field))
     out = _like(field.values, data.num_cells)
     if getattr(data.topology, "reference_cells", True):
         for_each(_at_centers, data, "cells", field, out)
-    elif isinstance(field.space, H1) and field.space.order == 1:
-        from tack.dataset.algorithms.project import _distinct_point_means
-
-        for_each(_distinct_point_means, data, "cells", materialize(field.values), out,
-                 float("nan"))
-    elif isinstance(field.space, Constant):
-        tack.copyto(out, materialize(field.values))
-    else:
+        return Field(Values(data, "cells"), out, field.unit)
+    if not ((isinstance(field.space, H1) and field.space.order == 1)
+            or isinstance(field.space, Constant)):
         raise NotImplementedError(f"values_at_centers of {field.space!r} on polyhedra, "
                                   "polygons or polylines: only point data (H1, order 1) and "
                                   "cell data (Constant) have values there")
+    from tack.dataset.algorithms.project import _distinct_point_means
+
+    values = materialize(field.values)
+    if isinstance(field.space, Constant) and not data.topology.has_polyhedra:
+        tack.copyto(out, values)
+    for group in data.launch_groups("cells", [field]):
+        if not group.count:
+            continue
+        view = data.domain_view("cells", group)
+        if group.shape.REFERENCE:
+            # Polyhedra beside the shapes: each shape group through its basis.
+            _at_centers(view, field.view(group), out)
+        elif isinstance(field.space, H1):
+            _distinct_point_means(view, values, out, float("nan"))
+        elif data.topology.has_polyhedra:
+            _own_values(view, values, out)
     return Field(Values(data, "cells"), out, field.unit)
+
+
+@tack.kernel
+def _own_values(cells, values, out):
+    for c in cells:
+        e = cells.entity_id(c)
+        out[e] = values[e]

@@ -9,7 +9,11 @@ import tack
 from tack.arrays import CartesianProduct, CountingArray, UniformCoordinates, dtype_of, materialize
 from tack.dataset import bases, ids, shapes
 from tack.dataset.algorithms._common import _field, _with_basis
-from tack.dataset.algorithms._links import _average_cell_values, _average_links
+from tack.dataset.algorithms._links import (
+    _average_cell_values,
+    _average_links,
+    _cell_values_at_corners,
+)
 from tack.dataset.algorithms.integrate import (
     _element,
     _no_reference_values,
@@ -20,9 +24,9 @@ from tack.dataset.algorithms.integrate import (
 from tack.dataset.algorithms.traces import traces
 from tack.dataset.buckets import bucket_order
 from tack.dataset.carry import _like, _take
-from tack.dataset.dataset import Field, for_each
+from tack.dataset.dataset import Field
 from tack.dataset.spaces import H1, L2, Constant, SideTraces, Values, reference_cells
-from tack.dataset.topology import UnstructuredTopology, _refuse_mixed, corner_layout
+from tack.dataset.topology import UnstructuredTopology, corner_layout, polyhedral_corners
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['project']
@@ -181,10 +185,17 @@ def _polyhedral_means(data, field, average):
 
     values = materialize(field.values)
     out = _like(values, data.num_cells)
-    for_each(_distinct_point_means, data, "cells", values, out, float("nan"))
+    groups = data.launch_groups("cells", [field])
+    for group in groups:
+        if group.count and not group.shape.REFERENCE:
+            _distinct_point_means(data.domain_view("cells", group), values, out,
+                                  float("nan"))
     if average == "integral" and data.num_cells:
         measures = materialize(cell_geometry(data).measure.values)
         _divided(_no_reference_values(data, field), measures, out, data.num_cells)
+    # The shapes beside polyhedra, after: `_divided` wrote their cells too.
+    _onto_cells(data, field, [g for g in groups if g.shape.REFERENCE],
+                CountingArray(data.num_cells, dtype=data.id_dtype), out, average)
     return out
 
 
@@ -247,7 +258,8 @@ def _onto_points(data, field, values):
     corner values -- summed in a fixed order through the point links."""
     topology = data.topology
     groups = topology.groups() if isinstance(topology, UnstructuredTopology) else ()
-    if len(groups) == 1 and isinstance(field.space, Constant) and groups[0].count:
+    if (len(groups) == 1 and isinstance(field.space, Constant) and groups[0].count
+            and groups[0].shape.REFERENCE):
         # A value a cell, cells of one shape, indexed by an integer: each
         # corner's contribution is its cell's value, read through the links,
         # without a contribution a corner (8 values a hexahedron: 640 MB at
@@ -257,7 +269,7 @@ def _onto_points(data, field, values):
         link_offsets, entries = topology.point_links()
         _average_cell_values(link_offsets, entries, groups[0].view(), values, out)
         return out
-    if not getattr(topology, "reference_cells", True):
+    if not getattr(topology, "reference_cells", True) and not topology.has_polyhedra:
         offsets, point_ids = topology.cell_points()
         total = int(point_ids.shape[0])
         contributions = _like(values, total)
@@ -268,9 +280,16 @@ def _onto_points(data, field, values):
         start_of, total = corner_layout(topology)
         contributions = _like(values, total)
         for group in data.launch_groups("cells", [field]):
-            if group.count:
+            if not group.count:
+                continue
+            if group.shape.REFERENCE:
                 _corner_contributions(data.domain_view("cells", group), field.view(group),
                                       start_of[group.root], contributions)
+            else:
+                # The polyhedra beside the shapes, of cell values: each its own.
+                _cell_values_at_corners(group.view(), materialize(field.values),
+                                       start_of[group.root],
+                                       polyhedral_corners(topology)[0], contributions)
     out = _like(values, data.num_points)
     _start(data, field, out)
     if total:
@@ -359,7 +378,6 @@ def project(data, field, space, *, average="integral"):
     points). The values must be floating point, scalars or vectors, except from
     order-1 ``H1`` into order-1 ``L2``, which copies them and takes integers too.
     """
-    _refuse_mixed(data, "project")
     if average not in _AVERAGES:
         raise ValueError(f"average is one of {', '.join(map(repr, _AVERAGES))}, "
                          f"not {average!r}")

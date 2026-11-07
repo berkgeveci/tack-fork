@@ -17,7 +17,6 @@ from tack.dataset.algorithms._common import _field, _with_basis
 from tack.dataset.algorithms.cell_geometry import _signed_twice_area
 from tack.dataset.dataset import Field, is_field_key
 from tack.dataset.spaces import H1, L2, Constant, Values
-from tack.dataset.topology import _refuse_mixed
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['Integrals', 'integrate']
@@ -305,7 +304,7 @@ def _no_reference_values(data, field):
     dtype = arrays.dtype_of(values)
     out = tack.zeros((data.num_cells,), tack.vec(width, dtype) if width else dtype)
     for group in data.launch_groups("cells", []):
-        if not group.count:
+        if not group.count or group.shape.REFERENCE:        # shapes beside polyhedra
             continue
         cells = data.domain_view("cells", group)
         if group.shape.DIMENSION == 3:
@@ -314,6 +313,42 @@ def _no_reference_values(data, field):
             _polygon_integrals(cells, values, out)
         elif group.shape is shapes.PolyLine:
             _polyline_integrals(cells, values, out)
+    return out
+
+
+@tack.kernel
+def _times_measures(cells, values, measures, out):
+    for c in cells:
+        e = cells.entity_id(c)
+        out[e] = values[e] * measures[e]
+
+
+def _mixed_cell_values(data, field, measures):
+    """Each cell's integral of ``field`` on a topology with polyhedra beside its
+    shapes: a shape's by quadrature, a polyhedron's exactly on its sub-tetrahedra
+    (point data) or as its value times its measure (cell data, ``measures``)."""
+    field = _with_basis(data, field)
+    space = field.space
+    if not (_on_points(space) or isinstance(space, Constant)):
+        raise NotImplementedError(
+            f"integrating {space!r} needs a reference element (polyhedra integrate cell "
+            "data and point data)")
+    width = arrays.width_of(field.values)
+    dtype = arrays.dtype_of(field.values)
+    out = tack.zeros((data.num_cells,), tack.vec(width, dtype) if width else dtype)
+    values = arrays.materialize(field.values)
+    n = _points_per_axis(data, _order(space))
+    for group in data.launch_groups("cells", [field]):
+        if not group.count:
+            continue
+        cells = data.domain_view("cells", group)
+        if group.shape.REFERENCE:
+            _cell_integrals(cells, field.view(group),
+                            *_tables(data, group.shape, _per_axis(group.shape, n)), out)
+        elif isinstance(space, Constant):
+            _times_measures(cells, values, measures, out)
+        else:
+            _polyhedron_integrals(cells, values, out)
     return out
 
 
@@ -335,6 +370,12 @@ def _piece(data, names):
         field_units[name] = field.unit
         if not getattr(data.topology, "reference_cells", True):
             field = field.space.stored(field, data)
+        if data.topology.has_polyhedra:
+            # Polyhedra beside the shapes: each group its own way, cell by cell.
+            per_cell = _top_cells(data, _mixed_cell_values(data, field, measures.values))
+            values[name] = np.asarray(owned_values(data, Field(Values(data, "cells"), per_cell))
+                                      .numpy(), np.float64).sum(axis=0)
+            continue
         if not getattr(data.topology, "reference_cells", True):
             space = _with_basis(data, field).space
             if _on_points(space):
@@ -383,7 +424,6 @@ def integrate(data, fields=None):
     integrals leave out its surfaces, lines and vertices. Only owned cells count
     (ghost marks), and a ``PartitionedDataSet`` sums its pieces over every rank, in
     the pieces' order."""
-    _refuse_mixed(data, "integrate")
     from tack.dataset.algorithms._common import _measure_unit
     from tack.dataset.partitioned import PartitionedDataSet
 

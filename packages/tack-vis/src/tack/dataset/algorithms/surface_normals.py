@@ -13,7 +13,7 @@ from tack.dataset.algorithms._links import _average_links
 from tack.dataset.carry import Same, _take, carry
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import Values
-from tack.dataset.topology import UnstructuredTopology, _refuse_mixed, corner_layout
+from tack.dataset.topology import UnstructuredTopology, corner_layout
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['surface_normals']
@@ -217,7 +217,6 @@ def surface_normals(data, consistent=True, weights=None):
     and vertices among the polygons are kept as they are, with a zero normal
     that adds nothing at their points. The result keeps every field; the
     normals are dimensionless."""
-    _refuse_mixed(data, "surface_normals")
     from tack.dataset.ghosts import visible
 
     if weights not in (None, "area"):

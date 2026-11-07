@@ -527,6 +527,20 @@ def carry_marks(source, out, points=None, cells=None, faces_to_cells=None,
 # ── Hidden cells ────────────────────────────────────────────────────
 
 @tack.kernel
+def _hide_by_cell_points(cells, point_marks, cell_marks):
+    # As `_hide_by_points`, over cells of any number of points (a mixed
+    # topology's polyhedra).
+    for c in cells:
+        hidden = 0
+        for j in range(cells.num_points(c)):
+            if (point_marks[cells.point_id(c, j)] & 2) != 0:
+                hidden = 1
+        if hidden == 1:
+            e = cells.entity_id(c)
+            cell_marks[e] = cell_marks[e] | 32
+
+
+@tack.kernel
 def _hide_by_points(cells, point_marks, cell_marks):
     # HIDDENCELL on each cell with a HIDDENPOINT corner.
     for c in cells:
@@ -559,14 +573,15 @@ def hidden_by_points(topology, ghosts):
         tack.copyto(marks, ghosts.cells)
     else:
         marks.fill(0)
-    if not getattr(topology, "reference_cells", True):
+    if not getattr(topology, "reference_cells", True) and not topology.has_polyhedra:
         offsets, members = _rows(topology)
         if topology.num_cells:
             _hide_rows_by_points(offsets, members, ghosts.points, marks)
     else:
         for group in topology.groups():
             if group.count:
-                _hide_by_points(group.view(), ghosts.points, marks)
+                hide = _hide_by_points if group.shape.REFERENCE else _hide_by_cell_points
+                hide(group.view(), ghosts.points, marks)
     return Ghosts(cells=marks, points=ghosts.points)
 
 

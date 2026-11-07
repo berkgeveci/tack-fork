@@ -96,7 +96,7 @@ def threshold(data, field, lower, upper, all_points=True, fields=None, subdivisi
 def _threshold_flags(data, field, lower, upper, all_points):
     """Each cell's 1 or 0: whether ``threshold`` keeps it."""
     field = _field(data, field)
-    if not getattr(data.topology, "reference_cells", True):
+    if not getattr(data.topology, "reference_cells", True) and not data.topology.has_polyhedra:
         return _polyhedral_flags(data, field, lower, upper, all_points)
     keep = tack.empty((data.num_cells,), tack.i32)
     values = None

@@ -17,7 +17,7 @@ from tack.dataset.buckets import key_order, run_offsets
 from tack.dataset.carry import Same, _point_values, carry
 from tack.dataset.dataset import Field
 from tack.dataset.spaces import H1, Values
-from tack.dataset.topology import UnstructuredTopology, _refuse_mixed, uniform_cells
+from tack.dataset.topology import UnstructuredTopology, uniform_cells
 from tack.runtime.dispatch import on_inputs_device
 
 __all__ = ['EdgeKind', 'feature_edges']
@@ -123,7 +123,6 @@ def feature_edges(data, angle=30.0, boundary=True, feature=True, non_manifold=Tr
     points (``fields`` chooses which, as ``extract_edges``); cell fields are
     left behind, an edge belonging to every cell around it. Hidden cells are
     left out. The geometry must be ``H1``."""
-    _refuse_mixed(data, "feature_edges")
     from tack.dataset.ghosts import visible
     from tack.dataset.polyhedra import PolygonalTopology
 
