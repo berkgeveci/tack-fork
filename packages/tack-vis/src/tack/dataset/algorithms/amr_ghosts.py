@@ -27,7 +27,7 @@ from tack import communication as tc
 from tack.algorithms import exclusive_scan
 from tack.arrays import CartesianProduct, UniformCoordinates
 from tack.dataset import _box_pairs, _matching, ids
-from tack.dataset.amr import AMRDataSet, _mark
+from tack.dataset.amr import AMRDataSet, _box_device, _mark
 from tack.dataset.carry import _point_values
 from tack.dataset.dataset import DataSet, Field, _split_key
 from tack.dataset.ghosts import Ghosts
@@ -251,45 +251,51 @@ class _Groups:
         """``levels``: the levels whose boxes are members (all by default); the groups
         are the devices of every box, so every rank makes the same blocks."""
         d = amr.dimension
-        # Each box's device, looked up once: ``DataSet.device`` searches the dataset's
-        # parts on every call (27 us; 3.6 s of average_down's per-box calls).
-        every = [box.device for _, box in amr]
-        devices = []
-        for device in every:
-            if device not in devices:
-                devices.append(device)
-        self.local, self.pieces, self.devices, of_box = [], [], [], []
-        n = 0
+        # In bulk: each box's device from its marks (`_box_device`; ``DataSet.device``
+        # searches every part), sizes by level in NumPy, members by index arrays.
+        # Box by box this was 0.12 s of AMR-Wind's 15,598 boxes.
+        devices, of_box, levels_of, ks, lengths = [], [], [], [], {"cells": [], "points": []}
+        self.local, self.pieces, self.devices = [], [], []
         for level, pieces in enumerate(amr.levels):
+            if levels is not None and level not in levels:
+                for box in pieces:          # every box's device makes the groups
+                    device = _box_device(box)
+                    if device not in devices:
+                        devices.append(device)
+                continue
+            first = amr._first[level]
             for k, box in enumerate(pieces):
-                device, n = every[n], n + 1
-                if levels is not None and level not in levels:
-                    continue
-                self.local.append((level, amr._first[level] + k))
+                device = _box_device(box)
+                if device not in devices:
+                    devices.append(device)
+                self.local.append((level, first + k))
                 self.pieces.append(box)
                 self.devices.append(device)
-                of_box.append(devices.index(device))
+                of_box.append(devices.index(device) if len(devices) > 1 else 0)
+            ext = extents[level][first:first + len(pieces)]
+            span = ext[:, 1, :d] - ext[:, 0, :d]
+            lengths["cells"].append(np.prod(span, axis=1))
+            lengths["points"].append(np.prod(span + 1, axis=1))
+            levels_of.append(np.full(len(pieces), level, np.int64))
         self.blocks = tc.Blocks(devices, amr.world)
-        gids = list(self.blocks.local)
-        self.members = {g: [i for i, k in enumerate(of_box) if k == n] for n, g in enumerate(gids)}
-        sizes = {"cells": [], "points": []}
-        for level, k in self.local:
-            ext = extents[level][k]
-            sizes["cells"].append(int(np.prod(ext[1, :d] - ext[0, :d])))
-            sizes["points"].append(int(np.prod(ext[1, :d] - ext[0, :d] + 1)))
-        self._sizes = {kind: np.asarray(v, np.int64) for kind, v in sizes.items()}
-        base = {kind: np.zeros(len(self.local), np.int64) for kind in sizes}
+        gids = np.asarray(list(self.blocks.local), np.int64)
+        of_box = np.asarray(of_box, np.int64)
+        self._level = np.concatenate(levels_of) if levels_of else np.zeros(0, np.int64)
+        self.members = {int(g): np.flatnonzero(of_box == n).tolist()
+                        for n, g in enumerate(gids)}
+        self._sizes = {kind: (np.concatenate(v).astype(np.int64) if v else
+                              np.zeros(0, np.int64)) for kind, v in lengths.items()}
+        base = {kind: np.zeros(len(self.local), np.int64) for kind in lengths}
         for g, members in self.members.items():
-            for kind in sizes:
-                lengths = self._sizes[kind][members]
-                base[kind][members] = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+            for kind in lengths:
+                counts = self._sizes[kind][members]
+                base[kind][members] = np.concatenate([[0], np.cumsum(counts)[:-1]])
         # Per level, over every rank's boxes in the hierarchy's order: group and starts.
+        group_of = gids[of_box] if len(of_box) else np.zeros(0, np.int64)
         self.group, self.cell_base, self.point_base = [], [], []
         for level in range(amr.num_levels):
-            mine = [i for i, (lv, _) in enumerate(self.local) if lv == level]
-            row = np.stack([np.asarray([gids[of_box[i]] for i in mine], np.int64),
-                            base["cells"][mine], base["points"][mine]], axis=1) \
-                if mine else np.zeros((0, 3), np.int64)
+            mine = np.flatnonzero(self._level == level)
+            row = np.stack([group_of[mine], base["cells"][mine], base["points"][mine]], axis=1)
             every = np.concatenate(amr.world._allgather(row)).reshape(-1, 3)
             self.group.append(every[:, 0])
             self.cell_base.append(every[:, 1])
@@ -305,7 +311,8 @@ class _Groups:
     def boxes(self, g, level):
         """The group's boxes of ``level``: their places in the hierarchy's order of this
         rank's boxes, and their global indices in the level."""
-        places = [i for i in self.members[g] if self.local[i][0] == level]
+        members = np.asarray(self.members[g], np.int64)
+        places = members[self._level[members] == level].tolist()
         return places, np.asarray([self.local[i][1] for i in places], np.int64)
 
 

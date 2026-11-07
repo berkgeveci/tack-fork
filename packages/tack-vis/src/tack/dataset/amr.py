@@ -487,20 +487,25 @@ def _kept(given, counts, mask):
     return whole
 
 
-def _by_device(pieces):
-    """``[(device, [k, ...])]``: the indices of ``pieces`` on each device, in order.
-    A box's device is its marks' where it has them, as every box of a hierarchy
+def _box_device(piece):
+    """A box's device: its marks' where it has them, as every box of a hierarchy
     does, else its topology's (a box's parts are on one device, checked when it
-    was made): ``DataSet.device`` searches the dataset's parts, about 4 us a box."""
+    was made); ``DataSet.device`` searches the dataset's parts, about 4 us a box."""
     from tack.runtime.dispatch import as_device
 
+    ghosts = piece.ghosts
+    marks = None if ghosts is None else (ghosts.cells if ghosts.cells is not None
+                                         else ghosts.points)
+    backend = marks._backend if marks is not None else piece.topology._device
+    return as_device(backend) if backend is not None else piece.device
+
+
+def _by_device(pieces):
+    """``[(device, [k, ...])]``: the indices of ``pieces`` on each device
+    (`_box_device`), in order."""
     groups = []
     for k, piece in enumerate(pieces):
-        ghosts = piece.ghosts
-        marks = None if ghosts is None else (ghosts.cells if ghosts.cells is not None
-                                             else ghosts.points)
-        backend = marks._backend if marks is not None else piece.topology._device
-        device = as_device(backend) if backend is not None else piece.device
+        device = _box_device(piece)
         for d, ks in groups:
             if d == device:
                 ks.append(k)
