@@ -601,10 +601,17 @@ def _piece(data, names):
     data, *given = visible(data, *(field for _, field in names)) if names else (visible(data),)
     measures = Field(Values(data, "cells"), _top_cells(data, arrays.materialize(
         cell_geometry(data).measure.values)))
-    measure = float(np.sum(np.asarray(owned_values(data, measures).numpy(), np.float64)))
+    weights = _Weights(data, measures.values)
+    from tack.runtime.dispatch import get_backend
+
+    if get_backend().supports_f64:
+        # The owned cells' measures summed as the fields are, by chunks in f64 on the
+        # device, not copied to the host (21.5M of AhmedML's: 0.1 s of 0.17 on CUDA).
+        measure = float(_weighted_sum(measures.values, weights.mask()))
+    else:                                       # the host's f64 sum, not the device's f32
+        measure = float(np.sum(np.asarray(owned_values(data, measures).numpy(), np.float64)))
     values = {}
     field_units = {}
-    weights = _Weights(data, measures.values)
     for (name, _), field in zip(names, given):
         field = _field(data, field)
         field_units[name] = field.unit

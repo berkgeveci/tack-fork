@@ -29,3 +29,7 @@
   - Corner gradients of straight hexahedra take the Jacobian's inverse
     transpose from its columns' cross products: a scalar's point gradient
     0.35 s from 0.40.
+  - `integrate`'s measure is summed as its fields are, by chunks in f64 on the
+    device, rather than every owned cell's measure copied to the host: on CUDA
+    0.06 s from 0.17 for AhmedML (jura). A device without f64 sums it on the
+    host as before.
