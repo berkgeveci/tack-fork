@@ -132,6 +132,29 @@ def test_a_mixed_mesh_has_the_faces_of_the_shaped_one(chosen):
                 axis=0))
 
 
+_FACE_ARRAYS = ("rows", "kinds", "sides", "side_face", "side_slot", "side_orientation")
+
+
+def _same_faces(a, b):
+    assert a.num_faces == b.num_faces
+    assert a.group_starts == b.group_starts
+    for name in _FACE_ARRAYS:
+        np.testing.assert_array_equal(getattr(a, name).numpy(), getattr(b, name).numpy(),
+                                      err_msg=name)
+
+
+@pytest.mark.parametrize("chosen", [[0], [0, 3, 5], [1, 2, 4, 6], list(range(12))],
+                         ids=["one", "some", "others", "all"])
+def test_the_bucketed_mixed_faces_are_the_sorted_ones(chosen):
+    """_derive_mixed_bucketed gives _derive_mixed's faces, array for array: the
+    ids, rows, sides and every (cell, face)'s face, slot and orientation."""
+    from tack.dataset.topology import Faces
+    mixed = _mixed(_hexes().topology, chosen)
+    bucketed = Faces._derive_mixed_bucketed(mixed)
+    assert bucketed is not None
+    _same_faces(bucketed, Faces._derive_mixed(mixed))
+
+
 def test_a_mixed_meshs_polyhedral_faces_keep_their_ids():
     shaped = _hexes().topology
     mixed = _mixed(shaped, [0, 3, 5])
@@ -274,6 +297,14 @@ def _pentagonal_prisms():
         polyhedra=(face_offsets, np.concatenate(faces), np.array(cell_face_offsets),
                    np.array(cell_faces), np.array(sides, np.uint8)))
     return td.DataSet(topology, tack.array(np.array(pts, np.float64), tack.vec3(tack.f64)))
+
+
+def test_the_bucketed_mixed_faces_take_a_polygon_beside_a_hexahedron():
+    from tack.dataset.topology import Faces
+    topology = _pentagonal_prisms().topology
+    bucketed = Faces._derive_mixed_bucketed(topology)
+    assert bucketed is not None
+    _same_faces(bucketed, Faces._derive_mixed(topology))
 
 
 def test_pentagons_are_polygon_faces_and_a_hexahedron_shares_a_prisms_side():
@@ -1105,6 +1136,18 @@ def _out_of(data, field):
         sign = 1.0 if sides[f, 0] == min(cells) else -1.0
         out[points] = sign * values[f]
     return out
+
+
+@pytest.mark.parametrize("chosen", [[0], [1, 5, 6], list(range(12))], ids=["one", "some", "all"])
+def test_the_bucketed_mixed_faces_of_polygons_beside_quads(chosen):
+    """In 2D the faces are edges, a polygon's among them: the bucketed derivation
+    gives the sorted one's, array for array."""
+    from tack.dataset.topology import Faces
+    topology = _as_polygons_beside(_quads(), chosen).topology
+    assert topology.mixed
+    bucketed = Faces._derive_mixed_bucketed(topology)
+    assert bucketed is not None
+    _same_faces(bucketed, Faces._derive_mixed(topology))
 
 
 #: The calls of `test_dataset_devices.CALLS` that take a surface of polygons beside

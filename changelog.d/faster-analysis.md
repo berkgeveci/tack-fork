@@ -38,3 +38,9 @@
     answered without unyt: a program that gives no unit no longer imports
     unyt and sympy at its first such filter, half a second
     (`cell_quality`'s first call on AhmedML 0.58 s to 0.25).
+  - A mixed mesh's faces are matched by `_derive_bucketed`'s counting sort
+    of the records themselves (each (cell, face) and each polyhedral face a
+    shaped cell may share placed under its lowest point), not by a sort of
+    keys whose runs were read through the permutation: the same faces, array
+    for array. AhmedML's first `faces()` 1.19 s to 1.03, its memory
+    6.7 GB to 2.0; crowded buckets keep the sorted path.

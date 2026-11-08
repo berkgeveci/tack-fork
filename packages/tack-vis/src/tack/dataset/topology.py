@@ -1505,6 +1505,157 @@ def _wound_into_only_cell(face_sides, problems):
             tack.atomic_add(problems, 4, 1)
 
 
+def _polyhedral_sides_in(topology):
+    """A mixed topology's polyhedral faces' sides (``[cell0, local0, cell1,
+    local1]``, -1 where none) from its polyhedra's ``cell_faces``, checked."""
+    from tack.dataset.polyhedra import _count_sides, _scatter_sides, _side_problems
+
+    nfp = topology.num_polyhedral_faces
+    nc = topology.num_cells
+    counts = tack.zeros((2 * nfp,), tack.i32)
+    bad = tack.zeros((1,), tack.i32)
+    if nc:
+        _count_sides(topology.cell_face_offsets, topology.cell_faces,
+                     topology.cell_face_sides, counts, bad, nc, nfp)
+    if bad[0]:
+        raise ValueError(f"{bad[0]} cell -> face entries name no face, or a side other "
+                         "than 0 or 1")
+    problems = tack.zeros((3,), tack.i32)
+    if nfp:
+        _side_problems(counts, problems, nfp)
+    if problems[0]:
+        raise ValueError(f"{problems[0]} faces are on the same side of two polyhedra: "
+                         "more than two cells share a face, or two claim the same side "
+                         "of it")
+    del counts
+    sides_in = tack.empty((nfp,), tack.vec(4, topology.id_dtype))
+    if nfp:
+        sides_in.fill(-1)
+        _scatter_sides(topology.cell_face_offsets, topology.cell_faces,
+                       topology.cell_face_sides, sides_in, nc)
+    return sides_in
+
+
+# ── Mixed faces by buckets of records ───────────────────────────────
+# _derive_mixed's faces by _derive_bucketed's counting sort: the shaped cells'
+# (cell, face) records and the polyhedral faces a shaped cell may share placed
+# under their lowest point, each bucket sorted by key and entry, and the runs
+# read along the records rather than through a permutation.
+
+#: A shaped entry's side_slot while it waits for the free side of the polyhedral
+#: face it matched (_side_of_polyhedral_face).
+_MATCHED = tack.constant(2)
+
+
+@tack.kernel
+def _candidate_bucket_counts(rows, counts):
+    # The candidate polyhedral faces' buckets, by lowest point.
+    for j in range(rows.shape[0]):
+        key = _key_of(rows[j])
+        tack.atomic_add(counts, key[0], 1)
+
+
+@tack.kernel
+def _place_candidates(rows, at, starts, fill, records):
+    # Each candidate's record, its entry after the shaped cells' (from ``at``).
+    for j in range(rows.shape[0]):
+        key = _key_of(rows[j])
+        slot = starts[key[0]] + tack.atomic_add(fill, key[0], 1)
+        records[slot] = [key[1], key[2], key[3], at + j]
+
+
+@tack.func
+def _run_end(records, i, end):
+    # The end of the run of equal keys that starts at i.
+    j = i + 1
+    while j < end and _same_key(records[j], records[i]) == 1:
+        j += 1
+    return j
+
+
+@tack.kernel
+def _mixed_bucket_counts(starts, records, shaped, counts, problems, nbuckets):
+    # Each bucket's fresh faces (runs of shaped entries only), as _classify_runs
+    # finds them; problems: [0] more than two cells, [1] two polyhedral faces of
+    # the same points.
+    for b in range(nbuckets):
+        fresh = 0
+        end = starts[b + 1]
+        i = starts[b]
+        while i < end:
+            j = _run_end(records, i, end)
+            polyhedral = 0
+            for k in range(i, j):
+                if records[k][3] >= shaped:
+                    polyhedral += 1
+            if polyhedral == 0:
+                fresh += 1
+            if polyhedral > 1:
+                tack.atomic_add(problems, 1, 1)
+            elif j - i > 2:
+                tack.atomic_add(problems, 0, 1)
+            i = j
+        counts[b] = fresh
+
+
+@tack.kernel
+def _assign_mixed_faces(starts, records, shaped, first, polyhedral, candidates, side_face,
+                        side_slot, nbuckets):
+    # A fresh run's entries take its face, numbered after the polyhedral faces in
+    # key order, and their slots (the first, lowest entry is side 0); a run with
+    # a polyhedral face marks its shaped entry to take that face's free side.
+    for b in range(nbuckets):
+        face = polyhedral + first[b]
+        end = starts[b + 1]
+        i = starts[b]
+        while i < end:
+            j = _run_end(records, i, end)
+            matched = -1
+            for k in range(i, j):
+                if records[k][3] >= shaped:
+                    matched = candidates[records[k][3] - shaped]
+            if matched < 0:
+                for k in range(i, min(j, i + 2)):
+                    e = records[k][3]
+                    side_face[e] = face
+                    side_slot[e] = k - i
+                face += 1
+            else:
+                for k in range(i, j):
+                    e = records[k][3]
+                    if e < shaped:
+                        side_face[e] = matched
+                        side_slot[e] = _MATCHED
+            i = j
+
+
+@tack.kernel
+def _side_of_polyhedral_face(cells, start, side_face, side_slot, face_rows, face_sides,
+                             orientation, problems):
+    # A shaped cell beside a polyhedral face takes its free side: side 0 walking
+    # it as stored, side 1 the other way. problems: [2] a cell face that goes
+    # round its face's points neither way, [3] one walking it the way of the side
+    # it cannot take.
+    for c in cells:
+        first = start + cells.index(c) * cells.NUM_FACES
+        for f in range(cells.NUM_FACES):
+            e = first + f
+            if side_slot[e] == _MATCHED:
+                face = side_face[e]
+                slot = 0 if face_sides[face][0] < 0 else 1
+                face_sides[face][2 * slot] = cells.entity_id(c)
+                face_sides[face][2 * slot + 1] = f
+                side_slot[e] = slot
+                o = _orientation(_face_row(cells, c, f), face_rows[face])
+                if o < 0:
+                    orientation[e] = 0
+                    tack.atomic_add(problems, 2, 1)
+                else:
+                    orientation[e] = o
+                    if o % 2 != slot:
+                        tack.atomic_add(problems, 3, 1)
+
+
 class Faces(_OnItsArrays):
     """The faces of a topology's cells of the highest dimension, as global entities:
     a 3D mesh's polygons, a 2D mesh's edges.
@@ -1526,7 +1677,8 @@ class Faces(_OnItsArrays):
         if isinstance(topology, StructuredTopology) and topology.dimension >= 2:
             return cls._derive_structured(topology)
         if topology.mixed:
-            return cls._derive_mixed(topology)
+            derived = cls._derive_mixed_bucketed(topology)
+            return derived if derived is not None else cls._derive_mixed(topology)
         derived = cls._derive_bucketed(topology)
         return derived if derived is not None else cls._derive_sorted(topology)
 
@@ -1545,8 +1697,6 @@ class Faces(_OnItsArrays):
         polyhedron's are its ``cell_faces`` and ``cell_face_sides``. A polyhedral
         face of more than four points has kind ``POLYGON`` and no row: its points
         are the topology's ``face_points``."""
-        from tack.dataset.polyhedra import _count_sides, _scatter_sides, _side_problems
-
         self = cls()
         top = topology.dimension
         cell_groups = [g for g in topology.groups()
@@ -1558,30 +1708,7 @@ class Faces(_OnItsArrays):
         self.id_dtype = idt = topology.id_dtype
         self.topology = topology
         nfp = topology.num_polyhedral_faces
-        nc = topology.num_cells
-
-        # The polyhedra's sides, by their stored faces.
-        counts = tack.zeros((2 * nfp,), tack.i32)
-        bad = tack.zeros((1,), tack.i32)
-        if nc:
-            _count_sides(topology.cell_face_offsets, topology.cell_faces,
-                         topology.cell_face_sides, counts, bad, nc, nfp)
-        if bad[0]:
-            raise ValueError(f"{bad[0]} cell -> face entries name no face, or a side other "
-                             "than 0 or 1")
-        problems = tack.zeros((3,), tack.i32)
-        if nfp:
-            _side_problems(counts, problems, nfp)
-        if problems[0]:
-            raise ValueError(f"{problems[0]} faces are on the same side of two polyhedra: "
-                             "more than two cells share a face, or two claim the same side "
-                             "of it")
-        del counts
-        sides_in = tack.empty((nfp,), tack.vec(4, idt))
-        if nfp:
-            sides_in.fill(-1)
-            _scatter_sides(topology.cell_face_offsets, topology.cell_faces,
-                           topology.cell_face_sides, sides_in, nc)
+        sides_in = _polyhedral_sides_in(topology)
 
         # The entries to match: every shaped cell's faces, then the polyhedral faces
         # a shaped cell may share (three or four points, one side).
@@ -1642,6 +1769,125 @@ class Faces(_OnItsArrays):
         if problems[2]:
             raise ValueError(f"{problems[2]} cell faces do not go round their face's points "
                              "in either direction")
+        if problems[3]:
+            raise ValueError(f"{problems[3]} faces a polyhedron shares with a shaped cell are "
+                             "wound the same way by both: a shape's faces wind out of it, so "
+                             "the polyhedron's face must wind into the shape")
+        if problems[4]:
+            raise ValueError(f"{problems[4]} faces are wound into their only cell (side 1 "
+                             "with no side 0); tack.dataset.polyhedra.orient turns them "
+                             "around")
+        self._groups = None
+        self._boundary = None
+        return self
+
+    @classmethod
+    def _derive_mixed_bucketed(cls, topology):
+        """``_derive_mixed``'s faces -- the same ids, rows, sides and orientations --
+        by ``_derive_bucketed``'s counting sort of the records themselves: the
+        shaped cells' (cell, face) records and the polyhedral faces a shaped cell
+        may share, each under its lowest point, each bucket sorted by key and
+        entry. ``None`` where the buckets are crowded (``_derive_mixed`` takes
+        those). On AhmedML (21.5M cells, 65.7M faces) its matching read each
+        entry's row and owner through the sort's permutation, the derivation's
+        largest kernel."""
+        top = topology.dimension
+        cell_groups = [g for g in topology.groups()
+                       if g.shape.NUM_FACES and g.shape.DIMENSION == top]
+        starts = np.concatenate([[0], np.cumsum([g.count * g.shape.NUM_FACES
+                                                 for g in cell_groups])]).astype(int)
+        shaped = int(starts[-1])
+        idt = topology.id_dtype
+        np_ = topology.num_points
+        nfp = topology.num_polyhedral_faces
+        sides_in = _polyhedral_sides_in(topology)
+
+        # The polyhedral faces a shaped cell may share: three or four points, one side.
+        flags = tack.empty((nfp,), tack.i32)
+        slots = tack.empty((nfp,), idt)
+        if nfp:
+            _polyhedral_candidates(topology.face_offsets, sides_in, flags)
+        m = exclusive_scan(flags, slots, nfp) if nfp else 0
+        total = shaped + m
+        if not total:
+            return None
+        crows = tack.empty((max(m, 1),), tack.vec(4, idt))
+        ckinds = tack.empty((max(m, 1),), tack.i32)
+        candidates = tack.empty((max(m, 1),), idt)
+        if m:
+            _candidate_rows(flags, slots, topology.face_offsets, topology.face_points, 0,
+                            crows, ckinds, candidates)
+        del flags, slots, ckinds
+
+        counts = tack.zeros((np_,), tack.i32)
+        for group in cell_groups:
+            if group.count:
+                _face_bucket_counts(group.view(), counts)
+        if m:
+            _candidate_bucket_counts(crows, counts)
+        if not _face_buckets_affordable(counts, np_, total):
+            return None
+        bucket_starts = tack.empty((np_ + 1,), idt)
+        exclusive_scan(counts, bucket_starts, np_, total=False, close=True)
+        counts.fill(0)                                     # each bucket's fill now
+        records = tack.empty((total,), tack.vec(4, idt))
+        for group, start in zip(cell_groups, starts[:-1]):
+            if group.count:
+                _place_faces(group.view(), int(start), bucket_starts, counts, records, 0, np_,
+                             0)
+        if m:
+            _place_candidates(crows, shaped, bucket_starts, counts, records)
+        del crows
+        _sort_face_buckets(bucket_starts, records, 0, np_, 0)
+
+        problems = tack.zeros((5,), tack.i32)
+        _mixed_bucket_counts(bucket_starts, records, shaped, counts, problems, np_)
+        if problems[0]:
+            raise ValueError(f"{problems[0]} faces are shared by more than two cells")
+        if problems[1]:
+            raise ValueError(f"{problems[1]} polyhedral faces have the same points as another "
+                             "polyhedral face: a face two polyhedra share is stored once")
+        first = counts if idt == tack.i32 else tack.empty((np_,), idt)
+        new = exclusive_scan(counts, first, np_)
+
+        self = cls()
+        self.group_starts = {g: int(s) for g, s in zip(cell_groups, starts[:-1])}
+        self.id_dtype = idt
+        self.topology = topology
+        count = nfp + new
+        self.num_faces = count
+        self.rows = tack.empty((count,), tack.vec(4, idt))
+        self.kinds = tack.empty((count,), tack.i32)
+        self.sides = tack.empty((count,), tack.vec(4, idt))
+        self.side_face = tack.empty((shaped,), idt)
+        self.side_slot = tack.empty((shaped,), tack.i32)
+        self.side_orientation = tack.empty((shaped,), tack.i32)
+        _assign_mixed_faces(bucket_starts, records, shaped, first, nfp, candidates,
+                            self.side_face, self.side_slot, np_)
+        del records, counts, first, bucket_starts, candidates
+        if nfp:
+            _polyhedral_face_rows(topology.face_offsets, topology.face_points, sides_in,
+                                  self.rows, self.kinds, self.sides)
+        # Rows and sides from the cells, in their order: side 0's first, since
+        # side 1's orientation reads its face's row; then the shaped cells beside
+        # polyhedral faces.
+        for group, start in zip(cell_groups, starts[:-1]):
+            if group.count:
+                _side_zero_rows(group.view(), int(start), self.side_face, self.side_slot,
+                                self.rows, self.kinds, self.sides, self.side_orientation)
+        bad = tack.zeros((1,), tack.i32)
+        for group, start in zip(cell_groups, starts[:-1]):
+            if group.count:
+                _side_one_rows(group.view(), int(start), self.side_face, self.side_slot,
+                               self.rows, self.sides, self.side_orientation, bad)
+                _side_of_polyhedral_face(group.view(), int(start), self.side_face,
+                                         self.side_slot, self.rows, self.sides,
+                                         self.side_orientation, problems)
+        if count:
+            _wound_into_only_cell(self.sides, problems)
+        if bad[0] or problems[2]:
+            raise ValueError(f"{bad[0] + problems[2]} cell faces do not go round their face's "
+                             "points in either direction")
         if problems[3]:
             raise ValueError(f"{problems[3]} faces a polyhedron shares with a shaped cell are "
                              "wound the same way by both: a shape's faces wind out of it, so "
