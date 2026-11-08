@@ -221,22 +221,14 @@ def _kept(flags, slots, ids):
             ids[slots[i]] = i
 
 
-@on_inputs_device
-def owned_values(data, field):
-    """The values of ``field`` (a ``Field`` of ``data``, or its name; an evaluated one's
-    stored values) that ``data`` owns: all of
-    them when it has no marks for where they live, else those of cells and
-    points not marked a duplicate or hidden, materialized. Fields on faces or
-    edges, and order-2 fields, have no marks of their own yet; on a dataset
-    with ghost marks they are refused rather than counted twice."""
-    from tack.dataset.carry import _take
-    from tack.dataset.dataset import is_field_key
+def refuse_lost(data, space):
+    """``(on_points, on_cells)`` for values in ``space``, or ``NotImplementedError``
+    where ``data`` lost the ghost marks of where they live (a filter's output from
+    data with marks): reduced, its shared cells or points would count once per
+    piece. What `owned_values` checks, for a reduction that sums on the device
+    without it (``integrate``'s measure)."""
     from tack.dataset.spaces import H1, L2, Constant, Values
 
-    if is_field_key(field):
-        field = data.fields[field]
-    field = field.space.stored(field, data)
-    space = field.space
     on_points = (isinstance(space, H1) and space.order == 1) or (
         isinstance(space, Values) and space.on == "points")
     on_cells = isinstance(space, (Constant, L2)) or (
@@ -253,6 +245,26 @@ def owned_values(data, field):
             f"its shared {kind} would count once per piece. "
             "td.generate_global_ids(pieces) of the outputs marks them by matching "
             "(or reduce the input instead, or set the output's ghosts)")
+    return on_points, on_cells
+
+
+@on_inputs_device
+def owned_values(data, field):
+    """The values of ``field`` (a ``Field`` of ``data``, or its name; an evaluated one's
+    stored values) that ``data`` owns: all of
+    them when it has no marks for where they live, else those of cells and
+    points not marked a duplicate or hidden, materialized. Fields on faces or
+    edges, and order-2 fields, have no marks of their own yet; on a dataset
+    with ghost marks they are refused rather than counted twice."""
+    from tack.dataset.carry import _take
+    from tack.dataset.dataset import is_field_key
+    from tack.dataset.spaces import L2
+
+    if is_field_key(field):
+        field = data.fields[field]
+    field = field.space.stored(field, data)
+    space = field.space
+    on_points, on_cells = refuse_lost(data, space)
     values = materialize(field.values)
     ghosts = data.ghosts
     if ghosts is None or (ghosts.cells is None and ghosts.points is None):

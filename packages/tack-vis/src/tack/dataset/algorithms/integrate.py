@@ -606,7 +606,11 @@ def _piece(data, names):
 
     if get_backend().supports_f64:
         # The owned cells' measures summed as the fields are, by chunks in f64 on the
-        # device, not copied to the host (21.5M of AhmedML's: 0.1 s of 0.17 on CUDA).
+        # device, not copied to the host (21.5M of AhmedML's: 0.1 s of 0.17 on CUDA);
+        # refused, as owned_values refuses, where the cells' marks were lost.
+        from tack.dataset.ghosts import refuse_lost
+
+        refuse_lost(data, measures.space)
         measure = float(_weighted_sum(measures.values, weights.mask()))
     else:                                       # the host's f64 sum, not the device's f32
         measure = float(np.sum(np.asarray(owned_values(data, measures).numpy(), np.float64)))
