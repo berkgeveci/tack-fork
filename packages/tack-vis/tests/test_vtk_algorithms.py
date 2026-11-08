@@ -524,6 +524,15 @@ def test_set_input_array_to_process_chooses_the_field():
     assert threshold(_two_of_one_name()).number_of_cells == 0
 
 
+def test_a_field_chosen_by_set_input_array_to_process_names_the_new_one():
+    """A filter whose new field takes the field's name takes the chosen one's."""
+    centers = ta.ValuesAtCenters()
+    centers.SetInputArrayToProcess(0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS,
+                                   "RTData")
+    out = centers(_wavelet()())
+    assert "RTData" in out.cell_data.keys()
+
+
 def test_a_name_both_kinds_have_is_refused_unless_told_which():
     threshold = ta.Threshold(field="p", lower=0.0, upper=200.0)
     threshold.SetInputDataObject(0, _two_of_one_name())
@@ -544,6 +553,11 @@ def _boolean(operation):
 @pytest.mark.parametrize("vtk_function, tack_function", [
     (lambda: vtk.vtkPlane(origin=(1, 0, 0), normal=(1, 2, 0)),
      lambda: td.Plane((1, 0, 0), (1, 2, 0))),
+    # The offset is along the normal as given, not the unit one, as VTK moves it.
+    (lambda: vtk.vtkPlane(origin=(1, 0, 0), normal=(2, 0, 0), offset=1.5),
+     lambda: td.Plane((4, 0, 0), (1, 0, 0))),
+    (lambda: vtk.vtkPlane(origin=(1, 0, 0), normal=(0.3, -0.9, 0.2), axis_aligned=True),
+     lambda: td.Plane((1, 0, 0), (0, 1, 0))),
     (lambda: vtk.vtkSphere(center=(1, 0, 0), radius=5.0), lambda: td.Sphere((1, 0, 0), 5.0)),
     (lambda: vtk.vtkCylinder(center=(0, 1, 0), axis=(0, 0, 1), radius=4.0),
      lambda: td.Cylinder((0, 1, 0), (0, 0, 1), 4.0)),

@@ -64,7 +64,7 @@ wrapper's field parameters numbered in order. Where an implicit function goes
 (``Clip``'s ``by``), VTK's own (``vtkPlane``, ``vtkSphere``, ``vtkBox``,
 ``vtkCylinder``, ``vtkPlanes``, ``vtkImplicitBoolean``) work as Tack's: the same
 function, so the same zero set and values; a ``vtkPlane`` is normalized, its
-values those of the unit normal.
+values those of the unit normal, with its ``Offset`` and ``AxisAligned``.
 
 The temporal filters (``RunningStatistics``, ``TimeDerivative``, ``Advection``,
 ``Pathlines``, ``Streaklines``) run in situ, taking the step their input holds at
@@ -471,7 +471,8 @@ def _implicit(function):
     ``vtkSphere``, ``vtkBox``, ``vtkCylinder``, ``vtkPlanes`` or ``vtkImplicitBoolean``
     (union, intersection, difference) of them; anything else as it is. Tack's are
     VTK's functions, so a clip or slice at any value is the same; a ``vtkPlane``'s
-    normal is normalized."""
+    normal is normalized, after ``AxisAligned`` snaps it to the axes (as VTK does,
+    every axis of the largest magnitude) and its origin moved ``Offset`` times it."""
     from vtkmodules.vtkCommonDataModel import vtkImplicitBoolean, vtkImplicitFunction
 
     import tack.dataset as td
@@ -484,7 +485,13 @@ def _implicit(function):
     if function.GetTransform() is not None:
         raise ValueError(f"a {name} with a transform has no Tack implicit function")
     if name == "vtkPlane":
-        return td.Plane(function.GetOrigin(), function.GetNormal())
+        normal = function.GetNormal()
+        if function.GetAxisAligned():
+            largest = max(abs(n) for n in normal)
+            normal = tuple(1.0 if abs(n) == largest else 0.0 for n in normal)
+        offset = function.GetOffset()
+        origin = tuple(o + offset * n for o, n in zip(function.GetOrigin(), normal))
+        return td.Plane(origin, normal)
     if name == "vtkSphere":
         return td.Sphere(function.GetCenter(), function.GetRadius())
     if name == "vtkBox":
@@ -787,7 +794,7 @@ class TackAlgorithm(VTKPythonAlgorithmBase):
             elif name == "fields" and isinstance(value, (list, tuple)):
                 value = [_field_argument(v) for v in value]
             if name in self.IMPLICIT:
-                value = _implicit(value)
+                value = self._implicit_function(value)
             if name in self.DATASETS and isinstance(value, vtkDataObject):
                 value = self._dataset(value, self.device)
             if value is None and name in self._REQUIRED:
@@ -796,6 +803,12 @@ class TackAlgorithm(VTKPythonAlgorithmBase):
         if getattr(self, "_TAKES_WORLD", False):
             values["world"] = self._run_world
         return values
+
+    @staticmethod
+    def _implicit_function(value):
+        """An implicit function parameter's value as Tack's (``_implicit``); a subclass
+        converts more kinds (ParaView's ``vtkPVBox``)."""
+        return _implicit(value)
 
     def _world(self):
         """The World this run's pieces are spread over: ``world`` (a World, or an mpi4py
@@ -1253,11 +1266,13 @@ class _FieldAlgorithm(TackAlgorithm):
 
     def _output_name(self):
         """The new field's name: the ``name`` parameter, or by default the field the
-        filter reads (``field``)."""
+        filter reads (``field``, or the one ``SetInputArrayToProcess`` chose)."""
         name = getattr(self, "name", None)
         if name is not None:
             return name
         field = getattr(self, "field", None)
+        if field is None and "field" in self.FIELDS:
+            field = self._input_array(self.FIELDS.index("field"))
         if isinstance(field, str):
             return field
         if isinstance(field, tuple) and field and isinstance(field[0], str):
@@ -3238,6 +3253,8 @@ class _Particles(_Temporal):
     INPUTS = 2
     REQUIRED_INPUTS = 1
     OUTPUT = "vtkPolyData"
+    # Read by _arguments, not arguments(): SetInputArrayToProcess(0, ...) chooses it.
+    FIELDS = ("field",)
 
     field = Parameter(None, "the velocity field (required): a name, or (name, 'points' "
                             "/ 'cells')")

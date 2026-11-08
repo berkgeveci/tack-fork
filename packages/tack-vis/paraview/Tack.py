@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) Kitware Inc.
+# SPDX-License-Identifier: BSD-3-Clause
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -9,8 +11,6 @@
 # hip = ["tack-core[hip]>=0.8,<0.9"]
 # metal = ["tack-core[metal]>=0.8,<0.9"]
 # ///
-# SPDX-FileCopyrightText: Copyright (c) Kitware Inc.
-# SPDX-License-Identifier: BSD-3-Clause
 """Tack's filters in ParaView, every one at one go.
 
 Load this file as a plugin (Tools > Manage Plugins > Load New, or

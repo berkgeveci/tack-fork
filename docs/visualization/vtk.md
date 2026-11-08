@@ -525,22 +525,34 @@ has a ParaView panel, loaded at one go (Tools > Manage Plugins > Load New, or
 `PV_PLUGIN_PATH`). It needs a ParaView whose Python plugins can declare packages:
 on first load ParaView offers to make an environment of Tack for it (with CUDA,
 HIP or Metal where their runtimes are found) and finds it again afterwards.
-The filters are in the Filters menu's Tack category: Tack Contour, Clip, Slice,
-Threshold, Gradients, Elevation, Cell Quality, Extract Surface, Probe,
-Streamlines, Shrink and Feature Edges.
+The filters are in the Filters menu's Tack category, every VTK wrapper's but
+`Interpolate` (whose function is a `@tack.func`) and `Composite` (whose fields
+are in an order a list of arrays cannot give); the temporal ones take the steps
+of a reader's time series as they do in VTK.
 
 The plugin file only imports `tack.interop.paraview`, which makes the proxies
 when it is imported: each wrapper of `tack.interop.vtk.algorithms` with a
 panel, a property for each of its parameters (inferred from the parameter's
 default and whether it is a field) and its ServerManager XML. A panel
 (`tack.interop.paraview._panels.PANELS`) gives what the parameters cannot:
-ParaView's property names, labels, widgets (a plane for Clip and Slice, a line
-for Elevation, array menus and ranges) and defaults, so a state or a script
-moves between ParaView's filter and Tack's by changing the proxy's name, for
-the properties both have. Tack Contour has ParaView's Contour panel: several
-isosurfaces, normals and gradients as VTK makes them, the output's precision.
-Every filter has a Device property: where its input's memory is, or a device
-of this machine.
+ParaView's property names, labels, widgets and defaults, so a state or a
+script moves between ParaView's filter and Tack's by changing the proxy's name,
+for the properties both have. Clip, Slice, Extract Cells By Region, Extract
+Points and Implicit Values take ParaView's implicit functions (Plane, Box,
+Sphere, Cylinder) with their widgets, the filter running again when one is
+moved; a Box must stay along the axes (turned by right angles at most), since
+Tack's is. Transform takes ParaView's Transform; Deposit and Voxelize sample onto
+an image over the input's bounds, as Resample To Image does. A number zero
+leaves it to the function where the function works one out (a radius, a
+neighbour count), and an optional field's menu has None. Tack Contour has
+ParaView's Contour panel: several isosurfaces, normals and gradients as VTK
+makes them, the output's precision. Every filter has a Device property: where
+its input's memory is, or a device of this machine.
+
+The filters compute what Tack's functions compute, which is not always what
+ParaView's filter of the name gives: Extract Cells By Region keeps a cell
+"inside" when all its points are at or below zero (VTK's, below), so a cell
+touching the function's zero set differs.
 
 ## Read meshes with polyhedra, repeated points or inside-out cells
 
