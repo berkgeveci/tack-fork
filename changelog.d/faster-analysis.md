@@ -18,3 +18,12 @@
     from 0.96 for 10.7M cells (4.2 s the first time).
   - `clip` of polyhedra beside shapes skips polyhedra with nothing to keep:
     0.17 s from 0.30.
+  - Deriving faces and edges: the bucket sort's scatter moves each key beside
+    its index (`buckets.sorted_key_order`), so the sort and the runs read a
+    bucket's keys together rather than at random, and the edges of polyhedra
+    beside shapes go into arrays of their own rather than one split by copies:
+    edges 0.81 s from 1.47, faces 0.93 from 1.06, the first time they are
+    needed.
+  - Corner gradients of straight hexahedra take the Jacobian's inverse
+    transpose from its columns' cross products: a scalar's point gradient
+    0.35 s from 0.40.

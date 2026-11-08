@@ -37,6 +37,7 @@ from tack.dataset.buckets import (
     bucket_order,
     key_order,
     run_offsets,
+    sorted_key_order,
 )
 from tack.dataset.views import (
     DomainGroup,
@@ -1606,8 +1607,8 @@ class Faces(_OnItsArrays):
         if total:
             keys = tack.empty((total,), tack.vec(4, idt))
             _face_keys(rows, keys)
-            order = key_order(keys, topology.num_points, idt)
-            offsets, runs = run_offsets(keys, order)
+            order, ordered = sorted_key_order(keys, topology.num_points, idt)
+            offsets, runs = run_offsets(keys, order, ordered)
             del keys
             fresh = tack.empty((runs,), idt)
             _classify_runs(order, offsets, shaped, fresh, problems, runs)
@@ -1755,8 +1756,8 @@ class Faces(_OnItsArrays):
         if total:
             keys = tack.empty((total,), tack.vec(4, idt))
             _face_keys(rows, keys)
-            order = key_order(keys, topology.num_points, idt)
-            offsets, count = run_offsets(keys, order)
+            order, ordered = sorted_key_order(keys, topology.num_points, idt)
+            offsets, count = run_offsets(keys, order, ordered)
         else:
             count = 0
         self.num_faces = count
@@ -1924,7 +1925,8 @@ def _emit_edges(cells, start, keys, signs):
 
 @tack.kernel
 def _face_edge_keys_at(face_offsets, face_points, keys, signs, at, n_faces):
-    # A polyhedral face's edges, from ``at``: edge j from its point j to the next.
+    # A polyhedral face's edges, their keys from ``at``, their signs from 0 (an
+    # array of the faces' own): edge j from its point j to the next.
     for f in range(n_faces):
         first = face_offsets[f]
         n = face_offsets[f + 1] - first
@@ -1933,32 +1935,22 @@ def _face_edge_keys_at(face_offsets, face_points, keys, signs, at, n_faces):
             b = face_points[first + (j + 1 if j + 1 < n else 0)]
             lo, hi = _order(a, b)
             keys[at + first + j] = [lo, hi]
-            signs[at + first + j] = 1 if a < b else -1
+            signs[first + j] = 1 if a < b else -1
 
 
 @tack.kernel
-def _copy_from(values, at, out):
-    for i in range(out.shape[0]):
-        out[i] = values[at + i]
-
-
-def _split_at(values, at):
-    """``values[:at]`` and ``values[at:]``, as new arrays."""
-    head = tack.empty((at,), values.dtype)
-    tail = tack.empty((values.shape[0] - at,), values.dtype)
-    if at:
-        _copy_from(values, 0, head)
-    if tail.shape[0]:
-        _copy_from(values, at, tail)
-    return head, tail
-
-
-@tack.kernel
-def _edges_from_runs(order, offsets, keys, edge_rows, side_edge, count):
+def _edges_from_runs(order, offsets, keys, edge_rows, side_edge, at, face_edge, count):
+    # Each run's edge, and each entry's edge id: the shaped cells' entries (below
+    # ``at``) into side_edge, the polyhedral faces' into face_edge from 0 -- two
+    # arrays from the start, not one split by copies (0.28 s of AhmedML's edges).
     for r in range(count):
         edge_rows[r] = keys[order[offsets[r]]]
         for i in range(offsets[r], offsets[r + 1]):
-            side_edge[order[i]] = r
+            e = order[i]
+            if e < at:
+                side_edge[e] = r
+            else:
+                face_edge[e - at] = r
 
 
 @tack.kernel
@@ -2065,28 +2057,30 @@ class Edges(_OnItsArrays):
         polyhedral = size_of(topology.face_points) if topology.mixed else 0
         total = shaped + polyhedral
         keys = tack.empty((total,), tack.vec(2, idt))
-        signs = tack.empty((total,), tack.i32)
+        # The shaped cells' entries and the polyhedral faces' in arrays of their own.
+        signs = tack.empty((shaped,), tack.i32)
+        face_signs = tack.empty((polyhedral,), tack.i32)
         for group, start in zip(cell_groups, starts[:-1]):
             if group.count:
                 _emit_edges(group.view(), int(start), keys, signs)
         if polyhedral:
-            _face_edge_keys_at(topology.face_offsets, topology.face_points, keys, signs, shaped,
-                               topology.num_polyhedral_faces)
-        side_edge = tack.empty((total,), idt)
+            _face_edge_keys_at(topology.face_offsets, topology.face_points, keys, face_signs,
+                               shaped, topology.num_polyhedral_faces)
+        side_edge = tack.empty((shaped,), idt)
+        face_edge = tack.empty((polyhedral,), idt)
         if total:
-            order = key_order(keys, topology.num_points, idt)
-            offsets, count = run_offsets(keys, order)
+            order, ordered = sorted_key_order(keys, topology.num_points, idt)
+            offsets, count = run_offsets(keys, order, ordered)
         else:
             count = 0
         self.num_edges = count
         self.rows = tack.empty((count,), tack.vec(2, idt))
         if count:
-            _edges_from_runs(order, offsets, keys, self.rows, side_edge, count)
+            _edges_from_runs(order, offsets, keys, self.rows, side_edge, shaped,
+                             face_edge if polyhedral else side_edge, count)
+        self.side_edge, self.side_sign = side_edge, signs
         if polyhedral:
-            self.side_edge, self.face_edge = _split_at(side_edge, shaped)
-            self.side_sign, self.face_edge_sign = _split_at(signs, shaped)
-        else:
-            self.side_edge, self.side_sign = side_edge, signs
+            self.face_edge, self.face_edge_sign = face_edge, face_signs
         return self
 
     @classmethod

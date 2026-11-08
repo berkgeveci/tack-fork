@@ -60,6 +60,15 @@ class _Keys1:
     def same(self, i, j):
         return self.values[i] == self.values[j]
 
+    @tack.func
+    def less(self, a, b, ia, ib):
+        # Key values a and b of one bucket (equal), entries ia and ib: by index.
+        return ia < ib
+
+    @tack.func
+    def equal(self, a, b):
+        return a == b
+
 
 @tack.device_class
 class _Keys2:
@@ -80,6 +89,15 @@ class _Keys2:
     def same(self, i, j):
         a = self.values[i]
         b = self.values[j]
+        return a[0] == b[0] and a[1] == b[1]
+
+    @tack.func
+    def less(self, a, b, ia, ib):
+        # Key values a and b of one bucket (their first components equal).
+        return a[1] < b[1] or (a[1] == b[1] and ia < ib)
+
+    @tack.func
+    def equal(self, a, b):
         return a[0] == b[0] and a[1] == b[1]
 
 
@@ -113,6 +131,22 @@ class _Keys4:
     def same(self, i, j):
         a = self.values[i]
         b = self.values[j]
+        return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3]
+
+    @tack.func
+    def less(self, a, b, ia, ib):
+        # Key values a and b of one bucket (their first components equal).
+        out = 1 if ia < ib else 0
+        if a[1] != b[1]:
+            out = 1 if a[1] < b[1] else 0
+        elif a[2] != b[2]:
+            out = 1 if a[2] < b[2] else 0
+        elif a[3] != b[3]:
+            out = 1 if a[3] < b[3] else 0
+        return out
+
+    @tack.func
+    def equal(self, a, b):
         return a[0] == b[0] and a[1] == b[1] and a[2] == b[2] and a[3] == b[3]
 
 
@@ -207,6 +241,47 @@ def _sort_buckets(keys, starts, order, nbuckets):
 
 
 @tack.kernel
+def _bucket_scatter_keys(keys, values, starts, fill, order, ordered, n):
+    # As _bucket_scatter, with each key copied beside its index: a bucket's keys
+    # then lie together, for the sort and the runs to read in order rather than
+    # each through the permutation at random.
+    for i in range(n):
+        b = keys.bucket(i)
+        slot = starts[b] + tack.atomic_add(fill, b, 1)
+        order[slot] = i
+        ordered[slot] = values[i]
+
+
+@tack.kernel
+def _sort_ordered_buckets(keys, ordered, starts, order, nbuckets):
+    # Each bucket sorted by insertion on its own keys, moved with their indices.
+    for b in range(nbuckets):
+        begin = starts[b]
+        end = starts[b + 1]
+        for i in range(begin + 1, end):
+            e = order[i]
+            v = ordered[i]
+            j = i - 1
+            moving = 1
+            while j >= begin and moving == 1:
+                if keys.less(v, ordered[j], e, order[j]):
+                    order[j + 1] = order[j]
+                    ordered[j + 1] = ordered[j]
+                    j -= 1
+                else:
+                    moving = 0
+            order[j + 1] = e
+            ordered[j + 1] = v
+
+
+@tack.kernel
+def _flag_ordered_runs(keys, ordered, flags):
+    # Runs of equal keys among keys already in sorted order: neighbours compared.
+    for i in range(flags.shape[0]):
+        flags[i] = 0 if i > 0 and keys.equal(ordered[i], ordered[i - 1]) else 1
+
+
+@tack.kernel
 def _component(values, c, out):
     for i in range(out.shape[0]):
         out[i] = values[i][c]
@@ -259,6 +334,44 @@ def bucket_order(values, nbuckets, index_dtype=None):
     _bucket_scatter(keys, starts, fill, order, n)
     _sort_buckets(keys, starts, order, nbuckets)
     return order, starts
+
+
+@on_inputs_device
+def sorted_key_order(values, nbuckets, index_dtype=None):
+    """``(order, ordered)``: ``key_order``'s permutation and the keys in it. On the
+    bucket path the scatter moves each key with its index, so the sort and
+    ``run_offsets(values, order, ordered)`` read each bucket's keys together, not
+    through the permutation at random (AhmedML's 266M edge keys: sort and runs
+    0.57 s to 0.33, the scatter writing the keys 0.12 to 0.21). Other keys are
+    sorted by ``key_order`` and gathered."""
+    from tack.algorithms.sort import gather
+
+    n = _count(values)
+    indices = _index_dtype(max(n, nbuckets), index_dtype)
+    if n == 0 or nbuckets <= _sparse(get_backend()) * n:
+        keys = keys_of(values)
+        starts = tack.empty((nbuckets + 1,), indices)
+        counts = tack.zeros((nbuckets,), tack.i32)
+        if n:
+            bad = tack.zeros((1,), tack.i32)
+            _bucket_counts(keys, counts, bad, n, nbuckets)
+            if bad[0]:
+                raise ValueError(f"{bad[0]} keys lie outside the {nbuckets} buckets")
+        exclusive_scan(counts, starts, nbuckets, total=False, close=True)
+        nchunks = max((nbuckets + _CHUNK - 1) // _CHUNK, 1)
+        largest = tack.zeros((nchunks,), tack.i32)
+        if nbuckets:
+            _largest_counts(counts, largest, _CHUNK, nchunks, nbuckets)
+        if int(largest.numpy().max()) <= _LARGEST:
+            order = tack.empty((n,), indices)
+            ordered = tack.empty((n,), values.dtype)
+            if n:
+                fill = tack.zeros((nbuckets,), tack.i32)
+                _bucket_scatter_keys(keys, values, starts, fill, order, ordered, n)
+                _sort_ordered_buckets(keys, ordered, starts, order, nbuckets)
+            return order, ordered
+    order = key_order(values, nbuckets, index_dtype)
+    return order, (gather(values, order) if n else tack.empty((0,), values.dtype))
 
 
 #: Keys at least this many times fewer than the buckets are radix sorted by
@@ -399,10 +512,11 @@ def run_firsts(order, flags, dtype):
 
 
 @on_inputs_device
-def run_offsets(values, order):
+def run_offsets(values, order, ordered=None):
     """``(offsets, nruns)``: where each run of equal keys starts among ``values``
     taken in ``order`` (as ``bucket_order`` gives it), ``nruns + 1`` offsets of
-    ``order``'s type."""
+    ``order``'s type. ``ordered``, the keys in that order (``sorted_key_order``),
+    are compared as neighbours, not read through ``order``."""
     n = int(order.shape[0])
     if n == 0:
         offsets = tack.empty((1,), order.dtype)
@@ -410,7 +524,10 @@ def run_offsets(values, order):
         return offsets, 0
     flags = tack.empty((n,), tack.i32)
     run_ids = tack.empty((n,), order.dtype)
-    _flag_runs(keys_of(values), order, flags)
+    if ordered is not None:
+        _flag_ordered_runs(keys_of(values), ordered, flags)
+    else:
+        _flag_runs(keys_of(values), order, flags)
     nruns = exclusive_scan(flags, run_ids, n)
     offsets = tack.empty((nruns + 1,), order.dtype)
     _scatter_run_starts(flags, run_ids, offsets, n, nruns)

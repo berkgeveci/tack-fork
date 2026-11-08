@@ -81,17 +81,19 @@ def _or_flags(extra, used):
             used[i] = 1
 
 
-def _keep_cells(data, keep, fields=None, keep_points=None):
+def _keep_cells(data, keep, fields=None, keep_points=None, shapes_only=False):
     """The cells whose ``keep`` flag (i32, one per cell) is 1, with only the points
     they use, renumbered in order -- and the points whose ``keep_points`` flag is
     1, used or not; fields carried by ``carry``. Polyhedral topologies keep
     their cells' faces too; polygonal and polyline ones their loops and chains.
-    Hidden and refined cells (``HIDDENCELL``, ``REFINEDCELL``) are never kept."""
+    Hidden and refined cells (``HIDDENCELL``, ``REFINEDCELL``) are never kept.
+    ``shapes_only`` says a mixed topology's polyhedra are not among those kept,
+    so their faces are not walked."""
     from tack.dataset.ghosts import without_hidden
 
     keep = without_hidden(data, keep)
     if data.topology.mixed:
-        return _mixed_keep_cells(data, keep, fields, keep_points)
+        return _mixed_keep_cells(data, keep, fields, keep_points, shapes_only)
     if not getattr(data.topology, "reference_cells", True):
         return _polyhedral_keep_cells(data, keep, fields, keep_points)
     n = data.num_cells
@@ -208,7 +210,7 @@ def _polyhedral_keep_cells(data, keep, fields=None, keep_points=None):
                  fields=fields)
 
 
-def _mixed_keep_cells(data, keep, fields=None, keep_points=None):
+def _mixed_keep_cells(data, keep, fields=None, keep_points=None, shapes_only=False):
     """``_keep_cells`` of shaped cells beside polyhedra or polygons (a mixed
     `UnstructuredTopology`): each kept cell's run of the connectivity and its type,
     and the kept polyhedra's faces once, numbered in their old order. A kept face
@@ -236,7 +238,7 @@ def _mixed_keep_cells(data, keep, fields=None, keep_points=None):
 
     # Polyhedra's faces kept with them; polygons' edges are derived again.
     polyhedra = None
-    if t.has_polyhedra:
+    if t.has_polyhedra and not shapes_only:
         nf = t.num_polyhedral_faces
         used = tack.zeros((nf,), tack.i32)
         owned = tack.zeros((nf,), tack.i32)

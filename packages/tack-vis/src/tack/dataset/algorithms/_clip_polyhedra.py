@@ -422,7 +422,7 @@ def clip_mixed(data, values, iso, inside, fields):
         "point": Field(Values(data, "points"), tack.arange(data.num_points, dtype=idt)),
         "cell": Field(Values(data, "cells"), tack.arange(n, dtype=idt)),
         "value": Field(Values(data, "points"), values)}, **data._frame())
-    shaped = _keep_cells(marked, whole)
+    shaped = _keep_cells(marked, whole, shapes_only=True)      # whole cells are shapes
     kept_ids = arrays.materialize(shaped.fields["point"].values)
     n_kept, n_shapes = shaped.num_points, shaped.num_cells
     if int(cut.numpy().max(initial=0)):

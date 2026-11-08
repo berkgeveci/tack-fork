@@ -236,7 +236,8 @@ def _hexahedron_corner(cells, u, c, j):
     parametric gradient there: at a vertex only it and its three neighbours along the
     axes have a shape gradient (of 1), so the Jacobian's columns are those three
     edges and the gradient the values' differences along them -- what the
-    trilinear map gives there, without evaluating its eight shape gradients."""
+    trilinear map gives there, without evaluating its eight shape gradients. Returns
+    the three edges (the Jacobian's columns) and the gradient."""
     x = cells.corner_position(c, j)
     v = u.corner_value(c, j)
     a = _HEXAHEDRON_NEXT[3 * j]
@@ -248,16 +249,32 @@ def _hexahedron_corner(cells, u, c, j):
     ea = (cells.corner_position(c, a) - x) * sa
     eb = (cells.corner_position(c, b) - x) * sb
     ed = (cells.corner_position(c, d) - x) * sd
-    m = tack.mat3([ea[0], eb[0], ed[0]], [ea[1], eb[1], ed[1]], [ea[2], eb[2], ed[2]])
     g = tack.vec3((u.corner_value(c, a) - v) * sa, (u.corner_value(c, b) - v) * sb,
                   (u.corner_value(c, d) - v) * sd)
-    return m, g
+    return ea, eb, ed, g
+
+
+@tack.func
+def _edges_frame(ea, eb, ed):
+    """For a Jacobian of columns ``ea``, ``eb``, ``ed``: the cross products that make
+    its inverse transpose -- J^-T g = (g0 (eb x ed) + g1 (ed x ea) + g2 (ea x eb)) / det
+    -- its determinant, and its scaled Jacobian (``_scaled``'s), without inverting
+    a matrix."""
+    bc = eb.cross(ed)
+    ca = ed.cross(ea)
+    ab = ea.cross(eb)
+    det = ea.dot(bc)
+    lengths = ea.norm() * eb.norm() * ed.norm()
+    scaled = lengths - lengths
+    if lengths > 0.0:
+        scaled = det / lengths
+    return bc, ca, ab, det, scaled
 
 
 @tack.func
 def _hexahedron_corner_rows(cells, u, c, j):
-    """``_hexahedron_corner`` for a 3-vector field: the Jacobian, and the parametric
-    gradients of the three components as a matrix's rows."""
+    """``_hexahedron_corner`` for a 3-vector field: the edges, and the field's
+    differences along them (each a 3-vector, one component a component)."""
     x = cells.corner_position(c, j)
     v = u.corner_value(c, j)
     a = _HEXAHEDRON_NEXT[3 * j]
@@ -269,12 +286,10 @@ def _hexahedron_corner_rows(cells, u, c, j):
     ea = (cells.corner_position(c, a) - x) * sa
     eb = (cells.corner_position(c, b) - x) * sb
     ed = (cells.corner_position(c, d) - x) * sd
-    m = tack.mat3([ea[0], eb[0], ed[0]], [ea[1], eb[1], ed[1]], [ea[2], eb[2], ed[2]])
     da = (u.corner_value(c, a) - v) * sa
     db = (u.corner_value(c, b) - v) * sb
     dd = (u.corner_value(c, d) - v) * sd
-    p = tack.mat3([da[0], db[0], dd[0]], [da[1], db[1], dd[1]], [da[2], db[2], dd[2]])
-    return m, p
+    return ea, eb, ed, da, db, dd
 
 
 @tack.func
@@ -319,24 +334,26 @@ def _green_gauss_component(cells, u, c, k):
 @tack.kernel
 def _vector_edge_gradients(cells, u, start, out, singular):
     # ``_corner_gradients`` of a 3-vector field on straight hexahedra, every
-    # component from one Jacobian inverse a corner: G = P J^-1, P's rows the
-    # components' parametric gradients; row i of G is component i's gradient.
+    # component from one frame a corner (``_edges_frame``): component i's gradient
+    # is (da_i (eb x ed) + db_i (ed x ea) + dd_i (ea x eb)) / det, row i.
     for c in cells:
         first = start + cells.index(c) * cells.NUM_POINTS
         tangled = 0
         for j in range(cells.NUM_POINTS):
             singular[first + j] = 0
-            m, p = _hexahedron_corner_rows(cells, u, c, j)
-            scaled = _scaled(m)
+            ea, eb, ed, da, db, dd = _hexahedron_corner_rows(cells, u, c, j)
+            bc, ca, ab, det, scaled = _edges_frame(ea, eb, ed)
             if scaled < -_FLAT:
                 tangled = 1
             if abs(scaled) <= _FLAT:
                 out[first + j] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
                 singular[first + j] = 1
             else:
-                g = p @ m.inverse()
-                out[first + j] = [g[0, 0], g[0, 1], g[0, 2], g[1, 0], g[1, 1], g[1, 2],
-                                  g[2, 0], g[2, 1], g[2, 2]]
+                g0 = (da[0] * bc + db[0] * ca + dd[0] * ab) / det
+                g1 = (da[1] * bc + db[1] * ca + dd[1] * ab) / det
+                g2 = (da[2] * bc + db[2] * ca + dd[2] * ab) / det
+                out[first + j] = [g0[0], g0[1], g0[2], g1[0], g1[1], g1[2],
+                                  g2[0], g2[1], g2[2]]
         if tangled == 1:
             g0 = _green_gauss_component(cells, u, c, 0)
             g1 = _green_gauss_component(cells, u, c, 1)
@@ -367,15 +384,15 @@ def _corner_gradients(cells, u, start, edges, out, singular):
                 gb = world_gradient(cells, u, c, tack.vec3(0.5, 0.5, 0.996))
                 out[first + j] = 2.0 * ga - gb
             elif edges == 1:
-                m, pg = _hexahedron_corner(cells, u, c, j)
-                scaled = _scaled(m)
+                ea, eb, ed, pg = _hexahedron_corner(cells, u, c, j)
+                bc, ca, ab, det, scaled = _edges_frame(ea, eb, ed)
                 if scaled < -_FLAT:
                     tangled = 1
                 if abs(scaled) <= _FLAT:
                     out[first + j] = tack.vec3(0.0, 0.0, 0.0)
                     singular[first + j] = 1
                 else:
-                    out[first + j] = m.inverse().transpose() @ pg
+                    out[first + j] = (pg[0] * bc + pg[1] * ca + pg[2] * ab) / det
             else:
                 pc = cells.parametric_point(j)
                 flat, folded = _corner_kind(cells, c, pc)

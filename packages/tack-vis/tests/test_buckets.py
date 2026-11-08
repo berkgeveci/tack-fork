@@ -189,3 +189,28 @@ def test_groups_leave_the_skipped_bucket_empty(backend, dtype):
         group = order[starts[b]:starts[b + 1]]
         np.testing.assert_array_equal(np.sort(group), np.flatnonzero(keys == b))
 
+
+
+@pytest.mark.parametrize("width", [1, 2, 4])
+@pytest.mark.parametrize("spread", [50, 5000])     # many keys a bucket, and few
+def test_sorted_key_order_is_key_orders_with_its_keys(width, spread):
+    """``sorted_key_order`` (the scatter moving each key with its index, the sort and
+    the runs reading them in order) gives ``key_order``'s permutation and the keys
+    in it, and ``run_offsets`` finds the same runs from them."""
+    from tack.algorithms.sort import gather
+    from tack.dataset.buckets import key_order, run_offsets, sorted_key_order
+
+    rng = np.random.default_rng(width * 7 + spread)
+    n = 20000
+    keys = rng.integers(0, spread, (n, width)).astype(np.int32)
+    keys[:, 0] = np.minimum(keys[:, 0], spread - 1)
+    values = tack.array(keys if width > 1 else keys[:, 0],
+                        tack.vec(width, tack.i32) if width > 1 else tack.i32)
+    order, ordered = sorted_key_order(values, spread)
+    expected = key_order(values, spread)
+    np.testing.assert_array_equal(order.numpy(), expected.numpy())
+    np.testing.assert_array_equal(ordered.numpy(), gather(values, expected).numpy())
+    got = run_offsets(values, order, ordered)
+    want = run_offsets(values, expected)
+    assert got[1] == want[1]
+    np.testing.assert_array_equal(got[0].numpy(), want[0].numpy())
