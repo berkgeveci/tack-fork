@@ -280,7 +280,11 @@ def clip(data, by, value=0.0, inside=False, fields=None, subdivision=None, toler
     clipped yet. Polyhedra beside shapes (a mixed ``UnstructuredTopology``) are
     clipped the same way, and so is every cut shape beside them, since a shape's
     pieces would split faces a polyhedron holds whole; a shape kept whole stays
-    as it is, so the output is mixed too, its whole shapes first.
+    as it is, so the output is mixed too, its whole shapes first. There a cell is
+    kept only if a point is strictly above ``value`` (below, with ``inside``): a
+    cell that touches it from the other side is dropped, where the shapes' tables
+    (and VTK's) keep a piece of it of no volume, so a clip through a plane of mesh
+    points has fewer cells than VTK's, all of its volume.
 
     A curved geometry or a field above order 1 (or ``subdivision`` above 1, or a
     ``tolerance``) is clipped through subdivision, as ``contour`` cuts it, and the

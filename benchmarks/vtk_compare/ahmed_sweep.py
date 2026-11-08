@@ -59,6 +59,17 @@ class Sweep:
         x = np.asarray(grid.GetPoints().GetData())
         lo, hi = x.min(0).astype(float), x.max(0).astype(float)
         self.mid = (lo + hi) / 2
+        # The slice and clip plane, normal to x. Not through the middle: AhmedML's
+        # x = 1.0 is a plane of 31,570 mesh points, where clips differ only in the
+        # cells of no volume they keep (VTK's table clip keeps a piece of a cell
+        # that touches the plane from below; Tack's clip of polyhedra beside shapes
+        # does not), so the cell counts would not compare. A thousandth of the
+        # length further on, no point is within a millionth of it.
+        self.origin = self.mid + np.array([1e-3 * (hi[0] - lo[0]), 0.0, 0.0])
+        near = np.abs(x[:, 0].astype(np.float64) - self.origin[0]) < 1e-6 * (hi[0] - lo[0])
+        if near.any():
+            warnings.warn(f"{int(near.sum())} points lie on the slice and clip plane, "
+                          f"x = {self.origin[0]}", stacklevel=2)
         gx, gz = np.meshgrid(np.linspace(lo[0], hi[0], 800), np.linspace(lo[2], hi[2], 300))
         self.probes = np.c_[gx.ravel(), np.full(gx.size, self.mid[1]), gz.ravel()]
         self.seeds = np.c_[np.full(200, lo[0] + 0.05 * (hi[0] - lo[0])),
@@ -115,7 +126,7 @@ def run_tack(grid, records, args):
     P = ("pMean", data.fields["pMean", td.H1].space)
     U = ("UMean", data.fields["UMean", td.H1].space)
     PC = ("pMean", data.fields["pMean", td.Constant].space)
-    mid, timed = tuple(sweep.mid), sweep.timed
+    origin, timed = tuple(sweep.origin), sweep.timed
 
     def dataset(d):
         return [int(d.num_cells), int(d.num_points)]
@@ -139,9 +150,9 @@ def run_tack(grid, records, args):
     timed("integrate", lambda: td.integrate(data), lambda r: float(r.measure))
     timed("magnitude (U)", lambda: td.magnitude(data, U), norm)
     surface = timed("extract surface", lambda: td.extract_surface(data), dataset)
-    timed("slice", lambda: td.slice_plane(data, mid, (1.0, 0.0, 0.0)), dataset)
+    timed("slice", lambda: td.slice_plane(data, origin, (1.0, 0.0, 0.0)), dataset)
     timed("contour", lambda: td.contour(data, P, sweep.level), dataset)
-    timed("clip", lambda: td.clip(data, td.Plane(mid, (1.0, 0.0, 0.0)), 0.0), dataset)
+    timed("clip", lambda: td.clip(data, td.Plane(origin, (1.0, 0.0, 0.0)), 0.0), dataset)
     thr = timed("threshold (cells)", lambda: td.threshold(data, PC, sweep.low, sweep.high),
                 dataset)
     if thr is not None:
@@ -208,7 +219,7 @@ def run_vtk(grid, records, args):
     log(f"vtk: read {records['read']:.2f} s, merge {records['convert']:.2f} s; "
         f"{grid.number_of_cells} cells, {grid.number_of_points} points")
     POINTS, CELLS = vtkDataObject.FIELD_ASSOCIATION_POINTS, vtkDataObject.FIELD_ASSOCIATION_CELLS
-    mid, timed = tuple(sweep.mid), sweep.timed
+    origin, timed = tuple(sweep.origin), sweep.timed
 
     def run(alg):
         def go():
@@ -269,7 +280,7 @@ def run_vtk(grid, records, args):
     surface = timed("extract surface", run(vtkGeometryFilter(
         input_data=grid, merging=False, pass_through_cell_ids=False,
         pass_through_point_ids=False)), dataset)
-    plane = vtkPlane(origin=mid, normal=(1.0, 0.0, 0.0))
+    plane = vtkPlane(origin=origin, normal=(1.0, 0.0, 0.0))
     timed("slice", run(vtkPlaneCutter(input_data=grid, plane=plane, merge_points=True,
                                       interpolate_attributes=True, compute_normals=False,
                                       generate_polygons=True, build_tree=False,
