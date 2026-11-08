@@ -1369,6 +1369,77 @@ class Contour(_OfAComponent):
 
     field = Parameter(None, "the point field's name")
     value = Parameter(0.0, "the isovalue, or a sequence of them")
+    compute_normals = Parameter(False, "add the point field ``normals``, made as VTK's "
+                                       "contour filters make them (VTK's ComputeNormals)")
+    compute_gradients = Parameter(False, "add the point field ``gradient``, the field's "
+                                         "gradient on the surface (VTK's ComputeGradients)")
+    compute_scalars = Parameter(True, "keep the contoured field on the surface (VTK's "
+                                      "ComputeScalars); other point fields go either way")
+
+    def compute(self, data):
+        """``td.contour``, with ``normals`` and ``gradient`` as VTK's contour filters
+        make them. Normals: on a structured grid the field's gradient at the surface,
+        negated and made unit (as ``vtkContourFilter``'s structured paths, at the cost
+        of ``td.gradients`` over the whole input); on other inputs the surface's own,
+        its polygons wound alike (``td.surface_normals``, as ``vtkPolyDataNormals``,
+        which ``vtkContourFilter`` runs there); none on isolines, which have no
+        surface. The gradient is ``td.gradients`` at the input's points, carried
+        onto the surface with the other point fields."""
+        import copy
+
+        import tack
+        import tack.dataset as td
+        from tack.dataset import Field
+        from tack.dataset.topology import StructuredTopology
+
+        arguments = self.arguments()
+        field = _component_of(data, arguments["field"], self.component)
+        arguments["field"] = field
+        from_gradient = self.compute_normals and isinstance(data.topology, StructuredTopology)
+        staged = from_gradient or self.compute_gradients
+        if staged:
+            # On a copy of the input's dataset, so the input's fields stay its own.
+            data = copy.copy(data)
+            data.fields = {**data.fields,
+                           _GRADIENT: td.gradients(data, field, at="points")}
+        out = td.contour(data, **arguments)
+        if staged:
+            gradient = out.fields.pop(_GRADIENT)
+            if self.compute_gradients:
+                out.fields["gradient"] = gradient
+            if from_gradient:
+                normals = tack.empty_like(gradient.values)
+                _unit_negated(gradient.values, normals)
+                out.fields["normals"] = Field(gradient.space, normals)
+        if self.compute_normals and not from_gradient and out.topology.dimension == 2:
+            out = td.surface_normals(out)
+            del out.fields["cell_normals"]
+        # The name chosen, a name and where it is (SetInputArrayToProcess), or a
+        # component's view (no field of the input's to drop).
+        name = field[0] if isinstance(field, tuple) else field
+        if not self.compute_scalars and isinstance(name, str):
+            out.fields.pop(name, None)
+        return out
+
+    def _made_active(self):
+        return {("points", "Normals"): "normals"} if self.compute_normals else {}
+
+
+#: The name the gradient goes through ``td.contour`` under, as a point field.
+_GRADIENT = "__tack_contour_gradient__"
+
+
+@tack.kernel
+def _unit_negated(gradient, normals):
+    """Each point's normal: its gradient negated and made unit (zero where the gradient
+    is), as VTK's contour filters make normals from the gradient."""
+    for i in range(gradient.shape[0]):
+        g = gradient[i]
+        length = g.norm()
+        scale = 0.0
+        if length > 0.0:
+            scale = -1.0 / length
+        normals[i] = g * scale
 
 
 class SlicePlane(TackAlgorithm):

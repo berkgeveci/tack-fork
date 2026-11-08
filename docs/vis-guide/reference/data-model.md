@@ -232,6 +232,9 @@ never a guess.
 
 ::: tack.interop.vtk.algorithms
 
+::: tack.interop.paraview
+    options: {members: false}
+
 ::: tack.interop.mfem
 
 ::: tack.interop.warp
