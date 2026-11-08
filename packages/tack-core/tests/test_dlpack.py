@@ -187,7 +187,8 @@ def test_a_consumers_error_survives_the_capsule(monkeypatch):
     "SystemError: <built-in function from_dlpack> returned NULL without
     setting an exception" in place of NumPy's own error (mustafar-linux,
     2026-10-25). Here a host array says it is on CUDA, which NumPy refuses
-    the same way. The export is released all the same."""
+    the same way (RuntimeError before NumPy 2.5, BufferError since). The export is
+    released all the same."""
     pytest.importorskip("llvmlite")
     real = dlpack._get_device_info
     monkeypatch.setattr(dlpack, "_get_device_info",
@@ -196,7 +197,7 @@ def test_a_consumers_error_survives_the_capsule(monkeypatch):
     before = len(dlpack._prevent_gc)
     for _ in range(5):
         array = _array(np.arange(4, dtype=np.float32), tack.f32)
-        with pytest.raises(RuntimeError, match="Unsupported device"):
+        with pytest.raises((RuntimeError, BufferError), match="Unsupported device"):
             np.from_dlpack(array)
         del array
     gc.collect()
