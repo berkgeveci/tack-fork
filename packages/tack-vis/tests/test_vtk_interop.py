@@ -40,7 +40,16 @@ needs_vtk = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def cpu():
+    """The CPU the default for each test, and the default it found put back after:
+    the device tests set a GPU (``_init_device``), which, left, made the next test
+    on their xdist worker -- of another module, CPU datasets -- allocate there
+    ("arrays on two devices" in test_mixed_cells, by the schedule)."""
+    from tack.runtime import dispatch
+
+    was = dispatch._current_backend
     tack.set_default_device("cpu")
+    yield
+    dispatch._current_backend = was
 
 
 # ── A stand-in for VTK's module ──────────────────────────────────────
