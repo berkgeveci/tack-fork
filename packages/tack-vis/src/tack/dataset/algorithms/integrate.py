@@ -64,15 +64,26 @@ def _cell_measures(cells, points, weights, measures, centroids):
         centroids[e] = x / m if m > 0.0 else cells.position(c, cells.parametric_center())
 
 
+@tack.func
+def _cell_integral(cells, u, c, points, weights):
+    # Cell c's integral of the field and its measure, ``(integral, measure)``: the
+    # quadrature's weights times the measure element (through the cell's own map)
+    # times the field's value by its own basis, and the same without the value.
+    # integrate's and project's one quadrature of a cell.
+    m = weights[0] * 0.0
+    total = u.value(c, points[0]) * 0.0
+    for q in range(weights.shape[0]):
+        d = weights[q] * _element(cells.geometry_jacobian(c, points[q]), cells.DIMENSION)
+        m += d
+        total += d * u.value(c, points[q])
+    return total, m
+
+
 @tack.kernel
 def _cell_integrals(cells, u, points, weights, out):
-    # Each cell's integral of the field: the quadrature's weights times the measure
-    # element times the field's value, by its own basis.
+    # Each cell's integral of the field (_cell_integral).
     for c in cells:
-        total = u.value(c, points[0]) * 0.0
-        for q in range(weights.shape[0]):
-            d = weights[q] * _element(cells.geometry_jacobian(c, points[q]), cells.DIMENSION)
-            total += d * u.value(c, points[q])
+        total, _ = _cell_integral(cells, u, c, points, weights)
         out[cells.entity_id(c)] = total
 
 

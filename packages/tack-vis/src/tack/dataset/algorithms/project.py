@@ -15,7 +15,7 @@ from tack.dataset.algorithms._links import (
     _cell_values_at_corners,
 )
 from tack.dataset.algorithms.integrate import (
-    _element,
+    _cell_integral,
     _no_reference_values,
     _order,
     _points_per_axis,
@@ -56,14 +56,9 @@ def _corner_mean(cells, u, c):
 
 @tack.func
 def _integral_mean(cells, u, c, points, weights):
-    # The field's integral over the cell divided by the cell's measure, by quadrature
-    # through the cell's own map; a cell without measure takes its nodes' mean.
-    m = weights[0] * 0.0
-    total = u.value(c, points[0]) * 0.0
-    for q in range(weights.shape[0]):
-        d = weights[q] * _element(cells.geometry_jacobian(c, points[q]), cells.DIMENSION)
-        m += d
-        total += d * u.value(c, points[q])
+    # The field's integral over the cell divided by the cell's measure, by integrate's
+    # quadrature (_cell_integral); a cell without measure takes its nodes' mean.
+    total, m = _cell_integral(cells, u, c, points, weights)
     return total / m if m > 0.0 else _node_mean(u, c)
 
 
