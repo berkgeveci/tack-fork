@@ -267,7 +267,17 @@ class Array:
         target = backend_of(device)
         if target is self._backend or target.memory_domain == self._backend.memory_domain:
             return self
-        return array(self.numpy(), self.dtype, device=target)
+        return array(self._host_values(), self.dtype, device=target)
+
+    def _host_values(self) -> np.ndarray:
+        """The values as `numpy` gives them, for reading at once: a CPU array's own
+        memory rather than a copy of it (a copy from every other device). For a
+        copy elsewhere, which copies again: `to_device` of 3 GB on jura took
+        0.72 s more in `numpy`'s copy than in the upload."""
+        data = getattr(self._buffer, "_data", None)
+        if type(self._buffer) is not NumpyBuffer or not isinstance(data, np.ndarray):
+            return self.numpy()
+        return data if data.shape == self._host_shape else data.reshape(self._host_shape)
 
     @property
     def scalar_dtype(self):
