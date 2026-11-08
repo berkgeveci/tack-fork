@@ -710,14 +710,17 @@ def _oriented_connectivity(grid, orient, cells=None):
     those cells."""
     import numpy as np
 
-    chosen = (np.arange(grid.number_of_cells, dtype=np.int64) if cells is None
-              else np.asarray(cells, np.int64))
-    types = np.asarray(grid.cell_types)[chosen] if chosen.size else np.zeros(0, np.uint8)
+    # Every cell (``cells`` None) is read as VTK holds it, not through an index array.
+    every = cells is None
+    chosen = None if every else np.asarray(cells, np.int64)
+    types = np.asarray(grid.cell_types)
+    if not every:
+        types = types[chosen] if chosen.size else np.zeros(0, np.uint8)
     kinds = [k for k in _ORIENTATION if (types == k).any()] if types.size else []
     if not kinds:
         return None
     stored = grid.GetCells()
-    offsets = np.asarray(stored.offsets_array).astype(np.int64)
+    offsets = np.asarray(stored.offsets_array).astype(np.int64, copy=False)
     connectivity = np.asarray(stored.connectivity_array)
     x = _vtk_points(grid)
     if x.dtype not in (np.float32, np.float64):
@@ -725,7 +728,7 @@ def _oriented_connectivity(grid, orient, cells=None):
     flagged = _suspects(np.asarray(grid.cell_types), offsets, connectivity, x)
     inverted = {}
     for kind in kinds:
-        cells = chosen[types == kind]
+        cells = np.flatnonzero(types == kind) if every else chosen[types == kind]
         corners = int(offsets[cells[0] + 1] - offsets[cells[0]])
         suspect = cells[flagged[cells]]
         if not suspect.size:
@@ -759,7 +762,9 @@ def _oriented_connectivity(grid, orient, cells=None):
                       f"point inward{why}; vtk_to_dataset(..., orient=True) turns them outward",
                       stacklevel=4)
         return None
-    repaired = np.array(connectivity)
+    # Point ids in 32 bits where they fit, as the topology keeps them: VTK's are 64.
+    repaired = np.array(connectivity, dtype=np.int32 if grid.number_of_points < 2**31
+                        else connectivity.dtype)
     for kind, (cells, corners) in inverted.items():
         rows = offsets[cells][:, None] + np.arange(corners)
         repaired[rows] = repaired[rows][:, list(_ORIENTATION[kind][1])]
@@ -890,9 +895,9 @@ def _mixed_polyhedra(grid, types, orient=False):
     n = types.size
     polyhedra = np.flatnonzero(types == 42)
     locations, faces = grid.polyhedron_face_locations, grid.polyhedron_faces
-    loc_offsets = np.asarray(locations.offsets_array).astype(np.int64)
-    loc_faces = np.asarray(locations.connectivity_array).astype(np.int64)
-    face_offsets = np.asarray(faces.offsets_array).astype(np.int64)
+    loc_offsets = np.asarray(locations.offsets_array).astype(np.int64, copy=False)
+    loc_faces = np.asarray(locations.connectivity_array).astype(np.int64, copy=False)
+    face_offsets = np.asarray(faces.offsets_array).astype(np.int64, copy=False)
     face_conn = np.asarray(faces.connectivity_array)
     ids = np.int32 if grid.number_of_points < 2**31 else np.int64
     count = loc_offsets[polyhedra + 1] - loc_offsets[polyhedra]
@@ -1337,7 +1342,7 @@ def _collapsed_hexahedra(types, offsets, connectivity):
     from tack.lang.types import from_numpy_dtype
 
     t = host(types).reshape(-1)
-    o = host(offsets).astype(np.int64)
+    o = host(offsets).astype(np.int64, copy=False)
     c = host(connectivity)
     # Every collapse converted below joins an edge's two corners, so only rows with
     # a collapsed edge need the sort -- in most meshes none, and the 21M rows of a
@@ -1902,7 +1907,9 @@ def _points_geometry(grid, shift, dtype, share, device=None):
         shared = _shared(host, tack.vec(3, dtype))
         if shared is not None:
             return shared, dtype
-    return host - shift, dtype
+    # Subtracted in double precision where there is an origin; without one VTK's
+    # points as they are, which the dataset copies into ``dtype`` once.
+    return (host - shift if np.any(shift) else host), dtype
 
 
 def _shared_ids(values):

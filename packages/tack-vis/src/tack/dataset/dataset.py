@@ -271,7 +271,7 @@ def _as_geometry(geometry, topology, dtype, unit=None):
         except TypeError:
             positions = np.ascontiguousarray(geometry)
             geometry = tack.empty((positions.shape[0],), tack.vec(3, dtype))
-            tack.copyto(geometry, positions.astype(dtype.numpy_dtype))
+            tack.copyto(geometry, positions.astype(dtype.numpy_dtype, copy=False))
         geometry = Field(H1(topology), geometry, unit)
     if geometry.space.topology is not topology:
         raise ValueError("the geometry's space is on another topology")

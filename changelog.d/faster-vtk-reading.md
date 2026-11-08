@@ -16,3 +16,10 @@
   type is kept), and a merged read takes over the point data the merge made
   rather than copying it again: AhmedML's 14 fields convert in under 0.15 s,
   from 0.36, and the read's peak is 1.9 GB lower.
+- Reading a grid makes no copies it does not need: VTK's 64-bit offsets are
+  not copied into 64 bits again, cells are not chosen through an index array
+  when all are, inside-out cells are turned in a 32-bit copy of the
+  connectivity (as the topology keeps it) rather than a 64-bit one, and points
+  with no origin to subtract are copied once into the dataset's type rather
+  than first into doubles. AhmedML's 21.5M cells convert in 5.3-5.7 s, from
+  6.7-6.9, on jura; the dataset is the same bit for bit.
