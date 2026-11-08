@@ -43,6 +43,33 @@ def _place_counts(cells, count, per_cell):
         per_cell[cells[i]] = count[i]
 
 
+@tack.kernel
+def _listed_faces(starts, firsts, loc_faces, listed):
+    # Polyhedron p's faces as VTK lists them, its entries from starts[p], at firsts[p].
+    for p in range(starts.shape[0]):
+        s = starts[p]
+        f = firsts[p]
+        for k in range(firsts[p + 1] - f):
+            listed[f + k] = loc_faces[s + k]
+
+
+@tack.kernel
+def _ring_sizes(listed, face_offsets, sizes):
+    for r in range(listed.shape[0]):
+        f = listed[r]
+        sizes[r] = face_offsets[f + 1] - face_offsets[f]
+
+
+@tack.kernel
+def _ring_points_of(listed, face_offsets, ring_offsets, face_points, ring_points):
+    # Each ring's points, its face's as VTK stores them.
+    for r in range(listed.shape[0]):
+        s = face_offsets[listed[r]]
+        o = ring_offsets[r]
+        for j in range(ring_offsets[r + 1] - o):
+            ring_points[o + j] = face_points[s + j]
+
+
 def device_for(grid, options):
     """The device ``grid`` converts on here, or None for the host conversion: a
     ``vtkUnstructuredGrid``, copied, with no ``polyhedral`` and no merge tolerance,
@@ -87,13 +114,14 @@ def convert(grid, options, shift):
 def _convert(grid, options, shift, device):
     from vtkmodules.vtkCommonCore import vtkDataArray
 
+    from tack.algorithms.scan import exclusive_scan
     from tack.algorithms.sort import gather
     from tack.arrays import materialize, size_of
     from tack.dataset import H1, Constant, DataSet, Field, UnstructuredTopology, ids
     from tack.dataset.algorithms.merge_points import _equal_labels, _numbered_roots
     from tack.dataset.ghosts import Ghosts, hidden_by_points
     from tack.dataset.global_ids import GlobalIds
-    from tack.dataset.polyhedra import _match_rings_on, _ranges
+    from tack.dataset.polyhedra import _match_rings_on
     from tack.dataset.shapes import _BY_ID
     from tack.interop.vtk import (
         _GHOST_ARRAY,
@@ -168,27 +196,38 @@ def _convert(grid, options, shift, device):
         listed_cells = np.flatnonzero(types == 42)
         locations, faces = grid.polyhedron_face_locations, grid.polyhedron_faces
         loc_offsets = np.asarray(locations.offsets_array).astype(np.int64, copy=False)
-        loc_faces = np.asarray(locations.connectivity_array).astype(np.int64, copy=False)
-        face_offsets = np.asarray(faces.offsets_array).astype(np.int64, copy=False)
-        face_conn = np.asarray(faces.connectivity_array)
-        count = loc_offsets[listed_cells + 1] - loc_offsets[listed_cells]
-        listed = loc_faces[_ranges(loc_offsets[listed_cells], count)]
-        sizes = face_offsets[listed + 1] - face_offsets[listed]
-        ring_points = _upload(face_conn[_ranges(face_offsets[listed], sizes)], tack.i32,
-                              device)
-        del listed
+        loc_faces = np.asarray(locations.connectivity_array)
+        face_offsets = np.asarray(faces.offsets_array)
+        face_points = np.asarray(faces.connectivity_array)
+        if max(loc_faces.size, face_points.size) >= 2**31:
+            return None
+        starts = loc_offsets[listed_cells]
+        count = loc_offsets[listed_cells + 1] - starts
+        firsts = np.concatenate([[0], np.cumsum(count)]).astype(np.int64)
+        nrings = int(firsts[-1])
+        # The rings, each polyhedron's faces' points as VTK lists them, gathered
+        # there from VTK's face arrays (narrowed to 32 bits on the host first).
+        cell_rings = tack.array(firsts, tack.i64, device=device)
+        listed = tack.empty((nrings,), tack.i32)
+        _listed_faces(tack.array(starts, tack.i64, device=device), cell_rings,
+                      _upload(loc_faces, tack.i32, device), listed)
+        face_offsets_d = _upload(face_offsets, tack.i32, device)
+        sizes = tack.empty((nrings,), tack.i64)
+        _ring_sizes(listed, face_offsets_d, sizes)
+        ring_offsets = tack.empty((nrings + 1,), tack.i64)
+        total = int(exclusive_scan(sizes, ring_offsets, nrings, close=True))
+        del sizes
+        ring_points = tack.empty((total,), tack.i32)
+        _ring_points_of(listed, face_offsets_d, ring_offsets,
+                        _upload(face_points, tack.i32, device), ring_points)
+        del listed, face_offsets_d
         if kept is not None:
             ring_points = gather(new_id, ring_points)
-        ring_offsets = tack.array(np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64),
-                                  tack.i64, device=device)
-        del sizes
         out_offsets, out_points, cell_faces, sides, same_way = _match_rings_on(
             device, ring_offsets, ring_points)
         if same_way:
             return None                               # refused, or re-oriented: the host's
         negative = tack.empty((count.size,), tack.u8)
-        cell_rings = tack.array(np.concatenate([[0], np.cumsum(count)]).astype(np.int64),
-                                tack.i64, device=device)
         _negative_volumes(positions, cell_rings, ring_offsets, ring_points, negative)
         inside_out_polyhedra = int(np.count_nonzero(negative.numpy()))
         if inside_out_polyhedra and orient:
@@ -198,8 +237,6 @@ def _convert(grid, options, shift, device):
         _place_counts(tack.array(listed_cells, tack.i64, device=device),
                       tack.array(count.astype(np.int64), tack.i64, device=device), per_cell)
         cell_face_offsets = tack.empty((ncells + 1,), tack.i64)
-        from tack.algorithms.scan import exclusive_scan
-
         exclusive_scan(per_cell, cell_face_offsets, ncells, close=True)
         del per_cell
         # In the type the topology would choose for host arrays: a Tack array of i64
@@ -216,14 +253,14 @@ def _convert(grid, options, shift, device):
     if kinds:
         flags = tack.empty((ncells,), tack.u8)
         _suspect_frames(types_d, offsets_d, connectivity_d, positions, flags)
-        flagged = flags.numpy().astype(bool)
+        suspects = np.flatnonzero(flags.numpy())     # cells of these kinds alone
         del flags
+        suspect_kinds = types[suspects]
         for kind in kinds:
-            of_kind = np.flatnonzero(types == kind)
-            corners = int(offsets[of_kind[0] + 1] - offsets[of_kind[0]])
-            suspect = of_kind[flagged[of_kind]]
+            suspect = suspects[suspect_kinds == kind]
             if not suspect.size:
                 continue
+            corners = int(offsets[suspect[0] + 1] - offsets[suspect[0]])
             entries = offsets[suspect][:, None] + np.arange(corners)
             rows_d = gather(connectivity_d, tack.array(entries.reshape(-1), tack.i64,
                                                        device=device))
