@@ -133,6 +133,69 @@ class DeviceBuffer:
         raise NotImplementedError
 
 
+#: A host copy into a CPU buffer of at least this many bytes runs on several
+#: threads (`_host_copy`); a smaller one on the calling thread.
+_PARALLEL_COPY_BYTES = 32 << 20
+#: Each thread's least share of a parallel copy.
+_COPY_CHUNK_BYTES = 8 << 20
+#: At most this many threads copy: a few already take what memory gives (jura,
+#: 174M ids from i64 into fresh i32 pages: 1 thread 0.33 s, 4 0.09, 8 0.13).
+_COPY_THREADS = 8
+_copy_pool = None
+
+
+def _copy_threads():
+    import os
+    env = os.environ.get("TACK_CPU_THREADS")
+    cores = int(env) if env and env.isdigit() and int(env) > 0 else (os.cpu_count() or 1)
+    return max(1, min(_COPY_THREADS, cores))
+
+
+def _reset_copy_pool():
+    global _copy_pool
+    _copy_pool = None
+
+
+def _host_copy(dst: np.ndarray, src: np.ndarray):
+    """``np.copyto(dst, src)`` -- its ``same_kind`` casting, so a conversion such
+    as i64 to i32 happens in the copy -- for arrays of one shape, by up to
+    `_COPY_THREADS` threads of their own when it is large (NumPy leaves the GIL
+    while it copies). A new CPU buffer's pages are first touched here, so the
+    copy also spreads their faults; the buffer's range already has its NUMA
+    policy (`_interleave_range`), whichever thread touches it. On jura a 1 GB
+    copy into new pages took 0.31 s on one thread and 0.11-0.15 on 4-8."""
+    global _copy_pool
+    nbytes = max(dst.nbytes, src.nbytes)
+    threads = _copy_threads()
+    if (nbytes < _PARALLEL_COPY_BYTES or threads < 2 or dst.shape != src.shape
+            or not (dst.flags.c_contiguous and src.flags.c_contiguous)):
+        np.copyto(dst, src)
+        return
+    if not np.can_cast(src.dtype, dst.dtype, "same_kind"):
+        np.copyto(dst, src)                         # raises as it would
+        return
+    if _copy_pool is None:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+        _copy_pool = ThreadPoolExecutor(max_workers=_COPY_THREADS,
+                                        thread_name_prefix="tack-copy")
+        os.register_at_fork(after_in_child=_reset_copy_pool)
+    d, s = dst.reshape(-1), src.reshape(-1)
+    k = int(min(threads, max(1, nbytes // _COPY_CHUNK_BYTES)))
+    step = -(-d.size // k)
+    for done in [_copy_pool.submit(np.copyto, d[i * step:(i + 1) * step],
+                                   s[i * step:(i + 1) * step]) for i in range(k)]:
+        done.result()
+
+
+def _converts_in_copy(buffer, host: np.ndarray, numpy_dtype) -> bool:
+    """Whether ``host`` may go into ``buffer`` (of ``numpy_dtype``) unconverted, the
+    copy converting it (`_host_copy`): a CPU buffer, and a number type that
+    ``same_kind`` casting takes to ``numpy_dtype`` as ``astype`` would."""
+    return (type(buffer) is NumpyBuffer and host.dtype.kind in "biuf"
+            and np.can_cast(host.dtype, numpy_dtype, "same_kind"))
+
+
 class NumpyBuffer(DeviceBuffer):
     """CPU backend buffer — just a numpy array, uninitialized when new."""
 
@@ -144,7 +207,7 @@ class NumpyBuffer(DeviceBuffer):
     def from_numpy(self, arr: np.ndarray):
         # A reshaped array shares this buffer under another shape; the
         # element count already matches, so copy in the buffer's own shape.
-        np.copyto(self._data, arr.reshape(self._data.shape))
+        _host_copy(self._data, arr.reshape(self._data.shape))
 
     def to_numpy(self) -> np.ndarray:
         return self._data.copy()
@@ -1043,7 +1106,11 @@ def array(obj, dtype=None, *, device=None, layout=None) -> Array:
             raise ValueError(f"input shape {shape} must end with element shape {dtype.shape}")
         shape = shape[:-rank]
     out = empty(shape, dtype, device=device, layout=layout or "aos")
-    out._upload(host.astype(out.scalar_dtype.numpy_dtype, copy=False))
+    target = out.scalar_dtype.numpy_dtype
+    # Into the CPU's memory a conversion happens in the copy (`_host_copy`).
+    if not _converts_in_copy(out._buffer, host, target):
+        host = host.astype(target, copy=False)
+    out._upload(host)
     return out
 
 
@@ -1093,7 +1160,12 @@ def copyto(dst: Array, src):
                              f"of {dst.dtype} elements")
         _copy(src.reshape(src.size), dst.reshape(dst.size), dst.size)
         return
-    host = np.asarray(src, dtype=dst.scalar_dtype.numpy_dtype)
+    target = dst.scalar_dtype.numpy_dtype
+    # Into the CPU's memory a NumPy array's conversion happens in the copy
+    # (`_host_copy`), not in a converted copy made first.
+    if not (isinstance(src, np.ndarray) and _converts_in_copy(dst._buffer, src, target)):
+        src = np.asarray(src, dtype=target)
+    host = src
     expected = dst._host_shape
     if host.shape != expected:
         try:

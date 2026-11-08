@@ -762,9 +762,13 @@ def _oriented_connectivity(grid, orient, cells=None):
                       f"point inward{why}; vtk_to_dataset(..., orient=True) turns them outward",
                       stacklevel=4)
         return None
-    # Point ids in 32 bits where they fit, as the topology keeps them: VTK's are 64.
-    repaired = np.array(connectivity, dtype=np.int32 if grid.number_of_points < 2**31
+    # Point ids in 32 bits where they fit, as the topology keeps them: VTK's are 64,
+    # converted in a parallel copy (174M on AhmedML).
+    from tack.lang.array import _host_copy
+
+    repaired = np.empty(connectivity.shape, np.int32 if grid.number_of_points < 2**31
                         else connectivity.dtype)
+    _host_copy(repaired, np.ascontiguousarray(connectivity))
     for kind, (cells, corners) in inverted.items():
         rows = offsets[cells][:, None] + np.arange(corners)
         repaired[rows] = repaired[rows][:, list(_ORIENTATION[kind][1])]

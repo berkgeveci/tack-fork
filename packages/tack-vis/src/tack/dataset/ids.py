@@ -87,7 +87,7 @@ def as_ids(values, dtype, check=True):
         _check_fits(values)
     out = tack.empty(values.shape, dtype)
     if values.size:
-        tack.copyto(out, values.astype(dtype.numpy_dtype))
+        tack.copyto(out, values)                 # converted in the copy
     return out
 
 
