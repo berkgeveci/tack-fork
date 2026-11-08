@@ -105,13 +105,20 @@ def run_tack(grid, records, args):
     import tack
     import tack.dataset as td
     from tack.interop.vtk import vtk_to_dataset
+    from tack.interop.vtk._device_read import DEVICE_TYPES
 
     device = args.device
     sweep = Sweep(grid, args.only, args.warm, tack.sync)
+    # A discrete GPU converts there (VTK's arrays copied once, the work on the
+    # device): its "convert" includes the copy, and "to device" is what is left.
+    # The CPU and Metal convert on the host, as before, then move.
+    if tack.device(device).type in DEVICE_TYPES:
+        tack.set_default_device(device)
     t0 = time.perf_counter()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         data = vtk_to_dataset(grid, orient=True, merge_points=True)
+    tack.sync()
     records["convert"] = time.perf_counter() - t0
     del grid
     if device != "cpu":

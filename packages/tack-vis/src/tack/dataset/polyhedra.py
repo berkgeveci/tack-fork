@@ -1126,7 +1126,6 @@ def _match_rings(ring_offsets, ring_points):
     from the runs. A hash collision, or point ids past 32 bits, takes the host
     path. On AhmedML's 4.5M polyhedral rings, 0.12 s (0.5 the first call in a
     process) against its 0.75, the same arrays."""
-    from tack.dataset.buckets import _radix_order, run_firsts
     from tack.lang.types import from_numpy_dtype
 
     ring_offsets = np.ascontiguousarray(ring_offsets, np.int64)
@@ -1137,11 +1136,44 @@ def _match_rings(ring_offsets, ring_points):
     if n <= 0 or (ring_points.size and int(ring_points.max()) >= 2**32):
         return _match_rings_host(ring_offsets, ring_points)
     cpu = tack.device("cpu")
-    idt = ids.at_least(tack.i32, max(n, ring_points.size) + 1)
     with cpu:
         offsets = tack.array_from_ptr(ring_offsets, (n + 1,), tack.i64, device=cpu)
         points = tack.array_from_ptr(ring_points, (ring_points.size,),
                                      from_numpy_dtype(ring_points.dtype), device=cpu)
+        matched = _matched_rings(offsets, points, n)
+    if matched is None:
+        return _match_rings_host(ring_offsets, ring_points)
+    face_offsets, face_points, total, ring_face, ring_side, same_way = matched
+    return (face_offsets.numpy(), face_points.numpy()[:total], ring_face.numpy(),
+            ring_side.numpy(), same_way)
+
+
+def _match_rings_on(device, ring_offsets, ring_points):
+    """`_match_rings` over Tack arrays on ``device`` (``ring_offsets`` i64,
+    ``ring_points`` i32 or i64 ids below 2**32), by the same kernels there, its
+    arrays kept there: ``(face_offsets, face_points, ring_face, ring_side,
+    same_way)``. A hash collision takes the host path, its arrays then copied to
+    ``device``."""
+    n = size_of(ring_offsets) - 1
+    matched = _matched_rings(ring_offsets, ring_points, n) if n > 0 else None
+    if matched is None:
+        host = _match_rings_host(np.asarray(ring_offsets.numpy(), np.int64),
+                                 ring_points.numpy())
+        return (*(tack.array(a, device=device) for a in host[:4]), host[4])
+    face_offsets, face_points, total, ring_face, ring_side, same_way = matched
+    if total < size_of(face_points):                # no faces: the one-entry stand-in
+        face_points = tack.empty((0,), face_points.dtype, device=device)
+    return face_offsets, face_points, ring_face, ring_side, same_way
+
+
+def _matched_rings(offsets, points, n):
+    """`_match_rings`' kernels over ``n`` rings on the device their Tack arrays are on:
+    ``(face_offsets, face_points, total, ring_face, ring_side, same_way)``, the face
+    points' first ``total`` used, or None where two point sets share a key."""
+    from tack.dataset.buckets import _radix_order, run_firsts
+
+    idt = ids.at_least(tack.i32, max(n, size_of(points)) + 1)
+    with offsets.device:
         keys = tack.empty((n,), tack.vec2(tack.u64))
         _ring_keys(offsets, points, keys)
         order = _radix_order(keys, n, idt)
@@ -1149,7 +1181,7 @@ def _match_rings(ring_offsets, ring_points):
         collisions = tack.zeros((1,), tack.i32)
         _ring_run_starts(order, keys, offsets, points, starts, collisions)
         if int(collisions.numpy()[0]):
-            return _match_rings_host(ring_offsets, ring_points)
+            return None
         del keys
         owner = run_firsts(order, starts, idt)
         del order, starts
@@ -1164,13 +1196,12 @@ def _match_rings(ring_offsets, ring_points):
         _ring_numbers(offsets, owner, number, ring_face, ring_side, face_sizes)
         face_offsets = tack.empty((count + 1,), tack.i64)
         total = int(exclusive_scan(face_sizes, face_offsets, count, close=True))
-        face_points = tack.empty((max(total, 1),), from_numpy_dtype(ring_points.dtype))
+        face_points = tack.empty((max(total, 1),), points.dtype)
         _ring_face_points(offsets, points, owner, number, face_offsets, face_points)
         flags = tack.empty((n,), tack.i32)
         _rings_the_same_way(offsets, points, owner, flags)
         same_way = int(flags.numpy().sum())
-    return (face_offsets.numpy(), face_points.numpy()[:total], ring_face.numpy(),
-            ring_side.numpy(), same_way)
+    return face_offsets, face_points, total, ring_face, ring_side, same_way
 
 
 def _match_rings_host(ring_offsets, ring_points):

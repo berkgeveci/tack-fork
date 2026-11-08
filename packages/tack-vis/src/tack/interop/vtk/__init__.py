@@ -698,6 +698,43 @@ def _suspects(types, offsets, connectivity, x):
     return flags.numpy().astype(bool)
 
 
+def _negative_cells(kind, corners, first, corner):
+    """Which of some cells of VTK type ``kind`` (``corners`` each; ``first`` names one
+    in the error a cell that is not 3D raises) have a negative volume, summed over
+    their faces in f64 about their centre: ``corner`` is their corners' positions,
+    ``(cells, corners, 3)``. The decision `_oriented_connectivity` makes for the
+    cells its screen (`_suspect_frames`) flags, on any device's flags alike."""
+    import numpy as np
+
+    corner = np.asarray(corner).astype(np.float64)
+    centre = corner.mean(axis=1)
+    volume = np.zeros(corner.shape[0])
+    for ring in _face_tables(kind, corners, first):
+        ring_x = corner[:, ring] - centre[:, None]
+        middle = ring_x.mean(axis=1)
+        for j in range(len(ring)):
+            volume += np.einsum("ij,ij->i", middle,
+                                np.cross(ring_x[:, j], ring_x[:, (j + 1) % len(ring)]))
+    return volume < 0
+
+
+def _warn_inside_out(inverted, stacklevel):
+    """The warning for inside-out cells left as they are: ``inverted`` maps a VTK type
+    to ``(cells, corners)``."""
+    import warnings
+
+    count = sum(cells.size for cells, _ in inverted.values())
+    names = {10: "tetrahedra", 12: "hexahedra", 13: "wedges", 14: "pyramids"}
+    listed = ", ".join(f"{cells.size} {names[k]}" for k, (cells, _) in inverted.items())
+    why = ("; VTK's documentation gave the wedge the reverse order until March 2026 "
+           "(its code never did), so writers that followed it write wedges this way"
+           if 13 in inverted else "")
+    warnings.warn(f"{count} cells are inside out ({listed}): their corners are in the "
+                  "reverse of VTK's order, so their volumes are negative and their faces "
+                  f"point inward{why}; vtk_to_dataset(..., orient=True) turns them outward",
+                  stacklevel=stacklevel + 1)
+
+
 def _oriented_connectivity(grid, orient, cells=None):
     """The grid's connectivity with its inside-out cells turned outward, or ``None``
     where there is nothing to change. A cell is inside out when its corners are in
@@ -734,33 +771,13 @@ def _oriented_connectivity(grid, orient, cells=None):
         if not suspect.size:
             continue
         rows = connectivity[offsets[suspect][:, None] + np.arange(corners)]
-        corner = x[rows].astype(np.float64)                         # (cells, corners, 3)
-        centre = corner.mean(axis=1)
-        volume = np.zeros(suspect.size)
-        for ring in _face_tables(kind, corners, int(suspect[0])):
-            ring_x = corner[:, ring] - centre[:, None]
-            middle = ring_x.mean(axis=1)
-            for j in range(len(ring)):
-                volume += np.einsum("ij,ij->i", middle,
-                                    np.cross(ring_x[:, j], ring_x[:, (j + 1) % len(ring)]))
-        inside_out = suspect[volume < 0]
+        inside_out = suspect[_negative_cells(kind, corners, int(suspect[0]), x[rows])]
         if inside_out.size:
             inverted[kind] = (inside_out, corners)
     if not inverted:
         return None
-    count = sum(cells.size for cells, _ in inverted.values())
     if not orient:
-        import warnings
-
-        names = {10: "tetrahedra", 12: "hexahedra", 13: "wedges", 14: "pyramids"}
-        listed = ", ".join(f"{cells.size} {names[k]}" for k, (cells, _) in inverted.items())
-        why = ("; VTK's documentation gave the wedge the reverse order until March 2026 "
-               "(its code never did), so writers that followed it write wedges this way"
-               if 13 in inverted else "")
-        warnings.warn(f"{count} cells are inside out ({listed}): their corners are in the "
-                      "reverse of VTK's order, so their volumes are negative and their faces "
-                      f"point inward{why}; vtk_to_dataset(..., orient=True) turns them outward",
-                      stacklevel=4)
+        _warn_inside_out(inverted, stacklevel=4)
         return None
     # Point ids in 32 bits where they fit, as the topology keeps them: VTK's are 64,
     # converted in a parallel copy (174M on AhmedML).
@@ -1246,6 +1263,17 @@ def vtk_to_dataset(grid, dtype=_DEFAULT_FLOAT, polyhedral=None, orient=False, id
     be shared -- an origin to subtract, a type to convert, triangle strips,
     collapsed hexahedra, polyhedra -- is copied as before.
 
+    With a discrete GPU (CUDA, HIP, Level Zero) the default device, an unstructured
+    grid of linear shapes and polyhedra is converted there: VTK's arrays are copied
+    to the device once (ids narrowed to the topology's type on the host first) and
+    the merge of ``merge_points``, the screen and repair of inside-out cells and the
+    matching of polyhedra's faces run on it, giving the dataset the host conversion
+    gives, bit for bit (``_device_read``). What it does not do -- a merge with a
+    tolerance, ``polyhedral``, ``copy=False``, polylines or polygons, higher orders,
+    collapsed hexahedra to convert, polyhedra to turn outward -- the host conversion
+    does, its arrays then copied to the device. The CPU and Metal convert on the
+    host.
+
     A grid whose points, offsets, connectivity or data arrays are in a GPU's
     memory (VTK's device arrays, as ``array_to_vtk`` makes) is made on that
     device instead, whatever the default device (the default if it is of that
@@ -1687,6 +1715,14 @@ def _vtk_to_dataset(grid, dtype=tack.f32, polyhedral=None, orient=False, id_dtyp
         pieces = (grid.GetPartition(i) for i in range(grid.number_of_partitions))
         return PartitionedDataSet(vtk_to_dataset(piece, **options)
                                   for piece in pieces if piece is not None)
+    if isinstance(grid, vtkUnstructuredGrid) and not share:
+        # A discrete GPU the default device: VTK's arrays there once, the work
+        # there (``_device_read``), where it is what this conversion would do.
+        from tack.interop.vtk import _device_read
+
+        converted = _device_read.convert(grid, options, shift)
+        if converted is not None:
+            return converted
     # A merge's point data is the conversion's alone: taken over, not copied.
     merged = False
     if isinstance(grid, vtkUnstructuredGrid) and merge_points not in (None, False):
