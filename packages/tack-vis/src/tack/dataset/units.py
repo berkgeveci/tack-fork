@@ -29,7 +29,8 @@ unyt or pint quantity. A plain number is in the unit the parameter is in (the
 geometry's for a length, the field's for an isovalue), as before.
 
 unyt (with sympy) is imported on first use, so a program that gives no unit
-pays nothing. Tack hands out strings only, never unyt objects.
+pays nothing; nor does a pure number (``"dimensionless"``, ``"1"``), which
+Tack's own filters give their results. Tack hands out strings only, never unyt objects.
 """
 
 import math
@@ -42,6 +43,11 @@ __all__ = ["canonical", "check", "compatible", "conversion", "delta", "derived",
            "magnitude", "named", "quantity", "same"]
 
 _registry = None
+
+#: Spellings of a pure number, answered without unyt: Tack's own filters label
+#: their results with it (normals, fractions, qualities), and importing unyt with
+#: sympy for that cost a program that gives no unit half a second.
+_PURE = {"dimensionless": "dimensionless", "1": "dimensionless"}
 
 
 def _unyt():
@@ -75,7 +81,8 @@ def canonical(unit):
     if not unit.strip():
         raise ValueError("an empty unit: give 'dimensionless' for a pure number, or None "
                          "for unknown")
-    return str(_parsed(unit))
+    pure = _PURE.get(unit)
+    return pure if pure is not None else str(_parsed(unit))
 
 
 def conversion(source, target):
@@ -199,6 +206,8 @@ def dimensionless_or_none(what, unit):
     logarithm of metres, or of kilometres per metre, depends on the unit)."""
     if unit is None:
         return None
+    if unit in _PURE:
+        return "dimensionless"
     parsed = _parsed(unit)
     if parsed.is_dimensionless and parsed.base_value == 1.0:
         return "dimensionless"

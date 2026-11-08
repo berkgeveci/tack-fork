@@ -33,3 +33,8 @@
     device, rather than every owned cell's measure copied to the host: on CUDA
     0.06 s from 0.17 for AhmedML (jura). A device without f64 sums it on the
     host as before.
+  - A pure number's unit (`"dimensionless"`, `"1"`), which filters give
+    their results (`cell_quality`, `surface_normals`, `voxelize`), is
+    answered without unyt: a program that gives no unit no longer imports
+    unyt and sympy at its first such filter, half a second
+    (`cell_quality`'s first call on AhmedML 0.58 s to 0.25).

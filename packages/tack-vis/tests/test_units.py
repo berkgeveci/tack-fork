@@ -626,3 +626,19 @@ def test_parameters_that_bring_their_own_units():
     b = td.advect(data, "v", seeds, 0.01, 3)
     np.testing.assert_array_equal(a.positions(), b.positions())
     assert a.fields["time"].unit == "s"
+
+
+def test_a_pure_number_needs_no_unyt():
+    """Tack's filters label their results "dimensionless"; a program that gives
+    no unit of its own must not import unyt (and sympy) for that."""
+    import subprocess
+    import sys
+    code = ("import sys, tack.dataset.units as u\n"
+            "assert u.canonical('dimensionless') == 'dimensionless'\n"
+            "assert u.canonical('1') == 'dimensionless'\n"
+            "assert u.dimensionless_or_none('log', '1') == 'dimensionless'\n"
+            "assert u.same('dimensionless', 'dimensionless')\n"
+            "print('unyt' in sys.modules)\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         check=True)
+    assert out.stdout.strip() == "False"
