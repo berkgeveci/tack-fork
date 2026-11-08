@@ -419,8 +419,8 @@ def clip_mixed(data, values, iso, inside, fields):
                 _polyhedra_kept(group.view(), values, iso, whole, cut)
     # The input's point and cell ids ride along as fields, through both parts.
     marked = DataSet(t, data.geometry, fields={
-        "point": Field(Values(data, "points"), tack.arange(data.num_points, dtype=idt)),
-        "cell": Field(Values(data, "cells"), tack.arange(n, dtype=idt)),
+        "point": Field(Values(data, "points"), arrays.CountingArray(data.num_points, dtype=idt)),
+        "cell": Field(Values(data, "cells"), arrays.CountingArray(n, dtype=idt)),
         "value": Field(Values(data, "points"), values)}, **data._frame())
     shaped = _keep_cells(marked, whole, shapes_only=True)      # whole cells are shapes
     kept_ids = arrays.materialize(shaped.fields["point"].values)

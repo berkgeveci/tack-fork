@@ -17,7 +17,9 @@
     "changed" flag once a pass, not by an atomic from every thread: 0.17 s
     from 0.96 for 10.7M cells (4.2 s the first time).
   - `clip` of polyhedra beside shapes skips polyhedra with nothing to keep:
-    0.17 s from 0.30.
+    0.17 s from 0.30. The input's point and cell ids it carries through are
+    counting arrays, not ranges made on the host and copied to the device:
+    on CUDA 0.10 s from 0.33 (jura), on the CPU 0.83 from 1.07.
   - Deriving faces and edges: the bucket sort's scatter moves each key beside
     its index (`buckets.sorted_key_order`), so the sort and the runs read a
     bucket's keys together rather than at random, and the edges of polyhedra
