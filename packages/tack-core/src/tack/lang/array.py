@@ -1176,6 +1176,44 @@ def copyto(dst: Array, src):
     dst._upload(host)
 
 
+#: An integer `arange` of at least this many values is filled by a kernel where
+#: the array lives, not made by NumPy on the host and copied there.
+_ARANGE_KERNEL_MIN = 1 << 16
+
+
+def _arange_on_device(start, stop, step, dtype, device):
+    """`arange` of integers, ``i32`` or ``i64``, filled by a kernel on ``device`` --
+    in parallel on the CPU, with no copy to a GPU -- or None for NumPy's way: a
+    short range, floats (whose rounding NumPy's arange defines), another type, or
+    values ``dtype`` cannot hold. Its type without ``dtype`` is the host's: i32
+    unless an end needs i64. On a GPU the host's way filled 22M ids with NumPy,
+    converted and copied them: 0.22 s of a 0.31 s clip on jura."""
+    if not all(isinstance(v, (int, np.integer)) and not isinstance(v, (bool, np.bool_))
+               for v in (start, stop, step)):
+        return None
+    start, stop, step = int(start), int(stop), int(step)
+    if step == 0:
+        return None                                  # NumPy's error
+    n = len(range(start, stop, step))
+    if n < _ARANGE_KERNEL_MIN:
+        return None
+    last = start + step * (n - 1)
+    fits = integer_type_for_value(start) is i32 and integer_type_for_value(last) is i32
+    if dtype is None:
+        dtype = i32 if fits else i64
+    else:
+        dtype = as_dtype(dtype)
+        if dtype not in (i32, i64) or (dtype == i32 and not fits):
+            return None
+        if dtype == i64 and not all(-2**63 <= v < 2**63 for v in (start, last)):
+            return None
+    from tack.algorithms.copy import _affine_kernel
+    out = empty((n,), dtype, device=device)
+    with out.device:
+        _affine_kernel(out, np.int64(start), np.int64(step), n)
+    return out
+
+
 def arange(start, stop=None, step=1, dtype=None, *, device=None) -> Array:
     """Evenly spaced values in ``[start, stop)``, as ``np.arange``.
 
@@ -1184,6 +1222,9 @@ def arange(start, stop=None, step=1, dtype=None, *, device=None) -> Array:
     """
     if stop is None:
         start, stop = 0, start
+    filled = _arange_on_device(start, stop, step, dtype, device)
+    if filled is not None:
+        return filled
     values = np.arange(start, stop, step)
     if dtype is None:
         dtype = _host_dtype(values, [start, stop, step])

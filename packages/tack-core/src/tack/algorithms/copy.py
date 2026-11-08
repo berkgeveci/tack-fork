@@ -28,6 +28,13 @@ def _fill_kernel(dst, val, n):
 
 
 @tack.kernel
+def _affine_kernel(dst, start, step, n):
+    """dst[i] = start + step * i: an integer range, in i64 and stored as dst's type."""
+    for i in range(n):
+        dst[i] = start + step * tack.i64(i)
+
+
+@tack.kernel
 def _copy_offset_kernel(src, dst, dst_offset, n):
     """Copy n elements from src into dst starting at dst_offset."""
     for i in range(n):
