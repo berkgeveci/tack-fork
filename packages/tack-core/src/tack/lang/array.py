@@ -1205,8 +1205,8 @@ def _arange_on_device(start, stop, step, dtype, device):
         dtype = as_dtype(dtype)
         if dtype not in (i32, i64) or (dtype == i32 and not fits):
             return None
-        if dtype == i64 and not all(-2**63 <= v < 2**63 for v in (start, last)):
-            return None
+    if dtype == i64 and not all(-2**63 <= v < 2**63 for v in (start, last)):
+        return None                              # NumPy's way, as for any other type
     from tack.algorithms.copy import _affine_kernel
     out = empty((n,), dtype, device=device)
     with out.device:

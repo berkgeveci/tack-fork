@@ -197,6 +197,34 @@ def test_arange_follows_numpy(backend):
     assert tack.arange(0).shape == (0,)
 
 
+@pytest.mark.parametrize("args, dtype, expected", [
+    ((70_000,), None, tack.i32),
+    ((5, 300_005, 3), None, tack.i32),
+    ((200_000, -5, -2), None, tack.i32),
+    ((2**31 - 5, 2**31 + 70_000), None, tack.i64),             # an end needs i64
+    ((-(2**33), -(2**33) + 70_000), tack.i64, tack.i64),
+    ((10, 80_000), tack.i64, tack.i64),
+])
+def test_a_long_integer_arange_is_numpys(backend, args, dtype, expected):
+    """A long integer range is filled by a kernel on its device
+    (`_arange_on_device`): the values and the type NumPy's way gives."""
+    from tack.lang.array import _ARANGE_KERNEL_MIN
+    values = tack.arange(*args, dtype=dtype)
+    assert values.size >= _ARANGE_KERNEL_MIN and values.dtype is expected
+    np.testing.assert_array_equal(values.numpy(), np.arange(*args))
+
+
+def test_ranges_a_kernel_does_not_fill_go_numpys_way(backend):
+    from tack.lang.array import _arange_on_device
+    assert _arange_on_device(0, 100, 1, None, None) is None              # short
+    assert _arange_on_device(0.0, 1e5, 1.0, None, None) is None          # floats
+    assert _arange_on_device(0, 70_000, 1, tack.u32, None) is None       # another type
+    assert _arange_on_device(0, 2**31 + 70_000, 1, tack.i32, None) is None
+    above = np.uint64(2**63)                       # past i64, with or without a dtype
+    assert _arange_on_device(above, above + np.uint64(70_000), 1, None, None) is None
+    assert _arange_on_device(above, above + np.uint64(70_000), 1, tack.i64, None) is None
+
+
 @pytest.mark.parametrize("make, value", [
     (tack.zeros_like, 0), (tack.ones_like, 1), (lambda p: tack.full_like(p, 4), 4),
 ])
