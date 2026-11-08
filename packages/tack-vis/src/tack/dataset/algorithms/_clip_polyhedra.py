@@ -315,11 +315,19 @@ def _whole_or_cut(cells, values, iso, whole, cut):
 
 
 @tack.kernel
-def _every_cell(cells, whole, cut):
+def _polyhedra_kept(cells, values, iso, whole, cut):
+    # A polyhedron takes the polyhedral path (never whole) when any point is
+    # strictly above; one with none keeps nothing and is gone, as a shape is --
+    # most of a mesh's polyhedra, for a cut far from where they cluster (AhmedML's
+    # 508K went through clip_parts every time).
     for c in cells:
+        above = 0
+        for j in range(cells.num_points(c)):
+            if values[cells.point_id(c, j)] > iso:
+                above = 1
         e = cells.entity_id(c)
         whole[e] = 0
-        cut[e] = 1
+        cut[e] = above
 
 
 @tack.kernel
@@ -408,7 +416,7 @@ def clip_mixed(data, values, iso, inside, fields):
             if group.shape.REFERENCE:
                 _whole_or_cut(group.view(), values, iso, whole, cut)
             else:
-                _every_cell(group.view(), whole, cut)
+                _polyhedra_kept(group.view(), values, iso, whole, cut)
     # The input's point and cell ids ride along as fields, through both parts.
     marked = DataSet(t, data.geometry, fields={
         "point": Field(Values(data, "points"), tack.arange(data.num_points, dtype=idt)),

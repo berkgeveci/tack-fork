@@ -171,6 +171,240 @@ def _polyline_integrals(cells, u, out):
         out[cells.entity_id(c)] = total / 2.0
 
 
+# ── Integrals as weighted sums ──────────────────────────────────────
+#
+# A field linear in its points' values (order-1 point data) has the integral
+# sum_p u_p W_p, W_p the integral of point p's shape function over its cells; cell
+# data has sum_c u_c |c|. The weights depend on the mesh alone: one quadrature
+# makes them, and each field is then a dot product (``_weights``), rather than a
+# quadrature of its own per field (14 of them took 13.6 s on AhmedML).
+
+@tack.kernel
+def _corner_weights(cells, points, weights, start, mask, out):
+    # Each corner's share of its cell's integral of a field linear in its points'
+    # values: its shape function's integral, the quadrature's weights times the
+    # measure element times the shape function; 0 for a cell ``mask`` drops.
+    for c in cells:
+        first = start + cells.index(c) * cells.NUM_POINTS
+        for j in range(cells.NUM_POINTS):
+            out[first + j] = weights[0] * 0.0
+        if mask[cells.entity_id(c)] != 0:
+            for q in range(weights.shape[0]):
+                d = weights[q] * _element(cells.geometry_jacobian(c, points[q]), cells.DIMENSION)
+                for j in range(cells.NUM_POINTS):
+                    out[first + j] += d * cells.shape_function(j, points[q])
+
+
+@tack.func
+def _local(cells, c, p):
+    """Point ``p``'s place among cell ``c``'s points."""
+    at = 0
+    for j in range(cells.num_points(c)):
+        if cells.point_id(c, j) == p:
+            at = j
+    return at
+
+
+@tack.kernel
+def _polyhedron_corner_weights(cells, corners, start, mask, out):
+    # ``_polyhedron_integrals``' weight on each of the cell's points: each
+    # sub-tetrahedron's volume over 4 to each of its corners, the cell point's
+    # share spread evenly over the cell's points and a face point's over its face's.
+    for c in cells:
+        first = start + corners[cells.index(c)]
+        n = cells.num_points(c)
+        origin = cells.point_position(cells.point_id(c, 0))
+        zero = origin[0] - origin[0]
+        for j in range(n):
+            out[first + j] = zero
+        if mask[cells.entity_id(c)] != 0:
+            xc = origin - origin
+            for j in range(n):
+                xc += cells.point_position(cells.point_id(c, j)) - origin
+            xc = xc / n
+            centre = zero
+            for k in range(cells.num_faces(c)):
+                size = cells.side_num_points(c, k)
+                xf = origin - origin
+                for j in range(size):
+                    xf += cells.side_position(c, k, j) - origin
+                xf = xf / size
+                face = zero
+                for j in range(size):
+                    nxt = j + 1 if j + 1 < size else 0
+                    a = cells.side_position(c, k, j) - origin - xc
+                    b = cells.side_position(c, k, nxt) - origin - xc
+                    w = a.dot(b.cross(xf - xc)) / 24.0
+                    centre += w
+                    face += w
+                    out[first + _local(cells, c, cells.side_point_id(c, k, j))] += w
+                    out[first + _local(cells, c, cells.side_point_id(c, k, nxt))] += w
+                for j in range(size):
+                    out[first + _local(cells, c, cells.side_point_id(c, k, j))] += face / size
+            for j in range(n):
+                out[first + j] += centre / n
+
+
+@tack.kernel
+def _polygon_corner_weights(cells, corners, start, mask, out):
+    # ``_polygon_integrals``' weight on each of the polygon's points: each fan
+    # triangle's signed area over 3 to each of its corners, the cell point's share
+    # spread evenly over the polygon's points.
+    for c in cells:
+        first = start + corners[cells.index(c)]
+        n = cells.num_points(c)
+        origin = cells.side_position(c, 0, 0)
+        zero = origin[0] - origin[0]
+        for j in range(n):
+            out[first + j] = zero
+        if mask[cells.entity_id(c)] != 0:
+            normal = origin - origin
+            for k in range(cells.num_faces(c)):
+                normal += (cells.side_position(c, k, 0) - origin).cross(
+                    cells.side_position(c, k, 1) - origin)
+            length = normal.norm()
+            unit = normal / length if length > 0.0 else normal
+            xc = origin - origin
+            for j in range(n):
+                xc += cells.point_position(cells.point_id(c, j)) - origin
+            xc = xc / n
+            centre = zero
+            for k in range(cells.num_faces(c)):
+                a = cells.side_position(c, k, 0) - origin - xc
+                b = cells.side_position(c, k, 1) - origin - xc
+                w = _signed_twice_area(a, b, unit) / 6.0
+                centre += w
+                out[first + _local(cells, c, cells.side_point_id(c, k, 0))] += w
+                out[first + _local(cells, c, cells.side_point_id(c, k, 1))] += w
+            for j in range(n):
+                out[first + j] += centre / n
+
+
+@tack.kernel
+def _owned_cells(marks, skipped, mask):
+    for c in range(mask.shape[0]):
+        mask[c] = 1 if (marks[c] & skipped) == 0 else 0
+
+
+@tack.kernel
+def _masked(values, mask, out):
+    for c in range(out.shape[0]):
+        out[c] = values[c] if mask[c] != 0 else values[c] * 0.0
+
+
+@tack.kernel
+def _weighted_chunks(values, weights, chunk, n, out):
+    # Each chunk of ``chunk`` entries' sum of value times weight, accumulated in
+    # ``out``'s type (f64 where the device has it).
+    for k in range(out.shape[0]):
+        total = out[k] * 0.0
+        for i in range(k * chunk, min((k + 1) * chunk, n)):
+            total += values[i] * weights[i]
+        out[k] = total
+
+
+#: Entries a chunk of ``_weighted_chunks``: its sums go to the host, summed there in f64.
+_CHUNK = 4096
+
+
+def _weighted_sum(values, weights):
+    """``sum_i values[i] weights[i]`` as a float (or an array, for vector values): by
+    chunks on the device, in f64 where it has it, then in f64 on the host."""
+    from tack.runtime.dispatch import get_backend
+
+    n = arrays.size_of(values)
+    width = arrays.width_of(values)
+    acc = tack.f64 if get_backend().supports_f64 else arrays.dtype_of(values)
+    chunks = max(-(-n // _CHUNK), 1)
+    out = tack.zeros((chunks,), tack.vec(width, acc) if width else acc)
+    if n:
+        _weighted_chunks(values, weights, _CHUNK, n, out)
+    return np.asarray(out.numpy(), np.float64).sum(axis=0)
+
+
+class _Weights:
+    """The weights ``integrate`` takes fields' integrals by, made on first use: each
+    cell's measure for cell data, each point's shape function's integral for point
+    data; cells not owned (ghost marks) or below the mesh's dimension weigh 0.
+    ``None`` from ``points`` where a group's cells are not ones it weighs (a
+    polyhedral topology's: their integrals take ``_no_reference_values``)."""
+
+    def __init__(self, data, measures):
+        self.data = data
+        self.measures = measures            # top cells' measures (_top_cells)
+        self._mask = self._points = self._cells = None
+
+    def mask(self):
+        if self._mask is None:
+            data = self.data
+            mask = tack.empty((data.num_cells,), tack.u8)
+            ghosts = data.ghosts
+            if ghosts is not None and ghosts.cells is not None:
+                from tack.dataset.ghosts import Ghosts
+
+                if data.num_cells:
+                    _owned_cells(ghosts.cells, int(Ghosts.SKIPPED_CELLS), mask)
+            else:
+                mask.fill(1)
+            self._mask = _top_cells(data, mask)
+        return self._mask
+
+    def cells(self):
+        if self._cells is None:
+            measures = self.measures
+            self._cells = tack.empty((arrays.size_of(measures),), arrays.dtype_of(measures))
+            if self.data.num_cells:
+                _masked(measures, self.mask(), self._cells)
+        return self._cells
+
+    def points(self):
+        if self._points is None:
+            self._points = self._point_weights()
+        return self._points
+
+    def _point_weights(self):
+        from tack.algorithms import segment_reduce
+        from tack.arrays import Permutation
+        from tack.dataset.topology import (
+            StructuredTopology,
+            UnstructuredTopology,
+            corner_layout,
+            polyhedral_corners,
+        )
+
+        data = self.data
+        topology = data.topology
+        if (not isinstance(topology, (UnstructuredTopology, StructuredTopology))
+                or not isinstance(data.geometry.space, H1)):
+            return None
+        top = topology.dimension
+        start_of, total = corner_layout(topology)
+        corners = tack.zeros((max(total, 1),), data.dtype)
+        mask = self.mask()
+        for group in data.launch_groups("cells", []):
+            if not group.count or group.shape.DIMENSION != top:
+                continue                                  # weighs nothing
+            cells = data.domain_view("cells", group)
+            start = start_of[group.root]
+            if group.shape.REFERENCE:
+                n = _per_axis(group.shape, _points_per_axis(data, 1, group.shape))
+                _corner_weights(cells, *_tables(data, group.shape, n), start, mask, corners)
+            elif group.shape.DIMENSION == 3:
+                _polyhedron_corner_weights(cells, polyhedral_corners(topology)[0], start, mask,
+                                           corners)
+            elif group.shape.DIMENSION == 2:
+                _polygon_corner_weights(cells, polyhedral_corners(topology)[0], start, mask,
+                                        corners)
+            else:
+                return None
+        weights = tack.zeros((data.num_points,), data.dtype)
+        if total and data.num_points:
+            offsets, entries = topology.point_links()
+            segment_reduce(Permutation(entries, corners), offsets, op="sum", out=weights,
+                           empty="keep")
+        return weights
+
+
 def quadrature(shape, n):
     """``(points, weights)``: ``n``-point Gauss-Legendre rules along each axis of
     ``shape``'s reference element, collapsed onto a simplex (Duffy: the triangle
@@ -280,12 +514,15 @@ def _cell_values(data, field):
     width = arrays.width_of(field.values)
     dtype = arrays.dtype_of(field.values)
     out = tack.zeros((data.num_cells,), tack.vec(width, dtype) if width else dtype)
-    n = _points_per_axis(data, _order(field.space))
+    order = _order(field.space)
     top = data.topology.dimension
     for group in data.launch_groups("cells", [field]):
         if group.count and group.shape.DIMENSION == top:
+            # The fewest points exact for the shape (2 an axis on a hexahedron for
+            # order 1, not the 4 a collapsed rule needs).
+            n = _per_axis(group.shape, _points_per_axis(data, order, group.shape))
             _cell_integrals(data.domain_view("cells", group), field.view(group),
-                            *_tables(data, group.shape, _per_axis(group.shape, n)), out)
+                            *_tables(data, group.shape, n), out)
     return out
 
 
@@ -337,14 +574,14 @@ def _mixed_cell_values(data, field, measures):
     dtype = arrays.dtype_of(field.values)
     out = tack.zeros((data.num_cells,), tack.vec(width, dtype) if width else dtype)
     values = arrays.materialize(field.values)
-    n = _points_per_axis(data, _order(space))
+    order = _order(space)
     for group in data.launch_groups("cells", [field]):
         if not group.count:
             continue
         cells = data.domain_view("cells", group)
         if group.shape.REFERENCE:
-            _cell_integrals(cells, field.view(group),
-                            *_tables(data, group.shape, _per_axis(group.shape, n)), out)
+            n = _per_axis(group.shape, _points_per_axis(data, order, group.shape))
+            _cell_integrals(cells, field.view(group), *_tables(data, group.shape, n), out)
         elif isinstance(space, Constant):
             _times_measures(cells, values, measures, out)
         elif group.shape.DIMENSION == 3:
@@ -367,11 +604,20 @@ def _piece(data, names):
     measure = float(np.sum(np.asarray(owned_values(data, measures).numpy(), np.float64)))
     values = {}
     field_units = {}
+    weights = _Weights(data, measures.values)
     for (name, _), field in zip(names, given):
         field = _field(data, field)
         field_units[name] = field.unit
         if not getattr(data.topology, "reference_cells", True):
             field = field.space.stored(field, data)
+        # Point data and cell data: a weighted sum of their values.
+        space = _with_basis(data, field).space
+        if _on_points(space) and weights.points() is not None:
+            values[name] = _weighted_sum(arrays.materialize(field.values), weights.points())
+            continue
+        if isinstance(space, Constant) or (isinstance(space, Values) and space.on == "cells"):
+            values[name] = _weighted_sum(arrays.materialize(field.values), weights.cells())
+            continue
         if data.topology.mixed:
             # Polyhedra beside the shapes: each group its own way, cell by cell.
             per_cell = _top_cells(data, _mixed_cell_values(data, field, measures.values))

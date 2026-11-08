@@ -231,3 +231,26 @@ def test_a_linear_fields_point_gradients_stay_exact_beside_a_tangled_hexahedron(
     data.fields["v"] = td.Field(td.H1(data), tack.array(x @ np.array([1.0, -2.0, 3.0]) + 4))
     np.testing.assert_allclose(td.gradients(data, "v", at="points").values.numpy(),
                                np.tile([1.0, -2.0, 3.0], (data.num_points, 1)), atol=1e-12)
+
+
+@pytest.mark.parametrize("make", ["distorted", "mixed", "tangled"])
+def test_a_vectors_point_gradients_are_its_components(make):
+    """A 3-vector's point gradients (straight hexahedra's corners all three components
+    from one Jacobian inverse) are its components' scalar point gradients, row by
+    row: on a distorted mesh of hexahedra, with polyhedra beside them, and with a
+    tangled hexahedron (its Green-Gauss gradient at every corner)."""
+    from test_mixed_cells import _located
+
+    if make == "tangled":
+        data = _tangled()
+    else:
+        shaped, mixed, _, _, _ = _located(distorted=True)
+        data = mixed if make == "mixed" else shaped
+    x = data.positions()
+    v = np.c_[np.sin(x[:, 0]) * x[:, 1], x[:, 2] ** 2, np.cos(x[:, 1]) + x[:, 0]]
+    data.fields["v"] = td.Field(td.H1(data), tack.array(v, tack.vec3(tack.f64)))
+    got = td.gradients(data, "v", at="points").values.numpy().reshape(-1, 9)
+    for k in range(3):
+        data.fields[f"v{k}"] = td.Field(td.H1(data), tack.array(np.ascontiguousarray(v[:, k])))
+        row = td.gradients(data, f"v{k}", at="points").values.numpy().reshape(-1, 3)
+        np.testing.assert_allclose(got[:, 3 * k:3 * k + 3], row, rtol=1e-12, atol=1e-12)

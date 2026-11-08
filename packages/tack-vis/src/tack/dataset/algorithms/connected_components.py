@@ -53,7 +53,10 @@ def _hook(cell_of, members, ncells, hidden, labels, changed):
             b = labels[ncells + members[e]]
             if a != b:
                 tack.atomic_min(labels, max(a, b), min(a, b))
-                tack.atomic_max(changed, 0, 1)
+                # Set once a pass: an atomic on one counter from every hook was half
+                # a pass's time on a CPU's cores (0.5 of 0.6 s, AhmedML's 10.7M cells).
+                if changed[0] == 0:
+                    tack.atomic_max(changed, 0, 1)
 
 
 @tack.kernel
@@ -85,7 +88,8 @@ def _hook_near(grid, ncells, used, r, labels, changed):
                                     c = labels[ncells + p]
                                     if a != c:
                                         tack.atomic_min(labels, max(a, c), min(a, c))
-                                        tack.atomic_max(changed, 0, 1)
+                                        if changed[0] == 0:
+                                            tack.atomic_max(changed, 0, 1)
 
 
 @tack.kernel

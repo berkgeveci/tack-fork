@@ -14,7 +14,7 @@ import tack
 from tack.dataset import shapes
 from tack.dataset.algorithms._common import _table
 from tack.dataset.dataset import Field
-from tack.dataset.spaces import Values
+from tack.dataset.spaces import H1, Values
 from tack.runtime.dispatch import get_backend, on_inputs_device
 
 __all__ = ['cell_quality']
@@ -87,12 +87,12 @@ def _samples(shape):
             if turn > 1e-9:
                 break
         directions = (pcs[list(order)] - pcs[k]).T
-        out.append((pcs[k], directions, w, True))
+        out.append((pcs[k], directions, w, True, list(order)))
     if shape in (shapes.Hexahedron, shapes.Voxel):
         # The principal axes at the center: Verdict's ninth sample of a hexahedron.
-        out.append((np.full(3, 0.5), np.eye(3), np.eye(3), False))
+        out.append((np.full(3, 0.5), np.eye(3), np.eye(3), False, []))
     rows = []
-    for pc, directions, w, corner in out:
+    for pc, directions, w, corner, neighbours in out:
         d = np.zeros((3, 3))
         d[:, :dim] = directions
         if dim == 2:
@@ -104,7 +104,8 @@ def _samples(shape):
         else:
             scale = np.linalg.det(w) / np.prod(np.linalg.norm(w, axis=0))
             inverse = np.linalg.inv(w)
-        rows.append((pc, d, 1.0 / scale, inverse, corner))
+        rows.append((pc, d, 1.0 / scale, inverse, corner,
+                     [*neighbours, -1, -1, -1][:3]))
     return rows, edges
 
 
@@ -124,7 +125,8 @@ def _tables(shape, dtype):
             tack.array(np.array([r[2] for r in rows]).astype(f)),
             tack.array(np.concatenate([r[3].reshape(-1) for r in rows]).astype(f)),
             tack.array(np.array([1 if r[4] else 0 for r in rows], np.int32)),
-            tack.array(np.array(edges, np.int32).reshape(-1)))
+            tack.array(np.array(edges, np.int32).reshape(-1)),
+            tack.array(np.array([r[5] for r in rows], np.int32).reshape(-1)))
     return _TABLES[key]
 
 
@@ -163,8 +165,12 @@ def _corner_ratio(least, most, big):
 
 
 @tack.kernel
-def _reference_quality(cells, dim, pcs, directions, norms, inverses, corner, big, sj, ratio,
-                       cond):
+def _reference_quality(cells, dim, pcs, directions, norms, inverses, corner, neighbours,
+                       straight, big, conditioning, sj, ratio, cond):
+    # ``conditioning`` 0: the condition number is not asked for (nor computed; its
+    # 3x3 inverses at nine samples were most of a hexahedron's time). ``straight``
+    # 1: an order-1 geometry, whose corner samples' edges are its corners'
+    # differences (``neighbours``), what the Jacobian there gives, without it.
     for c in cells:
         e = cells.entity_id(c)
         worst = big
@@ -178,14 +184,24 @@ def _reference_quality(cells, dim, pcs, directions, norms, inverses, corner, big
             normal = middle @ tack.vec3(1.0, 0.0, 0.0)
             normal = _unit(normal.cross(middle @ tack.vec3(0.0, 1.0, 0.0)))
         for k in range(norms.shape[0]):
-            j = cells.geometry_jacobian(c, tack.vec3(pcs[3 * k], pcs[3 * k + 1], pcs[3 * k + 2]))
-            a0 = _column(directions, k, 0, j)
-            a1 = _column(directions, k, 1, j)
+            if straight == 1 and corner[k] == 1:
+                here = cells.corner_position(c, k)
+                a0 = cells.corner_position(c, neighbours[3 * k]) - here
+                a1 = cells.corner_position(c, neighbours[3 * k + 1]) - here
+                a2 = a0
+                if dim == 3:
+                    a2 = cells.corner_position(c, neighbours[3 * k + 2]) - here
+            else:
+                j = cells.geometry_jacobian(c, tack.vec3(pcs[3 * k], pcs[3 * k + 1],
+                                                         pcs[3 * k + 2]))
+                a0 = _column(directions, k, 0, j)
+                a1 = _column(directions, k, 1, j)
+                a2 = a0
+                if dim == 3:
+                    a2 = _column(directions, k, 2, j)
             det = 0.0
             lengths = a0.norm() * a1.norm()
-            a2 = a0
             if dim == 3:
-                a2 = _column(directions, k, 2, j)
                 det = a0.dot(a1.cross(a2))
                 lengths = lengths * a2.norm()
             else:
@@ -199,7 +215,9 @@ def _reference_quality(cells, dim, pcs, directions, norms, inverses, corner, big
             # ideal cell's: |T| |T^-1| / dim (Frobenius norms), infinite where T
             # is singular or inverted.
             w = _matrix(inverses, k)
-            if dim == 3:
+            if conditioning == 0:
+                pass
+            elif dim == 3:
                 t = tack.mat3([a0[0], a1[0], a2[0]], [a0[1], a1[1], a2[1]],
                               [a0[2], a1[2], a2[2]]) @ w
                 d = t.determinant()
@@ -273,7 +291,7 @@ def _tet_condition(p0, p1, p2, p3, w, big):
 
 
 @tack.kernel
-def _pyramid_quality(cells, norms, inverses, big, sj, ratio, cond):
+def _pyramid_quality(cells, norms, inverses, big, conditioning, sj, ratio, cond):
     for c in cells:
         e = cells.entity_id(c)
         worst = big
@@ -305,15 +323,16 @@ def _pyramid_quality(cells, norms, inverses, big, sj, ratio, cond):
             worst = min(worst, scaled * norms[k])
             least = min(least, det)
             most = max(most, det)
-            conditioned = max(conditioned, _tet_condition(p0, p1, p2, p3, _matrix(inverses, k),
-                                                          big))
+            if conditioning == 1:
+                conditioned = max(conditioned, _tet_condition(p0, p1, p2, p3,
+                                                              _matrix(inverses, k), big))
         sj[e] = worst
         cond[e] = conditioned
         ratio[e] = _corner_ratio(least, most, big)
 
 
 @tack.kernel
-def _polyhedron_quality(cells, w, big, sj, ratio, cond):
+def _polyhedron_quality(cells, w, big, conditioning, sj, ratio, cond):
     for c in cells:
         # The fan tetrahedra polyhedra are evaluated in: each face fanned from its
         # points' mean, the faces from the cell's points' mean.
@@ -340,8 +359,9 @@ def _polyhedron_quality(cells, w, big, sj, ratio, cond):
                 worst = min(worst, scaled)
                 least = min(least, det)
                 most = max(most, det)
-                conditioned = max(conditioned, _tet_condition(center, a, b, apex,
-                                                              _matrix(w, 0), big))
+                if conditioning == 1:
+                    conditioned = max(conditioned, _tet_condition(center, a, b, apex,
+                                                                  _matrix(w, 0), big))
         sj[e] = worst
         cond[e] = conditioned
         ratio[e] = _corner_ratio(least, most, big)
@@ -581,6 +601,11 @@ def cell_quality(data, measures=None):
     out = {m: tack.empty((n,), dtype) for m in ("scaled_jacobian", "jacobian_ratio",
                                                 "condition", "min_edge", "max_edge")}
     jacobian = {"scaled_jacobian", "jacobian_ratio", "condition"} & set(names)
+    # What is not asked for is not computed: the condition number and the edges.
+    conditioning = int("condition" in names)
+    geometry = data.geometry.space
+    straight = int(isinstance(geometry, H1) and geometry.order == 1)
+    edges = bool({"min_edge", "max_edge", "edge_ratio"} & set(names))
     for group in data.launch_groups("cells", []):
         if not group.count:
             continue
@@ -590,29 +615,35 @@ def cell_quality(data, measures=None):
         lo, hi = out["min_edge"], out["max_edge"]
         if shape in _REFERENCE:
             if jacobian:
-                pcs, directions, norms, inverses, corner, _ = _tables(shape, dtype)
+                pcs, directions, norms, inverses, corner, _, neighbours = _tables(shape, dtype)
                 _reference_quality(view, shape.DIMENSION, pcs, directions, norms, inverses,
-                                   corner, big, sj, ratio, cond)
-            _edges_by_table(view, _tables(shape, dtype)[5], lo, hi)
+                                   corner, neighbours, straight, big, conditioning, sj, ratio,
+                                   cond)
+            if edges:
+                _edges_by_table(view, _tables(shape, dtype)[5], lo, hi)
         elif shape is shapes.Pyramid:
             if jacobian:
                 norms, inverses = _pyramid_tables(dtype)
-                _pyramid_quality(view, norms, inverses, big, sj, ratio, cond)
-            edges = _table("pyramid edges", _PYRAMID_EDGES)
-            _edges_by_table(view, edges, lo, hi)
+                _pyramid_quality(view, norms, inverses, big, conditioning, sj, ratio, cond)
+            if edges:
+                _edges_by_table(view, _table("pyramid edges", _PYRAMID_EDGES), lo, hi)
         elif shape is shapes.Polyhedron:
             if jacobian:
                 w = tack.array(np.linalg.inv(_REGULAR).astype(dtype.numpy_dtype).reshape(-1))
-                _polyhedron_quality(view, w, big, sj, ratio, cond)
-            _edges_by_sides(view, lo, hi)
+                _polyhedron_quality(view, w, big, conditioning, sj, ratio, cond)
+            if edges:
+                _edges_by_sides(view, lo, hi)
         elif shape is shapes.Polygon:
             if jacobian:
                 _polygon_quality(view, big, sj, ratio, cond)
-            _edges_by_sides(view, lo, hi)
+            if edges:
+                _edges_by_sides(view, lo, hi)
         else:
             # Lines, polylines, vertices: no Jacobian measures.
             _no_jacobian(view, float("nan"), sj, ratio, cond)
-            if shape is shapes.PolyLine:
+            if not edges:
+                pass
+            elif shape is shapes.PolyLine:
                 _edges_of_lines(view, lo, hi)
             else:
                 _edges_by_table(view, _table(("line edges", shape is shapes.Line),

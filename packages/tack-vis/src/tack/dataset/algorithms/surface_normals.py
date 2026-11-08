@@ -77,7 +77,8 @@ def _hook(pairs, relations, parents, changed):
             if ra != rb:
                 parity = (va % 2 + vb % 2 + relations[f]) % 2
                 tack.atomic_min(parents, max(ra, rb), 2 * min(ra, rb) + parity)
-                tack.atomic_max(changed, 0, 1)
+                if changed[0] == 0:          # once a pass, not an atomic per hook
+                    tack.atomic_max(changed, 0, 1)
 
 
 @tack.kernel

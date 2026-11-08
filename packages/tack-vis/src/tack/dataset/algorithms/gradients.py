@@ -222,8 +222,135 @@ def _shape_green_gauss(cells, u, c):
     return total / six
 
 
+#: A hexahedron's vertex ``j``'s neighbours along r, s and t (``3 j`` to ``3 j + 2``), in
+#: VTK's order of its corners, and the sign taking each edge from r (s, t) = 0 to 1.
+_HEXAHEDRON_NEXT = tack.constant((1, 3, 4, 0, 2, 5, 3, 1, 6, 2, 0, 7,
+                                  5, 7, 0, 4, 6, 1, 7, 5, 2, 6, 4, 3), tack.i32)
+_HEXAHEDRON_SIGN = tack.constant((1, 1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1,
+                                  1, 1, -1, -1, 1, -1, -1, -1, -1, 1, -1, -1), tack.i32)
+
+
+@tack.func
+def _hexahedron_corner(cells, u, c, j):
+    """A straight hexahedron's Jacobian at its vertex ``j`` and an order-1 field's
+    parametric gradient there: at a vertex only it and its three neighbours along the
+    axes have a shape gradient (of 1), so the Jacobian's columns are those three
+    edges and the gradient the values' differences along them -- what the
+    trilinear map gives there, without evaluating its eight shape gradients."""
+    x = cells.corner_position(c, j)
+    v = u.corner_value(c, j)
+    a = _HEXAHEDRON_NEXT[3 * j]
+    b = _HEXAHEDRON_NEXT[3 * j + 1]
+    d = _HEXAHEDRON_NEXT[3 * j + 2]
+    sa = tack.f32(_HEXAHEDRON_SIGN[3 * j])
+    sb = tack.f32(_HEXAHEDRON_SIGN[3 * j + 1])
+    sd = tack.f32(_HEXAHEDRON_SIGN[3 * j + 2])
+    ea = (cells.corner_position(c, a) - x) * sa
+    eb = (cells.corner_position(c, b) - x) * sb
+    ed = (cells.corner_position(c, d) - x) * sd
+    m = tack.mat3([ea[0], eb[0], ed[0]], [ea[1], eb[1], ed[1]], [ea[2], eb[2], ed[2]])
+    g = tack.vec3((u.corner_value(c, a) - v) * sa, (u.corner_value(c, b) - v) * sb,
+                  (u.corner_value(c, d) - v) * sd)
+    return m, g
+
+
+@tack.func
+def _hexahedron_corner_rows(cells, u, c, j):
+    """``_hexahedron_corner`` for a 3-vector field: the Jacobian, and the parametric
+    gradients of the three components as a matrix's rows."""
+    x = cells.corner_position(c, j)
+    v = u.corner_value(c, j)
+    a = _HEXAHEDRON_NEXT[3 * j]
+    b = _HEXAHEDRON_NEXT[3 * j + 1]
+    d = _HEXAHEDRON_NEXT[3 * j + 2]
+    sa = tack.f32(_HEXAHEDRON_SIGN[3 * j])
+    sb = tack.f32(_HEXAHEDRON_SIGN[3 * j + 1])
+    sd = tack.f32(_HEXAHEDRON_SIGN[3 * j + 2])
+    ea = (cells.corner_position(c, a) - x) * sa
+    eb = (cells.corner_position(c, b) - x) * sb
+    ed = (cells.corner_position(c, d) - x) * sd
+    m = tack.mat3([ea[0], eb[0], ed[0]], [ea[1], eb[1], ed[1]], [ea[2], eb[2], ed[2]])
+    da = (u.corner_value(c, a) - v) * sa
+    db = (u.corner_value(c, b) - v) * sb
+    dd = (u.corner_value(c, d) - v) * sd
+    p = tack.mat3([da[0], db[0], dd[0]], [da[1], db[1], dd[1]], [da[2], db[2], dd[2]])
+    return m, p
+
+
+@tack.func
+def _green_gauss_component(cells, u, c, k):
+    """``_shape_green_gauss`` of component ``k`` of a vector field."""
+    origin = cells.corner_position(c, 0)
+    u0 = u.corner_value(c, 0)[k]
+    six = origin[0] - origin[0]
+    total = origin - origin
+    for f in range(cells.NUM_FACES):
+        size = cells.face_num_points(f)
+        first = cells.corner_position(c, cells.face_corner(f, 0)) - origin
+        u_first = u.corner_value(c, cells.face_corner(f, 0))[k] - u0
+        a = first
+        ua = u_first
+        points = first
+        values = u_first
+        newell = origin - origin
+        spun = origin - origin
+        along = origin - origin
+        for j in range(1, size + 1):
+            b = first
+            ub = u_first
+            if j < size:
+                b = cells.corner_position(c, cells.face_corner(f, j)) - origin
+                ub = u.corner_value(c, cells.face_corner(f, j))[k] - u0
+                points += b
+                values += ub
+            n = a.cross(b)
+            both = ua + ub
+            newell += n
+            spun += n * both
+            along += (b - a) * both
+            a = b
+            ua = ub
+        apex = points / size
+        six += apex.dot(newell)
+        total += spun + along.cross(apex) + newell * (values / size)
+    return total / six
+
+
 @tack.kernel
-def _corner_gradients(cells, u, start, out, singular):
+def _vector_edge_gradients(cells, u, start, out, singular):
+    # ``_corner_gradients`` of a 3-vector field on straight hexahedra, every
+    # component from one Jacobian inverse a corner: G = P J^-1, P's rows the
+    # components' parametric gradients; row i of G is component i's gradient.
+    for c in cells:
+        first = start + cells.index(c) * cells.NUM_POINTS
+        tangled = 0
+        for j in range(cells.NUM_POINTS):
+            singular[first + j] = 0
+            m, p = _hexahedron_corner_rows(cells, u, c, j)
+            scaled = _scaled(m)
+            if scaled < -_FLAT:
+                tangled = 1
+            if abs(scaled) <= _FLAT:
+                out[first + j] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                singular[first + j] = 1
+            else:
+                g = p @ m.inverse()
+                out[first + j] = [g[0, 0], g[0, 1], g[0, 2], g[1, 0], g[1, 1], g[1, 2],
+                                  g[2, 0], g[2, 1], g[2, 2]]
+        if tangled == 1:
+            g0 = _green_gauss_component(cells, u, c, 0)
+            g1 = _green_gauss_component(cells, u, c, 1)
+            g2 = _green_gauss_component(cells, u, c, 2)
+            for j in range(cells.NUM_POINTS):
+                out[first + j] = [g0[0], g0[1], g0[2], g1[0], g1[1], g1[2],
+                                  g2[0], g2[1], g2[2]]
+                singular[first + j] = 0
+
+
+@tack.kernel
+def _corner_gradients(cells, u, start, edges, out, singular):
+    # ``edges`` 1: a straight hexahedron's order-1 field, its corners' Jacobians and
+    # gradients from their edges (``_hexahedron_corner``), as the general path's are.
     for c in cells:
         first = start + cells.index(c) * cells.NUM_POINTS
         # Tangled: the map folds over (a corner's scaled Jacobian below -_FLAT), so
@@ -239,6 +366,16 @@ def _corner_gradients(cells, u, start, out, singular):
                 ga = world_gradient(cells, u, c, tack.vec3(0.5, 0.5, 0.998))
                 gb = world_gradient(cells, u, c, tack.vec3(0.5, 0.5, 0.996))
                 out[first + j] = 2.0 * ga - gb
+            elif edges == 1:
+                m, pg = _hexahedron_corner(cells, u, c, j)
+                scaled = _scaled(m)
+                if scaled < -_FLAT:
+                    tangled = 1
+                if abs(scaled) <= _FLAT:
+                    out[first + j] = tack.vec3(0.0, 0.0, 0.0)
+                    singular[first + j] = 1
+                else:
+                    out[first + j] = m.inverse().transpose() @ pg
             else:
                 pc = cells.parametric_point(j)
                 flat, folded = _corner_kind(cells, c, pc)
@@ -262,6 +399,18 @@ def _corner_gradients(cells, u, start, out, singular):
                 singular[first + j] = 0
 
 
+def _by_edges(data, field, group):
+    """1 where ``_corner_gradients`` takes a group's corners from their edges: straight
+    hexahedra (an order-1 geometry) and a field of their corners' values (order-1
+    point data) with its basis' gradient; else 0."""
+    geometry = data.geometry.space
+    space = field.space
+    return int(group.shape is shapes.Hexahedron and field.gradient is None
+               and isinstance(geometry, H1) and geometry.order == 1
+               and isinstance(space, H1) and space.order == 1
+               and space.dofs is None and space.basis is None)
+
+
 @tack.kernel
 def _without_singular(offsets, entries, singular, out, nan):
     # A point's average over the corners that have a gradient: the corners left out
@@ -273,7 +422,7 @@ def _without_singular(offsets, entries, singular, out, nan):
             left_out += singular[entries[k]]
         if left_out > 0:
             if left_out == n:
-                out[p] = tack.vec3(nan, nan, nan)
+                out[p] = out[p] * nan
             else:
                 # In the gradients' own type: Metal has no f64.
                 out[p] = out[p] * n / (n - left_out)
@@ -430,6 +579,16 @@ def _component(values, k, out):
 
 
 @tack.kernel
+def _place_rows_from(rows, k, first, n, out):
+    # As _place_rows, over the n entries from first.
+    for i in range(n):
+        g = rows[first + i]
+        out[first + i][3 * k] = g[0]
+        out[first + i][3 * k + 1] = g[1]
+        out[first + i][3 * k + 2] = g[2]
+
+
+@tack.kernel
 def _place_rows(rows, k, out):
     for i in range(out.shape[0]):
         g = rows[i]
@@ -474,26 +633,75 @@ def _scalar_gradients(data, field, at):
     corners = _vectors(total, data.dtype)
     # Each shape's corners say; a polyhedron's (its cell's gradient) never are.
     singular = (tack.zeros if data.topology.mixed else tack.empty)((total,), tack.i32)
+    _corner_rows(data, field, values, start_of, corners, singular)
+    return _at_points(data, corners, singular, 3)
+
+
+def _corner_rows(data, field, values, start_of, corners, singular, skip=None):
+    """A scalar field's gradient at each corner of each cell, into ``corners`` (in
+    ``corner_layout``'s order), and ``singular`` where a corner has none; groups
+    ``skip`` says (a function of the group) are left alone."""
     for group in data.launch_groups("cells", [field]):
-        if not group.count:
+        if not group.count or (skip is not None and skip(group)):
             continue
         view = data.domain_view("cells", group)
         if group.shape.REFERENCE:
-            _corner_gradients(view, field.view(group), start_of[group.root], corners,
+            _corner_gradients(view, field.view(group), start_of[group.root],
+                              _by_edges(data, field, group), corners,
                               singular)
         else:
             cells = _vectors(data.num_cells, data.dtype)
             _no_reference_gradients(field, view, values, group.shape.DIMENSION, cells)
             _cell_values_at_corners(view, cells, start_of[group.root],
                                     polyhedral_corners(data.topology)[0], corners)
-    out = tack.empty((data.num_points,), tack.vec(3, data.dtype))
+
+
+def _at_points(data, corners, singular, size):
+    """The corners' gradients (``size`` components) averaged over the cells around each
+    point, the corners ``singular`` says left out."""
+    out = tack.empty((data.num_points,), tack.vec(size, data.dtype))
     out.fill(0)
-    if total:
+    if arrays.size_of(corners):
         offsets, entries = data.topology.point_links()
         _average_links(offsets, entries, corners, out)
         if singular.max() > 0:              # rare: only then is any point rescaled
             _without_singular(offsets, entries, singular, out, float("nan"))
     return out
+
+
+def _vector_point_gradients(data, field):
+    """A 3-vector point field's gradient at the points, ``d(u_i)/d(x_j)`` at ``3 i + j``:
+    straight hexahedra's corners (``_by_edges``) all three components at once
+    (``_vector_edge_gradients``, one Jacobian inverse a corner), every other group's
+    a component at a time; then one average over each point's cells."""
+    start_of, total = corner_layout(data.topology)
+    corners = tack.empty((total,), tack.vec(9, data.dtype))
+    singular = (tack.zeros if data.topology.mixed else tack.empty)((total,), tack.i32)
+    values = materialize(field.values)
+    groups = [g for g in data.launch_groups("cells", [field]) if g.count]
+    edges = {id(g) for g in groups if g.shape.REFERENCE and _by_edges(data, field, g)}
+    if len(edges) < len(groups):
+        # The others a component at a time, each component's rows placed in turn;
+        # the one-pass groups' entries, written over here, are written after.
+        rows = _vectors(total, data.dtype)
+        for k in range(3):
+            part = tack.empty((arrays.size_of(values),), arrays.dtype_of(values))
+            if part.shape[0]:
+                _component(values, k, part)
+            component = Field(field.space, part)
+            _corner_rows(data, component, part, start_of, rows, singular,
+                         skip=lambda g: id(g) in edges)
+            for group in groups:                 # each group's own range of corners
+                if id(group) not in edges:
+                    size = (group.root.count * group.shape.NUM_POINTS if group.shape.REFERENCE
+                            else polyhedral_corners(data.topology)[1])
+                    if size:
+                        _place_rows_from(rows, k, start_of[group.root], size, corners)
+    for group in groups:
+        if id(group) in edges:
+            _vector_edge_gradients(data.domain_view("cells", group), field.view(group),
+                                   start_of[group.root], corners, singular)
+    return _at_points(data, corners, singular, 9)
 
 
 @on_inputs_device
@@ -561,6 +769,9 @@ def gradients(data, field, at="cells"):
     width = width_of(field.values)
     if not width:
         return Field(space, _scalar_gradients(data, field, at), unit)
+    if (at == "points" and width == 3 and field.gradient is None
+            and (getattr(data.topology, "reference_cells", True) or data.topology.mixed)):
+        return Field(space, _vector_point_gradients(data, field), unit)
     n = space.size if isinstance(at, L2) else data.num_cells if at == "cells" \
         else data.num_points
     out = tack.empty((n,), tack.vec(3 * width, data.dtype))
