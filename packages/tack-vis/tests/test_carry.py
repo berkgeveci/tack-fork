@@ -70,7 +70,10 @@ def test_a_surface_takes_face_data_as_its_cells(backend):
     out = td.extract_surface(data)
     kinds = _kinds(out)
     assert kinds["flux"] == ("Values", "cells") and kinds["cell"] == ("Constant", "cells")
-    assert kinds["label"] == ("Values", "points") and "dg" not in kinds and "edge" not in kinds
+    assert kinds["label"] == ("Values", "points") and "edge" not in kinds
+    # A DG field as each face's trace, in the same space (#418).
+    assert kinds["dg"] == ("L2", "cells")
+    assert out.fields["dg"].space == td.L2(out, order=data.fields["dg"].space.order)
 
 
 def test_polyhedra_keep_every_entity(backend):

@@ -712,6 +712,91 @@ def test_a_fresh_meshs_curved_surface_stays_curved(backend, mesh):
                                   expected.fields["c"].values.numpy())
 
 
+@tack.func
+def _cubic_at(x):
+    return x[0] * x[0] * x[1] + 0.5 * x[1] * x[2] - x[2] * x[2] * x[2]
+
+
+def _wedges(hexes):
+    """Each hexahedron of an explicit mesh as two wedges on its points."""
+    rows = hexes.topology.connectivity.numpy().reshape(-1, 8)
+    wedges = np.concatenate([rows[:, [0, 1, 3, 4, 5, 7]], rows[:, [1, 2, 3, 5, 6, 7]]], axis=1)
+    topology = td.UnstructuredTopology(np.full(2 * len(rows), 13, np.uint8),
+                                       6 * np.arange(2 * len(rows) + 1), wedges.reshape(-1))
+    return td.DataSet(topology, hexes.positions())
+
+
+def _l2_mesh(mesh):
+    data = _grid(4, "rectilinear" if mesh == "rectilinear" else "explicit")
+    if mesh == "tetrahedra":
+        return td.tetrahedralize(data)
+    return _wedges(data) if mesh == "wedges" else data
+
+
+@pytest.mark.parametrize("mesh", ["rectilinear", "explicit", "tetrahedra", "wedges"])
+@pytest.mark.parametrize("order, basis", [(1, None), (2, None), (3, "equispaced"),
+                                          (4, "gauss_lobatto"), (3, "bernstein")])
+def test_l2_fields_come_to_the_surface_as_each_faces_trace(backend, mesh, order, basis):
+    """A DG field on the surface is in the same space there, each face holding its
+    cell's trace: a polynomial of the field's order on the solid is the same
+    polynomial on the surface. The surface used to leave L2 fields behind (#418)."""
+    if basis == "gauss_lobatto" and mesh in ("tetrahedra", "wedges"):
+        pytest.skip("simplices and wedges have equispaced nodes only above order 2")
+    data = _l2_mesh(mesh)
+    kind = {} if basis is None else {"basis": basis}
+    data.fields["u"] = td.interpolate(data, _cubic_at, td.L2(data, order=order, **kind))
+    surface = td.extract_surface(data)
+    u = surface.fields["u"]
+    assert u.space == td.L2(surface, order=order, **kind)
+    np.testing.assert_allclose(u.values.numpy(),
+                               td.interpolate(surface, _cubic_at, u.space).values.numpy(),
+                               atol=2e-5)
+
+
+def test_an_l2_fields_trace_is_the_same_on_every_surface_path(backend):
+    """A fresh mesh's surface, the surface from derived faces, the surface around
+    hidden cells and each piece's surface all give a DG field its faces' trace, and
+    an order-0 one its cells' values."""
+    def mesh():
+        data = _grid(4, "explicit")
+        data.fields["u"] = td.interpolate(data, _cubic_at, td.L2(data, order=3, basis="equispaced"))
+        data.fields["w"] = td.Field(td.L2(data, order=0), _scalars(np.arange(data.num_cells)))
+        data.fields["c"] = td.Field(td.Constant(data), _scalars(np.arange(data.num_cells)))
+        return data
+
+    def check(surface):
+        u = surface.fields["u"]
+        np.testing.assert_allclose(u.values.numpy(),
+                                   td.interpolate(surface, _cubic_at, u.space).values.numpy(),
+                                   atol=2e-5)
+        assert surface.fields["w"].space == td.L2(surface, order=0)
+        np.testing.assert_array_equal(surface.fields["w"].values.numpy(),
+                                      surface.fields["c"].values.numpy())
+
+    fresh = td.extract_surface(mesh())
+    check(fresh)
+    derived = mesh()
+    derived.topology.faces()
+    from_faces = td.extract_surface(derived)
+    np.testing.assert_array_equal(fresh.fields["u"].values.numpy(),
+                                  from_faces.fields["u"].values.numpy())
+    hidden = mesh()
+    marks = np.zeros(hidden.num_cells, np.uint8)
+    marks[13] = td.Ghosts.HIDDENCELL
+    hidden.ghosts = td.Ghosts(cells=tack.array(marks))
+    around = td.extract_surface(hidden)
+    assert around.num_cells == fresh.num_cells + 6
+    check(around)
+    whole = mesh()
+    half = whole.num_cells // 2
+    pieces = td.PartitionedDataSet([td.extract_cells(whole, np.arange(half)),
+                                    td.extract_cells(whole, np.arange(half, whole.num_cells))])
+    surfaces = td.extract_surface(pieces)
+    assert sum(s.num_cells for s in surfaces) == fresh.num_cells
+    for surface in surfaces:
+        check(surface)
+
+
 def test_an_order_two_surface_needs_no_faces_of_its_own(backend):
     """Two hexahedra sharing one edge: four boundary quads meet there, which no face
     of the surface could have. Its order-2 layout has no face values, so it

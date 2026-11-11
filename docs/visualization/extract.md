@@ -397,7 +397,7 @@ How a field travels depends on where its values live:
 |---|---|
 | point data (`H1`) | kept at kept points, and interpolated along the edge at new points |
 | cell data (`Constant`) | copied to each kept cell, or each piece or triangle of a cut cell |
-| `L2` | kept cell by cell where whole cells survive |
+| `L2` | kept cell by cell where whole cells survive; on `extract_surface`'s faces, each face's trace in the same space |
 | values on faces or edges | kept where the filter keeps the faces, as `extract_surface` does, and otherwise left behind |
 
 Integer point fields are not interpolated: `contour`, `slice` and `clip`,
