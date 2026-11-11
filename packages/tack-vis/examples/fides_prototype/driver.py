@@ -24,12 +24,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import fides  # noqa: E402
-from producer import pressure, produce  # noqa: E402
+import fides
+from producer import pressure, produce
 
-import tack  # noqa: E402
-import tack.dataset as td  # noqa: E402
-from tack.interop.fides import to_datasets  # noqa: E402
+import tack
+import tack.dataset as td
+from tack.interop.fides import to_datasets
 
 
 def describe(node, indent=0, lines=None):
@@ -71,7 +71,7 @@ def _leaf(node):
 def render(path, surface, plane, outline):
     """The contour (grey) and the slice coloured by pressure, in the cube's outline:
     a PNG by VTK, offscreen."""
-    import vtkmodules.vtkCommonDataModel  # noqa: F401  (registers the pythonic API)
+    import vtkmodules.vtkCommonDataModel
     import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
     from vtkmodules.vtkIOImage import vtkPNGWriter
     from vtkmodules.vtkRenderingCore import (

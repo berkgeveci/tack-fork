@@ -18,9 +18,8 @@ Each block's per-cell values are the block's own array, cell after cell, each
 cell's nodes in Tack's local order: a hexahedron's tensor lattice, x fastest; a
 tetrahedron's lattice ``i + j + k <= p``, ``i`` fastest."""
 
-import numpy as np
-
 import conduit
+import numpy as np
 
 #: A hexahedron cut into six tetrahedra about its diagonal 0-6 (VTK corner order).
 _SIX = np.array([[0, 1, 2, 6], [0, 2, 3, 6], [0, 3, 7, 6], [0, 7, 4, 6], [0, 4, 5, 6],
