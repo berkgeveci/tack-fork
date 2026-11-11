@@ -582,6 +582,59 @@ class UnstructuredTopology(_Topology):
     cell (0) or into it (1). A face a polyhedron shares with a shaped cell
     is stored once, and ``faces()`` makes the shaped cell its other side."""
 
+    @classmethod
+    def from_blocks(cls, blocks, num_points):
+        """Cells in blocks of one shape each, numbered block after block, held as they
+        are: ``blocks`` is a list of ``(shape, rows)`` -- a shape class or VTK type, and
+        its cells' point ids, an i32 or i64 array of ``(cells, corners)`` (or flat) --
+        each block one shape group whose rows are the block's own, so nothing is
+        gathered or copied (a mixed ``types``/``offsets``/``connectivity`` is sorted by
+        shape and gathered into rows). ``types``, ``offsets`` and ``connectivity`` are
+        implicit over the blocks (VTK's flat arrays, computed where they are read).
+        ``blocks`` lists the blocks as ``(shape, first cell, count)``."""
+        from tack.arrays import Concatenate
+
+        if not blocks:
+            raise ValueError("from_blocks takes one or more blocks")
+        parsed = []
+        id_dtype = None
+        for shape, rows in blocks:
+            shape = shape if isinstance(shape, type) else shapes.shape_class(int(shape))
+            k = shape.NUM_POINTS
+            if not isinstance(rows, Array):
+                host = np.ascontiguousarray(rows)
+                if host.dtype not in (np.int32, np.int64):
+                    host = host.astype(np.int64)
+                rows = tack.array(host.reshape(-1))          # a host array is copied once
+            if rows.dtype not in (tack.i32, tack.i64):
+                raise TypeError(f"a block's point ids are i32 or i64, not {rows.dtype.name}")
+            if id_dtype is not None and rows.dtype != id_dtype:
+                raise TypeError("every block's point ids are of one type")
+            id_dtype = rows.dtype
+            if size_of(rows) % k:
+                raise ValueError(f"a block of {shape.__name__} cells holds a multiple of "
+                                 f"{k} point ids, not {size_of(rows)}")
+            parsed.append((shape, rows.reshape((size_of(rows) // k, k)), size_of(rows) // k))
+        types, offsets, connectivity, groups = [], [], [], []
+        start = corner = 0
+        for shape, rows, count in parsed:
+            k = shape.NUM_POINTS
+            types.append(ConstantArray(int(shape.ID), count, dtype=tack.u8))
+            offsets.append(CountingArray(count, start=corner, step=k, dtype=id_dtype))
+            connectivity.append(rows.reshape((count * k,)))
+            groups.append(DomainGroup(
+                _Cells, shape, (rows, CountingArray(count, start=start, dtype=id_dtype), count),
+                count, start))
+            start += count
+            corner += count * k
+        offsets.append(ConstantArray(corner, 1, dtype=id_dtype))
+        topology = cls(Concatenate(*types), Concatenate(*offsets), Concatenate(*connectivity),
+                       num_points=num_points, id_dtype=id_dtype)
+        topology._known(sorted({int(shape.ID) for shape, _, _ in parsed}))
+        topology._groups = [g for g in groups if g.count] or groups[:1]
+        topology.blocks = [(shape, g.start, g.count) for (shape, _, _), g in zip(parsed, groups)]
+        return topology
+
     _STORED = ("types", "offsets", "connectivity")
     #: The polyhedra's arrays, when it has any (``polyhedra``).
     _POLYHEDRAL = ("face_offsets", "face_points", "cell_face_offsets", "cell_faces",
