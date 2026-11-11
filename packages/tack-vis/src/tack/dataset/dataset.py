@@ -129,7 +129,7 @@ def _space_parts(field, group, space_mixin=None, corners_only=False):
     values = field.values
     if not isinstance(space, H1) and _is_cells(group):
         # Per-cell values in blocks: a block's group reads its own block's array.
-        from tack.dataset.blocks import for_group
+        from tack.dataset.cell_blocks import for_group
 
         values = for_group(values, group)
     if isinstance(space, H1) and space.basis == bases.SERENDIPITY:

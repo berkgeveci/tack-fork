@@ -6,15 +6,15 @@ no VTK (the vault's "Fides finite-element IR" proposal; a prototype).
 
 The IR is a Conduit tree, ``items/[i]/partitions/[j]/...``: a partition's points
 (``coordinate_system/values``), its cells in blocks of one shape
-(``cell_set/type: "blocks"``, ``cell_set/blocks/[b]/{shape, connectivity, ghosts}``),
+(``cell_set/type: "cell_blocks"``, ``cell_set/cell_blocks/[b]/{shape, connectivity, ghosts}``),
 optional ``ghosts/points``, and fields, each in a space
 (``fields/[k]/space/{family, order, basis}``) with its point-held ``values`` or its
-per-block ``blocks/[b]/{values, orders, dof_table}``.
+per-block ``cell_blocks/[b]/{values, orders, dof_table}``.
 
 ``to_datasets(ir)`` gives one ``PartitionedDataSet`` per item. Every array is the
 IR's own memory, read-only, kept alive by the Tack array that wraps it: the blocks'
-connectivity is the topology's rows (``UnstructuredTopology.from_blocks``), a
-field's per-block values its values (``tack.dataset.blocks``). What is copied:
+connectivity is the topology's rows (``UnstructuredTopology.from_cell_blocks``), a
+field's per-block values its values (``tack.dataset.cell_blocks``). What is copied:
 an order per cell (one byte a cell), cells' ghost marks, and an ``H1`` field's dof
 tables (Tack keeps one table of one node count)."""
 
@@ -112,20 +112,20 @@ def to_dataset(partition):
     """One partition (a ``_Tree``, or a ``conduit.Node`` of one) as a Tack ``DataSet``."""
     import tack.dataset as td
     from tack.dataset import shapes
-    from tack.dataset.blocks import block_values
+    from tack.dataset.cell_blocks import cell_block_values
     from tack.dataset.ghosts import Ghosts
 
     if not isinstance(partition, _Tree):
         partition = _Tree(partition, partition)
     owner = partition.owner
-    if partition.value("cell_set/type") != "blocks":
+    if partition.value("cell_set/type") != "cell_blocks":
         raise NotImplementedError("tack.interop.fides reads partitions of cell blocks "
-                                  f"(cell_set/type 'blocks'), not {partition.value('cell_set/type')!r}")
+                                  f"(cell_set/type 'cell_blocks'), not {partition.value('cell_set/type')!r}")
     points = partition.array("coordinate_system/values")
     positions = _vector(points.reshape(-1, 3), owner)
     blocks, cells = [], []
     first = 0
-    for block in partition.children("cell_set/blocks"):
+    for block in partition.children("cell_set/cell_blocks"):
         name = block.value("shape")
         if name not in _SHAPES:
             raise NotImplementedError(f"a block of {name!r} cells")
@@ -135,26 +135,26 @@ def to_dataset(partition):
         count = rows.size // shape.NUM_POINTS
         cells.append((first, count))
         first += count
-    topology = td.UnstructuredTopology.from_blocks(blocks, num_points=len(points))
+    topology = td.UnstructuredTopology.from_cell_blocks(blocks, num_points=len(points))
     data = td.DataSet(topology, positions, dtype=arrays.dtype_of(positions))
     marks = {}
     if partition.has("ghosts/points"):
         marks["points"] = _wrapped(partition.array("ghosts/points"), owner)
     by_block = [b.array("ghosts") if b.has("ghosts") else np.zeros(n, np.uint8)
-                for b, (_, n) in zip(partition.children("cell_set/blocks"), cells)]
-    if any(b.has("ghosts") for b in partition.children("cell_set/blocks")):
+                for b, (_, n) in zip(partition.children("cell_set/cell_blocks"), cells)]
+    if any(b.has("ghosts") for b in partition.children("cell_set/cell_blocks")):
         marks["cells"] = tack.array(np.concatenate(by_block).astype(np.uint8))   # copied
     if marks:
         data.ghosts = Ghosts(**marks)
     if partition.has("geometry"):
-        data.geometry = _field(data, partition["geometry"], cells, owner, block_values)
+        data.geometry = _field(data, partition["geometry"], cells, owner, cell_block_values)
     if partition.has("fields"):
         for field in partition.children("fields"):
-            data.fields[field.value("name")] = _field(data, field, cells, owner, block_values)
+            data.fields[field.value("name")] = _field(data, field, cells, owner, cell_block_values)
     return data
 
 
-def _field(data, field, cells, owner, block_values):
+def _field(data, field, cells, owner, cell_block_values):
     """One IR field (or the geometry) as a Tack ``Field`` of ``data``."""
     import tack.dataset as td
 
@@ -165,11 +165,11 @@ def _field(data, field, cells, owner, block_values):
     if basis == "nodal":
         raise NotImplementedError("a nodal basis given by its nodes is resampled into one of "
                                   "Tack's: not in this prototype yet")
-    blocks = field.children("blocks") if field.has("blocks") else []
+    blocks = field.children("cell_blocks") if field.has("cell_blocks") else []
 
     def per_block(key):
         parts = [_vector(b.array(key), owner) for b in blocks]
-        return block_values(parts, cells)
+        return cell_block_values(parts, cells)
 
     if family == "points":
         return td.Field(td.Values(data, "points"), _vector(field.array("values"), owner), unit)

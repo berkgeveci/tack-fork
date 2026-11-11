@@ -112,17 +112,17 @@ def produce(n=6, order=2):
             node[fe + f"fields/{name}/space/basis"] = "equispaced"
         if unit:
             node[fe + f"fields/{name}/units"] = unit
-    names = node[fe + "blocks/names"]
+    names = node[fe + "cell_blocks/names"]
     for b, (name, shape, rows, nodes_of) in enumerate(blocks):
         names.append().set(name)
-        node[fe + f"blocks/{name}/shape"] = shape
-        node[fe + f"blocks/{name}/connectivity"] = variable(f"{name}_connectivity", rows)
+        node[fe + f"cell_blocks/{name}/shape"] = shape
+        node[fe + f"cell_blocks/{name}/connectivity"] = variable(f"{name}_connectivity", rows)
         # What the solver holds: each cell's values at its nodes, cell after cell.
         at = np.concatenate([nodes_of(points[r], order) for r in rows])
-        node[fe + f"fields/pressure/blocks/{name}/values"] = variable(
+        node[fe + f"fields/pressure/cell_blocks/{name}/values"] = variable(
             f"pressure_{name}", pressure(at))
-        node[fe + f"fields/velocity/blocks/{name}/values"] = variable(
+        node[fe + f"fields/velocity/cell_blocks/{name}/values"] = variable(
             f"velocity_{name}", velocity(at))
-        node[fe + f"fields/block/blocks/{name}/values"] = variable(
+        node[fe + f"fields/block/cell_blocks/{name}/values"] = variable(
             f"block_{name}", np.full(len(rows), float(b)))
     return node, keep

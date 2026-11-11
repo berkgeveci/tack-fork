@@ -583,7 +583,7 @@ class UnstructuredTopology(_Topology):
     is stored once, and ``faces()`` makes the shaped cell its other side."""
 
     @classmethod
-    def from_blocks(cls, blocks, num_points):
+    def from_cell_blocks(cls, blocks, num_points):
         """Cells in blocks of one shape each, numbered block after block, held as they
         are: ``blocks`` is a list of ``(shape, rows)`` -- a shape class or VTK type, and
         its cells' point ids, an i32 or i64 array of ``(cells, corners)`` (or flat) --
@@ -595,7 +595,7 @@ class UnstructuredTopology(_Topology):
         from tack.arrays import Concatenate
 
         if not blocks:
-            raise ValueError("from_blocks takes one or more blocks")
+            raise ValueError("from_cell_blocks takes one or more blocks")
         parsed = []
         id_dtype = None
         for shape, rows in blocks:
@@ -632,7 +632,7 @@ class UnstructuredTopology(_Topology):
                        num_points=num_points, id_dtype=id_dtype)
         topology._known(sorted({int(shape.ID) for shape, _, _ in parsed}))
         topology._groups = [g for g in groups if g.count] or groups[:1]
-        topology.blocks = [(shape, g.start, g.count) for (shape, _, _), g in zip(parsed, groups)]
+        topology.cell_blocks = [(shape, g.start, g.count) for (shape, _, _), g in zip(parsed, groups)]
         return topology
 
     _STORED = ("types", "offsets", "connectivity")

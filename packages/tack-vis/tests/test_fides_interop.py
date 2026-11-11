@@ -75,9 +75,9 @@ def _ir(points, blocks, fields):
     p["coordinate_system/type"] = "array"
     ir.external(p["coordinate_system/values"], points)
     p["coordinate_system/values_num_components"] = np.int32(3)
-    p["cell_set/type"] = "blocks"
+    p["cell_set/type"] = "cell_blocks"
     for shape, rows in blocks:
-        b = p["cell_set/blocks"].append()
+        b = p["cell_set/cell_blocks"].append()
         b["shape"] = shape
         ir.external(b["connectivity"], rows)
     for name, space, units, values, per_block in fields:
@@ -92,7 +92,7 @@ def _ir(points, blocks, fields):
             if values.ndim == 2:
                 f["values_num_components"] = np.int32(values.shape[1])
         for b in range(len(blocks) if per_block else 0):
-            block = f["blocks"].append()
+            block = f["cell_blocks"].append()
             for key, arrays in per_block.items():
                 ir.external(block[key], arrays[b])
     return ir
@@ -144,11 +144,11 @@ def test_blocks_and_fields_come_as_they_are():
         (shapes.Wedge, first[2], 4)]
     held = node.node["items"][0]["partitions"][0]
     for b, g in enumerate(groups):
-        rows = held["cell_set/blocks"][b]["connectivity"]
+        rows = held["cell_set/cell_blocks"][b]["connectivity"]
         assert g.args[0]._buffer.address == rows.ctypes.data          # the rows, as given
     assert data.geometry.values._buffer.address == held["coordinate_system/values"].ctypes.data
-    parts = data.fields["w"].values._block_parts[0]
-    assert parts[1]._buffer.address == held["fields"][0]["blocks"][1]["values"].ctypes.data
+    parts = data.fields["w"].values._cell_block_parts[0]
+    assert parts[1]._buffer.address == held["fields"][0]["cell_blocks"][1]["values"].ctypes.data
     assert data.fields["w"].unit == "K" and data.fields["v"].unit == "m/s"
     mixed.fields["w"] = td.Field(twin, tack.array(w))
     np.testing.assert_allclose(td.integrate(data, fields=["w"]).values["w"],
@@ -226,7 +226,7 @@ def test_from_a_producer_through_fides():
 
     variable("points", points)
     node["finite_element/coordinates"] = "points"
-    names = node["finite_element/blocks/names"]
+    names = node["finite_element/cell_blocks/names"]
     f = "finite_element/fields/w/"
     node[f + "space/family"] = "L2"
     node[f + "space/order"] = "per_cell"
@@ -236,13 +236,13 @@ def test_from_a_producer_through_fides():
                                                   strict=True)):
         name = f"b{b}"
         names.append().set(name)
-        node[f"finite_element/blocks/{name}/shape"] = shape
+        node[f"finite_element/cell_blocks/{name}/shape"] = shape
         variable(f"{name}_rows", rows.astype(np.int64))
-        node[f"finite_element/blocks/{name}/connectivity"] = f"{name}_rows"
+        node[f"finite_element/cell_blocks/{name}/connectivity"] = f"{name}_rows"
         variable(f"w_{name}", part)
         variable(f"w_{name}_orders", orders[first[b]:first[b + 1]].astype(np.uint8))
-        node[f + f"blocks/{name}/values"] = f"w_{name}"
-        node[f + f"blocks/{name}/orders"] = f"w_{name}_orders"
+        node[f + f"cell_blocks/{name}/values"] = f"w_{name}"
+        node[f + f"cell_blocks/{name}/orders"] = f"w_{name}_orders"
     schema = {"finite_element": {"data_sources": [{"name": "source", "type": "conduit"}],
                                  "fields": [{"name": "w"}]}}
     reader = fides.Reader(json.dumps(schema), fides.InputType.JSONString)
@@ -250,7 +250,7 @@ def test_from_a_producer_through_fides():
     data = to_datasets(reader.read())[0][0]
     for b, g in enumerate(data.topology.groups()):
         assert g.args[0]._buffer.address == keep[1 + 3 * b].ctypes.data   # the producer's rows
-    assert data.fields["w"].values._block_parts[0][0]._buffer.address == keep[2].ctypes.data
+    assert data.fields["w"].values._cell_block_parts[0][0]._buffer.address == keep[2].ctypes.data
     mixed.fields["w"] = td.Field(twin, tack.array(w))
     np.testing.assert_allclose(td.integrate(data, fields=["w"]).values["w"],
                                td.integrate(mixed, fields=["w"]).values["w"], rtol=1e-14)

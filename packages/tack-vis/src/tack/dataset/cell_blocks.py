@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Per-cell data in blocks: a field's values kept as one array per block of cells
-(``UnstructuredTopology.from_blocks``), as solvers and VTK's cell grids keep them.
+(``UnstructuredTopology.from_cell_blocks``), as solvers and VTK's cell grids keep them.
 
-``block_values(parts, cells)`` joins them without copying (``tack.arrays.Concatenate``),
+``cell_block_values(parts, cells)`` joins them without copying (``tack.arrays.Concatenate``),
 so whatever reads a field's values whole reads them; a field view of a shape group
 that is one block reads its block's array directly, shifted to its first value
 (``for_group``), with no search through the blocks on each read."""
@@ -13,7 +13,7 @@ import tack
 from tack import arrays
 from tack.arrays import _Implicit, _metadata, dtype_of, size_of, width_of
 
-__all__ = ["block_values"]
+__all__ = ["cell_block_values"]
 
 
 @tack.device_class
@@ -31,7 +31,7 @@ class _Rebased(_Implicit):
         return self.part[k - self.base]
 
 
-def block_values(parts, cells):
+def cell_block_values(parts, cells):
     """Per-cell values in blocks, one array each (``parts``), the blocks' cells
     ``cells`` (``(first cell, count)`` each, block after block, as the topology's
     blocks): their values joined, holding the parts."""
@@ -43,14 +43,14 @@ def block_values(parts, cells):
     for part in parts:
         starts.append(at)
         at += size_of(part)
-    joined._block_parts = (parts, starts, [first for first, _ in cells])
+    joined._cell_block_parts = (parts, starts, [first for first, _ in cells])
     return joined
 
 
 def for_group(values, group):
     """``values`` as a view of ``group`` reads them: a block's own array, rebased, when
     ``values`` are in blocks and the group's cells are one block's; else ``values``."""
-    held = getattr(values, "_block_parts", None)
+    held = getattr(values, "_cell_block_parts", None)
     if held is None or not isinstance(values, _Implicit):
         return values
     parts, starts, firsts = held
