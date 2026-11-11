@@ -35,10 +35,14 @@ def _blocks():
     grid = td.uniform_grid((3, 3, 3), spacing=(0.5, 0.5, 0.5), dtype=tack.f64)
     hexes = td.extract_cells(grid, np.arange(grid.num_cells))
     rows = hexes.topology.connectivity.numpy().reshape(-1, 8)
-    tets = td.tetrahedralize(td.extract_cells(hexes, [4, 5])).topology.connectivity.numpy()
-    wedges = np.concatenate([[h[[0, 1, 3, 4, 5, 7]], h[[1, 2, 3, 5, 6, 7]]] for h in rows[6:]])
-    blocks = [("hexahedron", rows[:4]), ("tetrahedron", tets.reshape(-1, 4)), ("wedge", wedges)]
     points = hexes.positions()
+    # Hexahedra 4 and 5 as tetrahedra on the same points (extract_cells would renumber them).
+    every = td.tetrahedralize(hexes).topology.connectivity.numpy().reshape(-1, 4)
+    centres = points[every].mean(axis=1)
+    low, high = points[rows[4]].min(axis=0), points[rows[5]].max(axis=0)
+    tets = every[np.all((centres > low) & (centres < high), axis=1)]
+    wedges = np.concatenate([[h[[0, 1, 3, 4, 5, 7]], h[[1, 2, 3, 5, 6, 7]]] for h in rows[6:]])
+    blocks = [("hexahedron", rows[:4]), ("tetrahedron", tets), ("wedge", wedges)]
     types = np.concatenate([np.full(len(r), {"hexahedron": 12, "tetrahedron": 10,
                                              "wedge": 13}[s], np.uint8) for s, r in blocks])
     sizes = np.concatenate([np.full(len(r), r.shape[1]) for _, r in blocks])
@@ -104,6 +108,12 @@ def _split(values, space, blocks):
     return out
 
 
+def test_the_cubes_blocks_fill_it():
+    points, blocks, mixed = _blocks()
+    np.testing.assert_allclose(td.integrate(mixed).measure, 1.0, rtol=1e-14)
+    assert len(blocks[1][1]) == 12                    # two hexahedra's tetrahedra
+
+
 def test_blocks_and_fields_come_as_they_are():
     """The points, every block's rows and every block's values are the IR's memory;
     the cells are the blocks' in order, each block a shape group; an L2 field of an
@@ -144,6 +154,10 @@ def test_blocks_and_fields_come_as_they_are():
     np.testing.assert_allclose(td.integrate(data, fields=["w"]).values["w"],
                                td.integrate(mixed, fields=["w"]).values["w"], rtol=1e-14)
     np.testing.assert_array_equal(td.values_at_centers(data, "c").values.numpy(), c)
+    pts = np.random.default_rng(5).random((200, 3)) * 0.98 + 0.01
+    np.testing.assert_allclose(td.probe(data, pts).fields["w"].values.numpy(),
+                               td.probe(mixed, pts).fields["w"].values.numpy(), rtol=0,
+                               atol=1e-13)
     assert td.contour(data, "w", [1.1]).num_cells == td.contour(mixed, "w", [1.1]).num_cells
     assert td.extract_surface(data).num_cells == td.extract_surface(mixed).num_cells
 
