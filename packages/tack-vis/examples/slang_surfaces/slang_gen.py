@@ -1,0 +1,285 @@
+# SPDX-FileCopyrightText: Copyright (c) Kitware Inc.
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Tack IR to Slang, for shaders: one iteration of a Tack kernel as a Slang function.
+
+A Tack kernel ``for k in range(n): out[k] = <expression of ids[k], pcs[k]>`` becomes
+
+    float3 / float <name>(int id, float3 pc)
+
+whose body is the kernel's own, with ``ids``, ``pcs`` and ``out`` function-local
+arrays of one element (the parallel loop's index is 0), so nothing in the body
+changes. The kernel's other arrays (a view's connectivity, values, tables, ...) are
+storage buffers at bindings this module chooses; its scalars are words of one more
+buffer. A field view's ``value(c, pc)`` or a domain view's ``position(c, pc)`` and
+Jacobian are exported this way and called from a hand-written renderer shader.
+
+The target is WGSL through Slang, so there is no f64 and no 64-bit or narrow
+integer: f64 is computed in f32, i64/u64 and the 8/16-bit types in 32 bits, and
+the host uploads those arrays narrowed to match (``Export.buffers``). That is a
+renderer's precision, not Tack's semantics; the integer wrapping of narrow types is
+not kept. The generator is the Metal one (no f64 either) with Slang's spellings.
+"""
+
+import re
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from tack import arrays
+from tack.codegen.float_division import float_division_helpers
+from tack.codegen.integer_division import integer_division_helpers
+from tack.codegen.integer_ops import IntegerCodeGen
+from tack.codegen.msl_gen import MSLCodeGen
+from tack.codegen.tables import Tables
+from tack.lang import ir
+from tack.lang.array import Array
+from tack.lang.ir_traversal import walk_ir
+from tack.lang.types import f32, f64, i8, i16, i32, i64, u8, u16, u32, u64
+
+#: Slang types for Tack's: 32 bits at most, as WGSL has.
+SLANG_TYPES = {i8: "int", i16: "int", i32: "int", i64: "int",
+               u8: "uint", u16: "uint", u32: "uint", u64: "uint", f32: "float", f64: "float"}
+_NUMPY = {"int": np.int32, "uint": np.uint32, "float": np.float32}
+_READ = {"float": "asfloat", "int": "asint", "uint": "asuint"}
+
+
+@dataclass
+class Export:
+    """One generated function: its Slang source, and the buffers it reads, each
+    ``(binding, numpy array)`` in the type the shader declares."""
+
+    name: str
+    source: str
+    buffers: list = field(default_factory=list)
+    helpers: list = field(default_factory=list)      # blocks, shared by name between exports
+
+
+class SlangCodeGen(MSLCodeGen):
+    """The Metal generator with Slang's spellings, emitting one iteration of a
+    kernel as a function (see the module's docstring)."""
+
+    _LABEL = "Slang"
+    _INDEX_TYPE = "int"
+    _HAS_F64 = False
+    _integer_type_map = SLANG_TYPES
+
+    def __init__(self, ir_func, name, slots, results, binding, group=0):
+        original = [p.name for p in ir_func.params]
+        super().__init__(ir_func)
+        # The GPU renaming keeps the parameters' order: the slots by position.
+        renamed = {o: p.name for o, p in zip(original, self.ir_func.params, strict=True)}
+        slots = {renamed[n]: (t, length, n) for n, (t, length) in slots.items()}
+        self._tables = Tables("metal")
+        self._integers = IntegerCodeGen(SLANG_TYPES, bitcast=True)
+        self._name = name
+        self._slots = slots              # parameter -> (Slang type, length, its own name)
+        out = list(slots)[-1]            # the result: (Slang type, expression of {out})
+        self._results = (results[0], results[1].format(out=out))
+        self._binding = binding          # the first binding number this function takes
+        self._group = group
+        self._globals = {}               # parameter -> its buffer's name
+        self._aliases = {}               # a local holding an array -> the array it names
+
+    def generate(self, effective_args):
+        # The Metal generator reads its module's type table and integer type, not the
+        # instance's: Slang's for as long as this runs.
+        from tack.codegen import msl_gen
+
+        saved = msl_gen._MSL_TYPE_MAP, msl_gen._INT
+        msl_gen._MSL_TYPE_MAP, msl_gen._INT = SLANG_TYPES, "int"
+        try:
+            return self._generate(effective_args)
+        finally:
+            msl_gen._MSL_TYPE_MAP, msl_gen._INT = saved
+
+    def _generate(self, effective_args):
+        func = self.ir_func
+        # Every array and scalar of the function in one buffer of 32-bit words, read by
+        # offset with a bit cast: one binding whatever the view holds (WebGPU's default
+        # is 8 storage buffers a stage; a curved geometry's view alone holds 18 arrays).
+        lines, words, scalars = [], [], []
+        pool = f"{self._name}__pool"
+        at = 0
+        for param, arg in zip(func.params, effective_args, strict=True):
+            self._param_types[param.name] = param.type_annotation
+            if param.name in self._slots:
+                self._array_params.add(param.name)
+                continue
+            t = SLANG_TYPES[param.type_annotation]
+            if param._is_array:
+                self._array_params.add(param.name)
+                host = np.asarray(arrays.to_host(arrays.materialize(arg))).reshape(-1)
+                data = host.astype(_NUMPY[t]).view(np.uint32)
+                self._globals[param.name] = (pool, at, t)
+            else:
+                data = np.array([arg], _NUMPY[t]).view(np.uint32)
+                scalars.append((param, at))
+            words.append(data)
+            at += len(data)
+        packed = np.concatenate(words) if words else np.zeros(1, np.uint32)
+        lines.append(f"[[vk::binding({self._binding}, {self._group})]] "
+                     f"StructuredBuffer<uint> {pool};")
+        buffers = [(self._binding, packed)]
+        self.next_binding = self._binding + 1
+
+        body_start = len(lines)
+        self._lines = lines
+        ret_type, _ = self._results
+        args = ", ".join(f"{t} {own}" if length == 1 else f"float3 {own}"
+                         for n, (t, length, own) in self._slots.items()
+                         if n != _result_slot(self._slots))
+        self._emit(f"{ret_type} {self._name}({args})")
+        self._emit("{")
+        self._indent += 1
+        for n, (t, length, own) in self._slots.items():
+            self._emit(f"{t} {n}[{length}];")
+            if n == _result_slot(self._slots):
+                continue
+            if length == 1:
+                self._emit(f"{n}[0] = {own};")
+            else:
+                for c in range(length):
+                    self._emit(f"{n}[{c}] = {own}[{c}];")
+        for param, offset in scalars:
+            t = SLANG_TYPES[param.type_annotation]
+            self._emit(f"{t} {param.name} = {_READ[t]}({pool}[{offset}]);")
+            self._local_vars[param.name] = t
+            self._declared_vars.add(param.name)
+        self._declare_locals_at_kernel_scope(func.body)
+        self._emit_body(func.body)
+        self._emit(f"return {self._results[1]};")
+        self._indent -= 1
+        self._emit("}")
+        helpers = (
+            self._tables.declarations("static const", SLANG_TYPES)
+            + float_division_helpers(self._float_division_helpers, SLANG_TYPES, "")
+            + integer_division_helpers(self._integer_division_helpers, SLANG_TYPES, "")
+            + self._integers.definitions("")
+        )
+        source = "\n".join(lines) + "\n"
+        blocks = [b.strip() for b in "\n".join(helpers).split("\n\n") if b.strip()]
+        return Export(self._name, _slang_spelling(source, self._name), buffers,
+                      [_slang_spelling(b, self._name) for b in blocks])
+
+    # The parallel loop is one iteration, at index 0; a sequential one counts in int.
+    def _emit_parallel_for(self, node):
+        for var in (node.dims or [node.var]):
+            self._emit(f"int {var} = 0;")
+            self._local_vars[var] = "int"
+            self._declared_vars.add(var)
+        self._emit_body(node.body)
+
+    def _emit_sequential_for(self, node):
+        start, end = self._expr(node.start), self._expr(node.end)
+        step = self._expr(node.step) if node.step else None
+        var = node.var
+        incr = f"{var} += {step}" if step else f"{var}++"
+        self._emit(f"for (int {var} = {start}; {var} < {end}; {incr}) {{")
+        outer = (var in self._declared_vars, self._local_vars.get(var))
+        self._local_vars[var] = "int"
+        self._declared_vars.add(var)
+        self._indent += 1
+        self._emit_body(node.body)
+        self._indent -= 1
+        self._emit("}")
+        self._leave_loop_scope(var, outer)
+
+    def _emit_stmt(self, node):
+        if isinstance(node, ir.IRReturn) or (isinstance(node, ir.IRContinue) and node.outermost):
+            self._emit(f"return {self._results[1]};")
+        elif isinstance(node, (ir.IRAtomicOp, ir.IRBarrier, ir.IRSharedAlloc, ir.IRPrint)):
+            raise NotImplementedError(f"{type(node).__name__} in a shader function")
+        else:
+            super()._emit_stmt(node)
+
+    def _array_root(self, name):
+        """The parameter (a pooled array or a slot) a name holding an array names, or None."""
+        name = self._aliases.get(name, name)
+        return name if name in self._globals or name in self._slots else None
+
+    def _expr_array_load(self, node):
+        root = self._array_root(node.array.name) if isinstance(node.array, ir.IRName) else None
+        if root in self._globals:
+            pool, offset, t = self._globals[root]
+            return f"{_READ[t]}({pool}[{offset} + int({self._expr(node.index)})])"
+        return super()._expr_array_load(node)
+
+    def _emit_array_store(self, node):
+        root = self._array_root(node.array.name) if isinstance(node.array, ir.IRName) else None
+        if root in self._globals:
+            raise NotImplementedError("a store to a dataset array in a shader function")
+        super()._emit_array_store(node)
+
+    def _alias(self, node):
+        """Record ``node`` (an assignment) if it binds a local to an array: True if so.
+        One local naming two arrays (chosen at run time) is refused."""
+        if not (isinstance(node.value, ir.IRName)
+                and self._array_root(node.value.name) is not None):
+            return False
+        root = self._aliases.get(node.value.name, node.value.name)
+        if self._aliases.get(node.target, root) != root:
+            raise NotImplementedError(f"'{node.target}' names two arrays: a buffer chosen at "
+                                      "run time has no WGSL spelling")
+        self._aliases[node.target] = root
+        self._declared_vars.add(node.target)
+        return True
+
+    def _emit_assign(self, node):
+        # Inlined device functions pass arrays down as locals holding them; WGSL has no
+        # pointers to buffers, and each names one buffer, so the name is resolved here.
+        if not self._alias(node):
+            super()._emit_assign(node)
+
+    def _emit_if(self, node):
+        # The branches' array locals first, so that none is hoisted as a variable.
+        for stmt in walk_ir(node):
+            if isinstance(stmt, ir.IRAssign):
+                self._alias(stmt)
+        super()._emit_if(node)
+
+    def _expr(self, node):
+        if isinstance(node, ir.IRName) and self._array_root(node.name) in self._slots:
+            return self._array_root(node.name)
+        return super()._expr(node)
+
+
+def _result_slot(slots):
+    return list(slots)[-1]
+
+
+def _slang_spelling(source, prefix):
+    """Metal's spellings the shared helpers use, in Slang's; tables named per function."""
+    source = re.sub(r"as_type<(\w+)>", r"bit_cast<\1>", source)
+    source = source.replace("__attribute__((noinline))", "")
+    source = re.sub(r"\bulong\b", "uint", source)
+    source = re.sub(r"\blong\b", "int", source)
+    source = re.sub(r"(\d+)U?LL?\b", r"\1", source)
+    return source.replace("__tack_table_", f"__tack_table_{prefix}_")
+
+
+def export(kernel, args, name, slots, results, binding, group=0):
+    """``kernel`` called with ``args`` (Tack arrays, views), its one iteration as a Slang
+    function ``name``: ``slots`` names the kernel's per-iteration parameters in order,
+    each ``(Slang type, length)``, the last the result; ``results`` is ``(return type,
+    expression of the slots)``."""
+    from tack.lang.inspect_kernel import _prepare_ir
+
+    ir_func, effective_args = _prepare_ir(kernel, args)
+    for node in walk_ir(ir_func.body):
+        if isinstance(node, (ir.IRAtomicOp, ir.IRBarrier, ir.IRSharedAlloc)):
+            raise NotImplementedError(f"{name}: {type(node).__name__} has no place in a shader")
+    gen = SlangCodeGen(ir_func, name, slots, results, binding, group)
+    out = gen.generate(effective_args)
+    out.next_binding = gen.next_binding
+    return out
+
+
+def is_array(arg):
+    return isinstance(arg, Array)
+
+
+def joined(*exports):
+    """The exports' sources after their helpers, each helper once."""
+    helpers = list(dict.fromkeys(b for e in exports for b in e.helpers))
+    return "\n\n".join(helpers) + "\n\n" + "\n".join(e.source for e in exports)
