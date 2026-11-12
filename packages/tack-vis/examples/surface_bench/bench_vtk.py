@@ -36,60 +36,79 @@ import vtkmodules.vtkRenderingCore as rr
 # The backend's module registers its window and mappers (BENCH_VTK_BACKEND: OpenGL2 or
 # WebGPU).
 importlib.import_module("vtkmodules.vtkRendering" + os.environ.get("BENCH_VTK_BACKEND", "OpenGL2"))
-from scenes import camera, surface
+from scenes import camera, indexed_template, surface
 
 import tack
+import tack.dataset as td
 
 W, H = 1920, 1080
 
 
-def _template(kind, level):
-    """A reference face subdivided ``level`` times a side as a triangle list of (u, v),
-    as the WebGPU renderers' (not imported: that would load wgpu-native beside VTK's
-    Dawn, both exporting the wgpu* symbols)."""
-    out = []
-    for j in range(level):
-        for i in range(level if kind == 1 else level - j):
-            a, b, c, d = (i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)
-            out += [a, b, c]
-            if kind == 1 or i + j < level - 1:
-                out += [b, d, c]
-    return np.array(out, np.float32) / level
-
-
 def polygons(surf, level):
-    """``surf`` as a triangle soup at the templates' points, the field evaluated there by
-    Tack (the same kernels the Slang shaders are made of), as a vtkPolyData."""
+    """``surf`` as triangles at the templates' points (shared within a face), the field
+    evaluated there by Tack (the same kernels the Slang shaders are made of), as a
+    vtkPolyData, and its update for a new field of the same space."""
     from shaders import _geometry_at, _value_at
     from vtkmodules.vtkCommonCore import vtkFloatArray, vtkPoints
     from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
 
-    field = surf.fields["f"]
     curved = surf.geometry.space.order > 1
-    xs, fs = [], []
-    for g in surf.launch_groups("cells", [field]):
+    xs, conn, groups, base = [], [], [], 0
+    for g in surf.launch_groups("cells", [surf.fields["f"]]):
         if not g.count:
             continue
-        t = _template(1 if g.shape.NUM_POINTS == 4 else 0, level if curved else 1)
-        ids = tack.array(np.repeat(np.arange(g.count, dtype=np.int32), len(t)))
-        pcs = np.zeros((g.count * len(t), 3), np.float32)
-        pcs[:, :2] = np.tile(t, (g.count, 1))
+        points, tris = indexed_template(g.shape.NUM_POINTS == 4, level if curved else 1)
+        m = len(points)
+        ids = tack.array(np.repeat(np.arange(g.count, dtype=np.int32), m))
+        pcs = np.zeros((g.count * m, 3), np.float32)
+        pcs[:, :2] = np.tile(points, (g.count, 1))
         pcs = tack.array(pcs, tack.vec3())
         geo = tack.empty((3 * ids.shape[0],), tack.vec3())
         _geometry_at(surf.domain_view("cells", g), ids, pcs, geo)
-        val = tack.empty((ids.shape[0],), tack.f32)
-        _value_at(field.view(g), ids, pcs, val)
         xs.append(geo.numpy().reshape(-1, 3, 3)[:, 0])
-        fs.append(val.numpy())
+        conn.append((tris[None, :] + base + m * np.arange(g.count)[:, None]).reshape(-1))
+        groups.append((g, ids, pcs, tack.empty((ids.shape[0],), tack.f32)))
+        base += g.count * m
     x = np.concatenate(xs).astype(np.float32)
-    n = len(x)
+    conn = np.concatenate(conn).astype(np.int64)
     poly = vtkPolyData()
     poly.points = vtkPoints(data=vtkFloatArray(x))
-    poly.polys = vtkCellArray(offsets=np.arange(0, n + 1, 3), connectivity=np.arange(n))
-    scalars = vtkFloatArray(np.concatenate(fs))
+    poly.polys = vtkCellArray(offsets=np.arange(0, len(conn) + 1, 3), connectivity=conn)
+    scalars = vtkFloatArray(np.zeros(len(x), np.float32))
     scalars.SetName("f")
     poly.GetPointData().SetScalars(scalars)
-    return poly, n // 3
+    out = np.asarray(scalars)
+
+    def update(field):
+        at = 0
+        for g, ids, pcs, val in groups:
+            _value_at(field.view(g), ids, pcs, val)
+            out[at:at + len(val)] = val.numpy()
+            at += len(val)
+        scalars.Modified()
+
+    update(surf.fields["f"])
+    return poly, len(conn) // 3, update
+
+
+def _cell_grid_update(surf, grid):
+    """The cell grid's field array refilled from a new field of the same space: Tack's
+    projection to VTK's basis (equispaced, a block a cell) per step, as
+    ``dataset_to_vtk`` does."""
+    array = grid.GetAttributes("vtkDGQuad").GetArray("f")
+    attribute = grid.GetCellAttributeByName("f")
+    out = np.asarray(array)
+
+    def update(field):
+        space = td.L2(surf, order=field.space.order, basis="equispaced", layout="blocks")
+        values = td.project(surf, field, space).values.numpy()
+        out[...] = values.reshape(out.shape)
+        array.Modified()
+        # The attribute caches its range by its own time, not its arrays'.
+        attribute.Modified()
+        grid.Modified()
+
+    return update
 
 
 def setup(mode, surf, level, window=None):
@@ -109,13 +128,15 @@ def setup(mode, surf, level, window=None):
         mapper.SetArrayName("f")
         mapper.SetArrayComponent(0)
         triangles = None
+        update = _cell_grid_update(surf, grid)
     else:
-        poly, triangles = polygons(surf, level)
+        poly, triangles, update = polygons(surf, level)
         mapper = rr.vtkPolyDataMapper(input_data=poly, scalar_range=(lo, hi))
         mapper.SetInterpolateScalarsBeforeMapping(True)
     renderer.AddActor(rr.vtkActor(mapper=mapper))
     window = window or _window()
     window.AddRenderer(renderer)
+    window.update = update
     return window, renderer, triangles
 
 

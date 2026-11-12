@@ -32,9 +32,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 for sub in ("slang_surfaces", "webgpu_surfaces"):
     sys.path.insert(0, os.path.join(HERE, "..", sub))
 
-from faces import QUAD, surface_records
+from faces import QUAD, _bernstein, surface_records
 from renderer import colormap, level_of, look_at, perspective, template
-from scenes import camera, surface
+from scenes import camera, indexed_template, surface
 from shaders import _geometry_at, group_shaders
 
 import tack
@@ -94,6 +94,7 @@ class Records:
 
     def __init__(self, device, surf, level):
         self.device = device
+        self.surface = surf
         self.records = r = surface_records(surf, "f")
         kinds = r.faces[:, 0] & 0xFF
         order = np.argsort(kinds, kind="stable")
@@ -110,13 +111,19 @@ class Records:
             self.pipeline = _pipeline(device, f.read(), "vs_main", "fs_main")
         self.uniforms = device.create_buffer(size=4 * 28, usage=wgpu.BufferUsage.UNIFORM
                                              | wgpu.BufferUsage.COPY_DST)
+        self.field = _storage(device, r.field, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
         buffers = [self.uniforms, _storage(device, faces), _storage(device, r.geometry.reshape(-1)),
-                   _storage(device, r.field), _storage(device, np.concatenate(verts)),
+                   self.field, _storage(device, np.concatenate(verts)),
                    _storage(device, colormap())]
         self.bind = device.create_bind_group(
             layout=self.pipeline.get_bind_group_layout(0),
             entries=[{"binding": i, "resource": {"buffer": b}} for i, b in enumerate(buffers)])
         self.triangles = sum(c // 3 * n for _, c, _, n in self.runs)
+
+    def update(self, field):
+        """A new field of the same space: its Bernstein coefficients, uploaded."""
+        values, _ = _bernstein(self.surface, field, field.space.order)
+        self.device.queue.write_buffer(self.field, 0, values.reshape(-1).astype(np.float32))
 
     def draw(self, target, eye, centre):
         eye = np.asarray(eye) - self.records.origin
@@ -146,11 +153,12 @@ class Slang:
         self.frame = device.create_buffer(size=16 * 7, usage=wgpu.BufferUsage.STORAGE
                                           | wgpu.BufferUsage.COPY_DST)
         colors = _storage(device, colormap())
-        self.draws, self.triangles = [], 0
+        self.draws, self.triangles, self.fields = [], 0, []
         for g in groups:
             pipeline = _pipeline(device, g.wgsl, "vs_main", "fs_main")
             verts = template(QUAD if g.shape.NUM_POINTS == 4 else 0, level if curved else 1)
-            pools = [_storage(device, data) for _, data in g.buffers]
+            pools = [_storage(device, data, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST) for _, data in g.buffers]
+            self.fields.append((pools[-1], _place(g.buffers[-1][1], surf.fields["f"])))
             bind0 = device.create_bind_group(
                 layout=pipeline.get_bind_group_layout(0),
                 entries=[{"binding": b, "resource": {"buffer": p}}
@@ -161,6 +169,13 @@ class Slang:
                 entries=[{"binding": i, "resource": {"buffer": b}} for i, b in enumerate(mine)])
             self.draws.append((pipeline, bind0, bind1, len(verts), len(g.ids)))
             self.triangles += len(verts) // 3 * len(g.ids)
+
+    def update(self, field):
+        """A new field of the same space: its values, in their own basis, uploaded where
+        the generated code reads them."""
+        values = field.values.numpy().reshape(-1).astype(np.float32)
+        for pool, at in self.fields:
+            self.device.queue.write_buffer(pool, 4 * at, values)
 
     def draw(self, target, eye, centre):
         frame = np.zeros((7, 4), np.float32)
@@ -179,23 +194,14 @@ class Slang:
         self.device.queue.submit([encoder.finish()])
 
 
-def indexed_template(kind, level):
-    """A reference face subdivided ``level`` times a side as points (u, v) and the
-    triangles' indices into them (``template``'s triangles, points shared)."""
-    n = level
-    points, at = [], {}
-    for j in range(n + 1):
-        for i in range(n + 1 if kind == QUAD else n + 1 - j):
-            at[i, j] = len(points)
-            points.append((i, j))
-    tris = []
-    for j in range(n):
-        for i in range(n if kind == QUAD else n - j):
-            a, b, c, d = (i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)
-            tris += [at[a], at[b], at[c]]
-            if kind == QUAD or i + j < n - 1:
-                tris += [at[b], at[d], at[c]]
-    return np.array(points, np.float32) / n, np.array(tris, np.uint32)
+def _place(pool, field):
+    """Where ``field``'s values start in a generated function's pool (in words): the
+    pool holds the view's arrays narrowed to 32 bits, one after another."""
+    words = field.values.numpy().reshape(-1).astype(np.float32).view(np.uint32)
+    for at in np.flatnonzero(pool[:len(pool) - len(words) + 1] == words[0]):
+        if np.array_equal(pool[at:at + len(words)], words):
+            return int(at)
+    raise ValueError("the field's values are not in the pool")
 
 
 def _used(wgsl, buffers, group=0):
@@ -217,10 +223,10 @@ class Cached:
         self.frame = device.create_buffer(size=16 * 7, usage=wgpu.BufferUsage.STORAGE
                                           | wgpu.BufferUsage.COPY_DST)
         colors = _storage(device, colormap())
-        self.draws, self.triangles = [], 0
+        self.draws, self.triangles, self.fields = [], 0, []
         for g in groups:
             pipeline = _pipeline(device, g.wgsl, "vs_main", "fs_main")
-            points, tris = indexed_template(QUAD if g.shape.NUM_POINTS == 4 else 0,
+            points, tris = indexed_template(g.shape.NUM_POINTS == 4,
                                             level if curved else 1)
             count, m = len(g.ids), len(points)
             # The geometry at every cell's points, by Tack (here on the CPU).
@@ -235,8 +241,10 @@ class Cached:
             cached[:, 0, :3] = geo[:, 0]
             cached[:, 1, :3] = np.cross(geo[:, 1], geo[:, 2])
             index = (tris[None, :] + (m * np.arange(count, dtype=np.uint32))[:, None]).reshape(-1)
-            used = _used(g.wgsl, g.buffers)
-            entries = [{"binding": b, "resource": {"buffer": _storage(device, d)}} for b, d in used]
+            used = [(b, _storage(device, d, wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)) for b, d in _used(g.wgsl, g.buffers)]
+            if not flat:
+                self.fields.append((used[-1][1], _place(g.buffers[-1][1], surf.fields["f"])))
+            entries = [{"binding": b, "resource": {"buffer": u}} for b, u in used]
             bind0 = device.create_bind_group(layout=pipeline.get_bind_group_layout(0),
                                              entries=entries) if entries else None
             mine = _used(g.wgsl, enumerate([
@@ -249,6 +257,13 @@ class Cached:
             indices = _storage(device, index, wgpu.BufferUsage.INDEX)
             self.draws.append((pipeline, bind0, bind1, indices, len(index)))
             self.triangles += len(index) // 3
+
+    def update(self, field):
+        """A new field of the same space: its values, in their own basis, uploaded where
+        the generated code reads them."""
+        values = field.values.numpy().reshape(-1).astype(np.float32)
+        for pool, at in self.fields:
+            self.device.queue.write_buffer(pool, 4 * at, values)
 
     def draw(self, target, eye, centre):
         frame = np.zeros((7, 4), np.float32)

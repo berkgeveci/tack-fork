@@ -47,3 +47,23 @@ def camera(frame, frames):
     a = 2 * np.pi * frame / max(frames, 1) + 0.6
     centre = np.array([0.5, 0.5, 0.5])
     return centre + np.array([2.4 * np.cos(a), 2.4 * np.sin(a), 1.6]), centre
+
+
+def indexed_template(quad, level):
+    """A reference face subdivided ``level`` times a side as points (u, v) and the
+    triangles' indices into them (the WebGPU renderers' ``template``
+    triangles, points shared)."""
+    n = level
+    points, at = [], {}
+    for j in range(n + 1):
+        for i in range(n + 1 if quad else n + 1 - j):
+            at[i, j] = len(points)
+            points.append((i, j))
+    tris = []
+    for j in range(n):
+        for i in range(n if quad else n - j):
+            a, b, c, d = (i, j), (i + 1, j), (i, j + 1), (i + 1, j + 1)
+            tris += [at[a], at[b], at[c]]
+            if quad or i + j < n - 1:
+                tris += [at[b], at[d], at[c]]
+    return np.array(points, np.float32) / n, np.array(tris, np.uint32)
