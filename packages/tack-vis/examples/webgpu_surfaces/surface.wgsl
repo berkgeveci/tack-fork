@@ -16,6 +16,7 @@ struct Uniforms {
     view_proj: mat4x4<f32>,
     eye: vec4<f32>,           // the camera, about the records' origin
     range: vec4<f32>,         // the field's least and greatest, the mode, the edge width
+    extra: vec4<f32>,         // the template triangles' edge width (0: none)
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -130,6 +131,7 @@ struct Varyings {
     @location(1) @interpolate(flat) face: u32,
     @location(2) normal: vec3<f32>,
     @location(3) world: vec3<f32>,
+    @location(4) corner: vec3<f32>,   // the template triangle's barycentric coordinates
 };
 
 @vertex
@@ -155,6 +157,8 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) face: u3
     out.face = face;
     out.normal = cross(pu, pv);
     out.world = p;
+    let which = vertex % 3u;
+    out.corner = vec3<f32>(f32(which == 0u), f32(which == 1u), f32(which == 2u));
     return out;
 }
 
@@ -178,6 +182,7 @@ fn fs_main(in: Varyings) -> Targets {
     let fu = fwidth(in.uv.x);
     let fv = fwidth(in.uv.y);
     let fw = fwidth(1.0 - in.uv.x - in.uv.y);
+    let fc = fwidth(in.corner);
     let record = faces[in.face];
     let kind = record.x & 0xFFu;
     let order = record.x >> 16u;
@@ -219,6 +224,15 @@ fn fs_main(in: Varyings) -> Targets {
         }
         let line = 1.0 - smoothstep(width - 0.5, width + 0.5, e);
         color = mix(color, vec3<f32>(0.1, 0.1, 0.12), line);
+    }
+
+    // The template's triangles, thinner and lighter than the face's edges.
+    let thin = uniforms.extra.x;
+    if (thin > 0.0) {
+        let t = in.corner / max(fc, vec3<f32>(1e-12));
+        let d = min(t.x, min(t.y, t.z));
+        let line = 1.0 - smoothstep(thin - 0.5, thin + 0.5, d);
+        color = mix(color, vec3<f32>(1.0, 1.0, 1.0), 0.8 * line);
     }
 
     var out: Targets;

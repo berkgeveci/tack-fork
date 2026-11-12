@@ -37,7 +37,9 @@ class Records:
     """What the renderer uploads: ``faces`` (``(n, 4)`` u32: shape | geometry order
     << 8 | field order << 16, geometry offset in points, field offset in values, 0),
     ``geometry`` (``(m, 3)`` f32 about ``origin``), ``field`` (f32), and the field's
-    range over its coefficients (the convex hull property bounds it)."""
+    range for a colour map: its values at the trace's nodes. (The Bernstein
+    coefficients bound it too, by the convex hull property, but loosely: an
+    oscillating order-5 field's reach 20 times past its values.)"""
 
     faces: np.ndarray
     geometry: np.ndarray
@@ -123,13 +125,16 @@ def surface_records(data, name):
         values, foffsets = _bernstein(surface, traced, p)
         forder = np.full(len(types), p, np.uint32)
     values = values.reshape(-1)
+    nodal = _host(traced.values).reshape(-1)
+    if getattr(traced.space, "basis", None) == "bernstein":
+        nodal = values
 
     faces = np.zeros((len(types), 4), np.uint32)
     faces[:, 0] = shape | (np.uint32(g) << 8) | (forder << 16)
     faces[:, 1] = goffsets[:len(types)]
     faces[:, 2] = foffsets[:len(types)]
     return Records(faces, (geometry - origin).astype(np.float32), values.astype(np.float32),
-                   origin, (float(values.min()), float(values.max())))
+                   origin, (float(nodal.min()), float(nodal.max())))
 
 
 def evaluate(records, face, u, v):

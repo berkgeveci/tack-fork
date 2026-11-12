@@ -111,11 +111,13 @@ class Renderer:
         return self.device.create_buffer_with_data(data=data, usage=wgpu.BufferUsage.STORAGE)
 
     def render(self, records, eye, target=(0.0, 0.0, 0.0), up=(0.0, 0.0, 1.0), size=(896, 704),
-               supersample=2, mode=0, edges=1.2, curved_level=8, fovy=30.0):
+               supersample=2, mode=0, edges=1.2, curved_level=8, fovy=30.0, tessellation=0.0,
+               field_range=None):
         """The picture (``(h, w, 4)`` u8) and the probe (``(h, w, 4)`` f32: field, face,
         u, v; face -1 where no face is) of ``records`` from ``eye`` (world
         coordinates) towards ``target``. ``mode`` 1 colours each face by its field's
-        order."""
+        order; ``tessellation`` > 0 draws the template's triangles that wide (pixels);
+        ``field_range`` overrides the colour map's range."""
         w, h = size[0] * supersample, size[1] * supersample
         origin = records.origin
         eye = np.asarray(eye, float) - origin
@@ -125,9 +127,10 @@ class Renderer:
         proj = perspective(fovy, w / h, max(distance - radius, 1e-3 * distance),
                            distance + radius)
         view_proj = proj @ look_at(eye, target, np.asarray(up, float))
-        lo, hi = records.range
+        lo, hi = records.range if field_range is None else field_range
         uniforms = np.concatenate([view_proj.T.reshape(-1), [*eye, 1.0],
-                                   [lo, hi, float(mode), edges * supersample]]).astype(np.float32)
+                                   [lo, hi, float(mode), edges * supersample],
+                                   [tessellation * supersample, 0, 0, 0]]).astype(np.float32)
 
         # Faces sorted by (shape, level), one draw each over their run.
         kinds = records.faces[:, 0] & 0xFF
