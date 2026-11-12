@@ -66,8 +66,9 @@ def _one_cell_arrays():
     return ids, pcs
 
 
-def group_shaders(surface, name, out_dir):
-    """Every launch group of ``surface`` for field ``name``, compiled."""
+def group_shaders(surface, name, out_dir, defines=()):
+    """Every launch group of ``surface`` for field ``name``, compiled; ``defines``
+    (names) are set to 1 in ``surface.slang`` (``TACK_CACHED``, ``TACK_FLAT``)."""
     field = surface.fields[name]
     with open(os.path.join(HERE, "surface.slang")) as f:
         scaffold = f.read()
@@ -92,8 +93,10 @@ def group_shaders(surface, name, out_dir):
         triangle = int(group.shape.NUM_POINTS == 3)
         source = "\n".join([f"// {group.shape.__name__}, key {group.keys}",
                             f"#define TACK_TRIANGLE {triangle}",
+                            *(f"#define {d} 1" for d in defines),
                             joined(geometry, value), scaffold])
-        stem = os.path.join(out_dir, f"group{n}_{group.shape.__name__}")
+        stem = os.path.join(out_dir, "_".join([f"group{n}", group.shape.__name__,
+                                               *(d.lower() for d in defines)]))
         with open(stem + ".slang", "w") as f:
             f.write(source)
         r = subprocess.run([SLANGC, stem + ".slang", "-target", "wgsl", "-o", stem + ".wgsl"],

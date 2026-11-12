@@ -11,6 +11,18 @@
 // draw per group: vertex_index picks a vertex of a subdivided reference face (the
 // template), instance_index the cell. The fragment shader evaluates the field at the
 // interpolated parametric point, exact on every template triangle.
+//
+// TACK_CACHED: the geometry was evaluated once, at the template's points (by Tack,
+// before drawing), into `cached` (position, normal per point of each cell): the draw is
+// indexed and not instanced, vertex v being point v % points of cell v / points.
+// TACK_FLAT: no field (a constant colour), to time the rest.
+
+#ifndef TACK_CACHED
+#define TACK_CACHED 0
+#endif
+#ifndef TACK_FLAT
+#define TACK_FLAT 0
+#endif
 
 // Group 1: the renderer's; group 0 is the generated functions'.
 [[vk::binding(0, 1)]] StructuredBuffer<float4> frame;      // view-projection rows 0-3, eye,
@@ -19,6 +31,10 @@
 [[vk::binding(1, 1)]] StructuredBuffer<float2> templates;
 [[vk::binding(2, 1)]] StructuredBuffer<float4> colors;     // 256 rows of a colour map
 [[vk::binding(3, 1)]] StructuredBuffer<uint> cell_ids;     // the group's cells in the surface
+#if TACK_CACHED
+[[vk::binding(4, 1)]] StructuredBuffer<float4> cached;     // position, normal per point
+[[vk::binding(5, 1)]] StructuredBuffer<uint> info;         // the template's points
+#endif
 
 struct Varyings
 {
@@ -33,17 +49,28 @@ struct Varyings
 [shader("vertex")]
 Varyings vs_main(uint vertex : SV_VertexID, uint instance : SV_InstanceID)
 {
+    Varyings out;
+#if TACK_CACHED
+    uint points = info[0];
+    uint cell = vertex / points;
+    float2 uv = templates[vertex - cell * points];
+    float3 x = cached[2 * vertex].xyz;
+    out.normal = cached[2 * vertex + 1].xyz;
+    out.corner = float3(0.0);    // points are shared: no template triangles to draw
+#else
+    uint cell = instance;
     float2 uv = templates[vertex];
     float3x3 g = tack_geometry(int(instance), float3(uv, 0.0));
-    float4 p = float4(g[0], 1.0);
-    Varyings out;
-    out.position = float4(dot(frame[0], p), dot(frame[1], p), dot(frame[2], p), dot(frame[3], p));
-    out.uv = uv;
-    out.cell = instance;
+    float3 x = g[0];
     out.normal = cross(g[1], g[2]);
-    out.world = g[0];
     uint which = vertex % 3;
     out.corner = float3(which == 0 ? 1.0 : 0.0, which == 1 ? 1.0 : 0.0, which == 2 ? 1.0 : 0.0);
+#endif
+    float4 p = float4(x, 1.0);
+    out.position = float4(dot(frame[0], p), dot(frame[1], p), dot(frame[2], p), dot(frame[3], p));
+    out.uv = uv;
+    out.cell = cell;
+    out.world = x;
     return out;
 }
 
@@ -62,7 +89,11 @@ Targets fs_main(Varyings v)
     float fw = fwidth(1.0 - v.uv.x - v.uv.y);
     float3 fc = fwidth(v.corner);
 
+#if TACK_FLAT
+    float value = 0.5 * (frame[5].x + frame[5].y);
+#else
     float value = tack_value(int(v.cell), float3(v.uv, 0.0));
+#endif
 
     float lo = frame[5].x;
     float hi = frame[5].y;
