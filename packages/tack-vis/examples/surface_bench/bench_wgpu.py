@@ -302,9 +302,10 @@ def bench(device, make, surf, frames=None):
     return r.triangles, setup, first, float(np.median(times))
 
 
-def main(out, kind="straight", sizes=(16, 32, 64, 128), level=8):
-    tack.set_default_device("cpu")
-    wanted = os.environ.get("BENCH_ADAPTER")       # a substring of the device's name
+def open_device():
+    """The adapter BENCH_ADAPTER names (a substring of its device's name), else the
+    high-performance one, and a device with its storage limits."""
+    wanted = os.environ.get("BENCH_ADAPTER")
     if wanted:
         adapters = wgpu.gpu.enumerate_adapters_sync()
         adapter = next((a for a in adapters if wanted.lower() in a.info["device"].lower()), None)
@@ -315,6 +316,37 @@ def main(out, kind="straight", sizes=(16, 32, 64, 128), level=8):
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     device = adapter.request_device_sync(required_limits={
         k: adapter.limits[k] for k in ("max-storage-buffer-binding-size", "max-buffer-size")})
+    return adapter, device
+
+
+def makers(device, out, level=8):
+    return {"records": lambda s: Records(device, s, level),
+            "slang": lambda s: Slang(device, s, level, out),
+            "cached": lambda s: Cached(device, s, level, out),
+            "flat": lambda s: Flat(device, s, level, out)}
+
+
+def first(renderer, surf, out):
+    """A fresh process's first picture: the device, the renderer's setup and the first
+    frame (drawn, waited for and read back), in ms."""
+    start = time.perf_counter()
+    _, device = open_device()
+    times = {"device": time.perf_counter() - start}
+    target = _Target(device)
+    start = time.perf_counter()
+    r = makers(device, out)[renderer](surf)
+    times["setup"] = time.perf_counter() - start
+    start = time.perf_counter()
+    r.draw(target, *camera(0, 30))
+    device.queue.read_texture({"texture": target.color, "origin": (0, 0, 0), "mip_level": 0},
+                              {"offset": 0, "bytes_per_row": W * 4}, (W, H, 1))
+    times["first"] = time.perf_counter() - start
+    return {k: 1e3 * v for k, v in times.items()}
+
+
+def main(out, kind="straight", sizes=(16, 32, 64, 128), level=8):
+    tack.set_default_device("cpu")
+    adapter, device = open_device()
     info = adapter.info
     print(f"# wgpu {info['backend_type']} {info['device']} ({info['adapter_type']}), {W}x{H}")
     print("renderer kind n faces triangles setup_ms first_ms frame_ms")
@@ -323,15 +355,11 @@ def main(out, kind="straight", sizes=(16, 32, 64, 128), level=8):
         surf = surface(kind, n)
         made = time.perf_counter() - start
         print(f"# {kind} n={n}: {surf.num_cells} faces, Tack's surface in {made:.1f} s")
-        makers = {"records": lambda s=surf: Records(device, s, level),
-                  "slang": lambda s=surf: Slang(device, s, level, out),
-                  "cached": lambda s=surf: Cached(device, s, level, out),
-                  "flat": lambda s=surf: Flat(device, s, level, out)}
-        wanted = os.environ.get("BENCH_RENDERERS", ",".join(makers)).split(",")
-        for name in wanted:
-            tri, setup, first, frame = bench(device, makers[name], surf)
+        make = makers(device, out, level)
+        for name in os.environ.get("BENCH_RENDERERS", ",".join(make)).split(","):
+            tri, setup, first_frame, frame = bench(device, lambda s=surf, m=make[name]: m(s), surf)
             print(f"{name} {kind} {n} {surf.num_cells} {tri} {1e3 * setup:.0f} "
-                  f"{1e3 * first:.1f} {1e3 * frame:.2f}", flush=True)
+                  f"{1e3 * first_frame:.1f} {1e3 * frame:.2f}", flush=True)
 
 
 if __name__ == "__main__":

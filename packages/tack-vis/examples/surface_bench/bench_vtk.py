@@ -92,7 +92,7 @@ def polygons(surf, level):
     return poly, n // 3
 
 
-def setup(mode, surf, level):
+def setup(mode, surf, level, window=None):
     renderer = rr.vtkRenderer(background=(1.0, 1.0, 1.0))
     values = surf.fields["f"].values.numpy().reshape(-1)
     lo, hi = float(values.min()), float(values.max())
@@ -114,10 +114,34 @@ def setup(mode, surf, level):
         mapper = rr.vtkPolyDataMapper(input_data=poly, scalar_range=(lo, hi))
         mapper.SetInterpolateScalarsBeforeMapping(True)
     renderer.AddActor(rr.vtkActor(mapper=mapper))
-    window = rr.vtkRenderWindow(size=(W, H), off_screen_rendering=True)
-    _webgpu_backend(window)
+    window = window or _window()
     window.AddRenderer(renderer)
     return window, renderer, triangles
+
+
+def _window():
+    window = rr.vtkRenderWindow(size=(W, H), off_screen_rendering=True)
+    _webgpu_backend(window)
+    return window
+
+
+def first(mode, surf, level=8):
+    """A fresh process's first picture: the window and its device (``Initialize``), the
+    mapper's input and actor, and the first frame (rendered, waited for and read back),
+    in ms. ``polygons`` includes Tack evaluating the triangles' points and values."""
+    start = time.perf_counter()
+    window = _window()
+    window.Initialize()
+    times = {"device": time.perf_counter() - start}
+    start = time.perf_counter()
+    window, renderer, _ = setup(mode, surf, level, window)
+    times["setup"] = time.perf_counter() - start
+    start = time.perf_counter()
+    frame(window, renderer, 0, 30)
+    grab = rr.vtkWindowToImageFilter(input=window)
+    grab.Update()
+    times["first"] = time.perf_counter() - start
+    return {k: 1e3 * v for k, v in times.items()}
 
 
 def _webgpu_backend(window):
