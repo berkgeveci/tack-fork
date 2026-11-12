@@ -21,6 +21,7 @@ from test_shapes import EXPECTED
 
 import tack
 import tack.dataset as td
+from tack import arrays
 from tack.dataset import algorithms as alg
 from tack.dataset import shapes as sh
 from tack.runtime.dispatch import env_flag
@@ -751,6 +752,33 @@ def test_l2_fields_come_to_the_surface_as_each_faces_trace(backend, mesh, order,
     np.testing.assert_allclose(u.values.numpy(),
                                td.interpolate(surface, _cubic_at, u.space).values.numpy(),
                                atol=2e-5)
+
+
+@tack.func
+def _swirl_at(x):
+    return tack.vec3(-x[1] * x[2], x[0] * x[0] + x[2], x[0] * x[1] * x[2])
+
+
+@pytest.mark.parametrize("mesh", ["explicit", "tetrahedra", "wedges"])
+@pytest.mark.parametrize("basis", ["equispaced", "bernstein"])
+def test_a_vector_l2_fields_trace_is_a_vector(backend, mesh, basis):
+    """A DG velocity comes to the surface as each face's trace of every component,
+    stored or implicit (a reader's blocks, concatenated). The traces were allocated
+    in the values' ``dtype``, an implicit array's component type, so an implicit
+    vector field stopped extract_surface with a lowering error."""
+    data = _l2_mesh(mesh)
+    space = td.L2(data, order=3, basis=basis)
+    stored = td.interpolate(data, _swirl_at, space, dtype=tack.vec3()).values
+    n = stored.shape[0] // 2
+    host = stored.numpy()
+    data.fields["v"] = td.Field(space, arrays.Concatenate(tack.array(host[:n], tack.vec3()),
+                                                          tack.array(host[n:], tack.vec3())))
+    surface = td.extract_surface(data)
+    v = surface.fields["v"]
+    assert v.space == td.L2(surface, order=3, basis=basis)
+    np.testing.assert_allclose(
+        v.values.numpy(),
+        td.interpolate(surface, _swirl_at, v.space, dtype=tack.vec3()).values.numpy(), atol=2e-5)
 
 
 def test_an_l2_fields_trace_is_the_same_on_every_surface_path(backend):

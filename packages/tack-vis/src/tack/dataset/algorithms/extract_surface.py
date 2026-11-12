@@ -14,7 +14,7 @@ from tack.arrays import CountingArray
 from tack.dataset import ids as id_types
 from tack.dataset import shapes
 from tack.dataset.algorithms._common import _close
-from tack.dataset.carry import Pieces, Same, Take, _take, carry, selected
+from tack.dataset.carry import Pieces, Same, Take, _like, _take, carry, selected
 from tack.dataset.dataset import Field
 from tack.dataset.sets import Set
 from tack.dataset.spaces import H1, L2
@@ -613,7 +613,7 @@ def _keep_traces(data, out, cells, points, fields):
                           **({} if space.basis is None else {"basis": space.basis}))
         nodal_space = (_bernstein.lagrange_companion(target_space)
                        if _bernstein.is_bernstein(target_space) else target_space)
-        target = Field(nodal_space, tack.empty((nodal_space.size,), field.values.dtype))
+        target = Field(nodal_space, _like(field.values, nodal_space.size))
         for h in out.launch_groups("cells", [target]):
             if not h.count:
                 continue
