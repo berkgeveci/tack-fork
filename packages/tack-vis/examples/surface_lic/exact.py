@@ -7,8 +7,11 @@ slice's vertex values.
 
 - Tack's evaluation as Slang (``slang_gen``, as the hooks): the cell's position and
   Jacobian at parametric coordinates (``tack_cell_geometry``), a vector field
-  (``tack_vector``) and a scalar field (``tack_scalar``) there, each reading one packed
-  buffer of Tack's arrays.
+  (``tack_vector``) and a scalar field (``tack_scalar``) there, all three reading one
+  packed buffer of Tack's arrays (``export_shared``: each array once, the topology's
+  connectivity shared by the geometry and both fields).
+- Only the cells the slice cuts (``cut_cells``): the volume's other cells are never
+  read.
 - The slice's triangles, each with its own three vertices, the cell it lies in (its
   centroid located by Tack's ``CellLocator``), and each vertex's parametric
   coordinates in that cell (the vertex located after a nudge towards the centroid, so
@@ -27,7 +30,7 @@ import tack.dataset as td
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "slang_surfaces"))
 
-from slang_gen import export, joined  # noqa: E402
+from slang_gen import export_shared, joined  # noqa: E402
 from shaders import _one_cell_arrays  # noqa: E402
 
 
@@ -51,8 +54,8 @@ def _field_at(u, ids, pcs, out):
 
 def volume_functions(data, vector, scalar):
     """The generated Slang (``tack_cell_geometry``, ``tack_vector``, ``tack_scalar``,
-    each taking its packed buffer first) and the three buffers' words. The volume must
-    be one launch group (one cell shape and order)."""
+    each taking the shared buffer first) and the buffer's words. The volume must be one
+    launch group (one cell shape and order)."""
     fields = [data.fields[vector], data.fields[scalar]]
     groups = [g for g in data.launch_groups("cells", fields) if g.count]
     if len(groups) != 1:
@@ -62,18 +65,25 @@ def volume_functions(data, vector, scalar):
         raise ValueError("the launch group is not every cell")
     cells = data.domain_view("cells", group)
     ids, pcs = _one_cell_arrays()
-    geometry = export(_cell_geometry_at, (cells, ids, pcs, tack.empty((4,), tack.vec3())),
-                      "tack_cell_geometry",
-                      {"ids": ("int", 1), "pcs": ("float", 3), "out": ("float", 12)},
-                      ("float4x3", "float4x3(" + ", ".join(f"{{out}}[{k}]" for k in range(12))
-                       + ")"), binding=None)
-    v = export(_field_at, (fields[0].view(group), ids, pcs, tack.empty((1,), tack.vec3())),
-               "tack_vector", {"ids": ("int", 1), "pcs": ("float", 3), "out": ("float", 3)},
-               ("float3", "float3({out}[0], {out}[1], {out}[2])"), binding=None)
-    s = export(_field_at, (fields[1].view(group), ids, pcs, tack.empty((1,), tack.f32)),
-               "tack_scalar", {"ids": ("int", 1), "pcs": ("float", 3), "out": ("float", 1)},
-               ("float", "{out}[0]"), binding=None)
-    return joined(geometry, v, s), [e.buffers[0][1] for e in (geometry, v, s)]
+    slots = {"ids": ("int", 1), "pcs": ("float", 3)}
+    outs, words = export_shared([
+        (_cell_geometry_at, (cells, ids, pcs, tack.empty((4,), tack.vec3())),
+         "tack_cell_geometry", {**slots, "out": ("float", 12)},
+         ("float4x3", "float4x3(" + ", ".join(f"{{out}}[{k}]" for k in range(12)) + ")")),
+        (_field_at, (fields[0].view(group), ids, pcs, tack.empty((1,), tack.vec3())),
+         "tack_vector", {**slots, "out": ("float", 3)},
+         ("float3", "float3({out}[0], {out}[1], {out}[2])")),
+        (_field_at, (fields[1].view(group), ids, pcs, tack.empty((1,), tack.f32)),
+         "tack_scalar", {**slots, "out": ("float", 1)}, ("float", "{out}[0]")),
+    ])
+    return joined(*outs), words
+
+
+def cut_cells(data, cells):
+    """``data``'s cells ``cells`` alone (``extract_cells``, with only their points and
+    the fields there), and ``cells`` renumbered into it (it keeps the cells' order)."""
+    kept = np.unique(cells)
+    return td.extract_cells(data, kept), np.searchsorted(kept, cells).astype(np.uint32)
 
 
 def slice_cells(data, points, triangles, nudge=1e-3):

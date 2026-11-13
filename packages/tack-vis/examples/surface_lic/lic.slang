@@ -48,9 +48,8 @@ float4 clipOf(Frame f, float4 p)
 // triangles each with its cell, and each triangle vertex's parametric coordinates
 // there (points are per triangle vertex: point i is triangle i / 3's vertex i % 3).
 #include "tack_volume.slang"
-[vk::binding(14, 0)] StructuredBuffer<uint> geometryPool;
-[vk::binding(15, 0)] StructuredBuffer<uint> vectorPool;
-[vk::binding(16, 0)] StructuredBuffer<uint> scalarPool;
+// The one buffer of Tack's arrays all three functions read.
+[vk::binding(14, 0)] StructuredBuffer<uint> tackPool;
 [vk::binding(17, 0)] StructuredBuffer<uint> triangleCells;
 [vk::binding(18, 0)] StructuredBuffer<float> parametric;
 #endif
@@ -129,7 +128,7 @@ float3x3 inverse3(float3x3 m)
 float3 locate(uint c, float3 x, float3 xi)
 {
     for (int it = 0; it < 8; ++it) {
-        float4x3 g = tack_cell_geometry(geometryPool, int(c), xi);
+        float4x3 g = tack_cell_geometry(tackPool, int(c), xi);
         // Rows 1-3 are the Jacobian's columns, so their matrix is its transpose.
         float3x3 jacobian = transpose(float3x3(g[1], g[2], g[3]));
         float3 step = mul(inverse3(jacobian), x - g[0]);
@@ -157,8 +156,8 @@ SurfaceTargets fs_surface(SurfaceVertex in)
     float footprint = max(length(ddx(in.model)), length(ddy(in.model)));
 #ifdef TACK_EXACT
     float3 xi = locate(in.cell, in.model, in.pc);
-    float3 v = tack_vector(vectorPool, int(in.cell), xi);
-    float scalar = tack_scalar(scalarPool, int(in.cell), xi);
+    float3 v = tack_vector(tackPool, int(in.cell), xi);
+    float scalar = tack_scalar(tackPool, int(in.cell), xi);
 #else
     float3 v = in.vector;
     float scalar = in.scalar;

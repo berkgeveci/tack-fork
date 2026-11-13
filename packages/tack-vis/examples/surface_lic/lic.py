@@ -43,7 +43,7 @@ PASSES = {
 # Bindings, by the numbers in lic.slang.
 FRAME, FIELD, INPUT, OUTPUT, RANGE, COLOR, FINAL, POINTS, VECTORS, TRIANGLES, SCALARS = (
     0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13)
-GEOMETRY_POOL, VECTOR_POOL, SCALAR_POOL, TRIANGLE_CELLS, PARAMETRIC = 14, 15, 16, 17, 18
+TACK_POOL, TRIANGLE_CELLS, PARAMETRIC = 14, 17, 18
 
 
 def compile_passes(out_dir, defines=()):
@@ -77,8 +77,8 @@ class LIC:
         field's tangential speed (``render(..., by_scalar=True)``).
 
         ``exact`` evaluates the fields per pixel with the cells' own basis instead of
-        interpolating ``vectors`` and ``scalars`` (then unused): a dict of ``source``
-        (``exact.volume_functions``' Slang), ``pools`` (its three buffers' words),
+        interpolating ``vectors`` and ``scalars`` (then unused, may be None): a dict of
+        ``source`` (``exact.volume_functions``' Slang), ``pool`` (its buffer's words),
         ``cells`` (a triangle's cell) and ``pcs`` (``(k, 3, 3)``, each triangle vertex's
         parametric coordinates there); ``points`` are then per triangle vertex
         (``(3k, 3)``) and ``triangles`` ``arange(3k)``."""
@@ -88,9 +88,11 @@ class LIC:
         self.device = d = adapter.request_device_sync()
         storage = wgpu.BufferUsage.STORAGE
         self.points = d.create_buffer_with_data(data=points.reshape(-1), usage=storage)
+        # Unread in the exact path, but bound: a word each.
+        vectors = np.zeros(1, np.float32) if vectors is None else vectors
         self.vectors = d.create_buffer_with_data(data=vectors.reshape(-1), usage=storage)
         self.triangles = d.create_buffer_with_data(data=triangles.reshape(-1), usage=storage)
-        scalars = np.zeros(len(points), np.float32) if scalars is None else scalars
+        scalars = np.zeros(1, np.float32) if scalars is None else scalars
         self.scalars = d.create_buffer_with_data(data=np.asarray(scalars, np.float32),
                                                  usage=storage)
         self.count = triangles.size
@@ -105,10 +107,8 @@ class LIC:
             with open(os.path.join(out_dir, "tack_volume.slang"), "w") as f:
                 f.write(exact["source"])
             defines = ("TACK_EXACT",)
-            for b, words in zip((GEOMETRY_POOL, VECTOR_POOL, SCALAR_POOL), exact["pools"],
-                                strict=True):
-                self.exact[b] = d.create_buffer_with_data(
-                    data=np.ascontiguousarray(words, np.uint32), usage=storage)
+            self.exact[TACK_POOL] = d.create_buffer_with_data(
+                data=np.ascontiguousarray(exact["pool"], np.uint32), usage=storage)
             self.exact[TRIANGLE_CELLS] = d.create_buffer_with_data(
                 data=np.ascontiguousarray(exact["cells"], np.uint32), usage=storage)
             self.exact[PARAMETRIC] = d.create_buffer_with_data(

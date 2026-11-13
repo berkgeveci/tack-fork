@@ -61,16 +61,18 @@ def main(path=DISK, out="."):
         if not per_pixel:
             return lic.LIC(points, triangles, vectors, os.path.join(out, "wgsl-vertex"),
                            scalars=temp, **size)
-        source, pools = exact.volume_functions(data, "V", "Temp")
         cells, corners, pcs, moved = exact.slice_cells(data, points, triangles)
-        print(f"  exact: {len(np.unique(cells))} cells under the slice; "
-              f"generated Slang {len(source) // 1024} KiB; buffers "
-              f"{sum(len(p) for p in pools) * 4 / 2**20:.2f} MB; {moved} vertices started "
-              f"from a cell centre", flush=True)
+        cut, cells = exact.cut_cells(data, cells)
+        source, pool = exact.volume_functions(cut, "V", "Temp")
         k = len(triangles)
+        slice_bytes = corners.nbytes + cells.nbytes + pcs.nbytes
+        print(f"  exact: {cut.num_cells} cells under the slice ({cut.num_points} points); "
+              f"generated Slang {len(source) // 1024} KiB; Tack's buffer "
+              f"{len(pool) * 4 / 1024:.1f} KiB, the slice's {slice_bytes / 1024:.1f} KiB; "
+              f"{moved} vertices started from a cell centre", flush=True)
         return lic.LIC(corners.reshape(-1, 3), np.arange(3 * k, dtype=np.uint32).reshape(-1, 3),
-                       np.zeros((3 * k, 3), np.float32), os.path.join(out, "wgsl-exact"),
-                       exact=dict(source=source, pools=pools, cells=cells, pcs=pcs), **size)
+                       None, os.path.join(out, "wgsl-exact"),
+                       exact=dict(source=source, pool=pool, cells=cells, pcs=pcs), **size)
 
     renderers = {"exact": renderer_for(True), "per vertex": renderer_for(False)}
     renderer = renderers["exact" if os.environ.get("EXACT", "1") != "0" else "per vertex"]

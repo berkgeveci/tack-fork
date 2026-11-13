@@ -64,7 +64,7 @@ class SlangCodeGen(MSLCodeGen):
     _HAS_F64 = False
     _integer_type_map = SLANG_TYPES
 
-    def __init__(self, ir_func, name, slots, results, binding, group=0):
+    def __init__(self, ir_func, name, slots, results, binding, group=0, header_base=0):
         original = [p.name for p in ir_func.params]
         super().__init__(ir_func)
         # The GPU renaming keeps the parameters' order: the slots by position.
@@ -78,6 +78,9 @@ class SlangCodeGen(MSLCodeGen):
         self._results = (results[0], results[1].format(out=out))
         self._binding = binding          # the first binding number this function takes
         self._group = group
+        # Where the function's header starts in its buffer: 0 alone, after the others'
+        # headers in a buffer several functions share (export_shared).
+        self._header_base = header_base
         self._globals = {}               # parameter -> its buffer's name
         self._aliases = {}               # a local holding an array -> the array it names
 
@@ -155,10 +158,10 @@ class SlangCodeGen(MSLCodeGen):
                 for c in range(length):
                     self._emit(f"{n}[{c}] = {own}[{c}];")
         for name, slot in offset_names:
-            self._emit(f"int {name} = asint({pool}[{slot}]);")
+            self._emit(f"int {name} = asint({pool}[{self._header_base + slot}]);")
         for param, offset in scalars:
             t = SLANG_TYPES[param.type_annotation]
-            self._emit(f"{t} {param.name} = {_READ[t]}({pool}[{offset}]);")
+            self._emit(f"{t} {param.name} = {_READ[t]}({pool}[{self._header_base + offset}]);")
             self._local_vars[param.name] = t
             self._declared_vars.add(param.name)
         self._declare_locals_at_kernel_scope(func.body)
@@ -313,14 +316,17 @@ def _structure(kernel, args, effective_args, *rest):
                   else ("s", type(a).__name__) for a in effective_args))
 
 
-def export(kernel, args, name, slots, results, binding, group=0):
+def export(kernel, args, name, slots, results, binding, group=0, header_base=0):
     """``kernel`` called with ``args`` (Tack arrays, views), its one iteration as a Slang
     function ``name``: ``slots`` names the kernel's per-iteration parameters in order,
     each ``(Slang type, length)``, the last the result; ``results`` is ``(return type,
     expression of the slots)``.
 
     The code is generated once per structure (``_structure``); a later call of the same
-    structure (a new mesh, another step) only packs its arrays into the buffer."""
+    structure (a new mesh, another step) only packs its arrays into the buffer.
+    ``header_base`` is where the function's header starts in its buffer
+    (``export_shared``). The result keeps the packing's ``layout`` and the call's
+    ``effective_args``."""
     from dataclasses import replace
 
     from tack.lang.inspect_kernel import _prepare_ir
@@ -328,25 +334,72 @@ def export(kernel, args, name, slots, results, binding, group=0):
 
     effective_args = _expand_template_args(args, _detect_template_args(kernel, args))
     key = _structure(kernel, args, effective_args, name, repr(slots), repr(results), binding,
-                     group)
+                     group, header_base)
     hit = _EXPORTS.get(key)
     if hit is not None:
         out, layout, next_binding = hit
         words = pack(layout, effective_args)
         out = replace(out, buffers=[(out.buffers[0][0], words)])
         out.next_binding = next_binding
+        out.layout, out.effective_args = layout, effective_args
         return out
     ir_func, effective_args = _prepare_ir(kernel, args)
     for node in walk_ir(ir_func.body):
         if isinstance(node, (ir.IRAtomicOp, ir.IRBarrier, ir.IRSharedAlloc)):
             raise NotImplementedError(f"{name}: {type(node).__name__} has no place in a shader")
-    gen = SlangCodeGen(ir_func, name, slots, results, binding, group)
+    gen = SlangCodeGen(ir_func, name, slots, results, binding, group, header_base)
     out = gen.generate(effective_args)
     out.next_binding = gen.next_binding
+    out.layout, out.effective_args = gen.layout, effective_args
     # Kept without its words, which the next call packs afresh.
     _EXPORTS[key] = (replace(out, buffers=[(b, None) for b, _ in out.buffers]), gen.layout,
                      gen.next_binding)
     return out
+
+
+def _header_size(layout):
+    return sum(1 for kind in layout if kind is not None)
+
+
+def pack_shared(parts):
+    """One buffer for several functions (``parts``: per function its ``(layout,
+    effective_args)``, in order): their headers one after another, then every array
+    once -- an array two functions read (a topology's connectivity, read by the
+    geometry's view and every field's) is stored once, by identity. Each header holds
+    its arrays' offsets in the whole buffer, then its scalars."""
+    sizes = [_header_size(layout) for layout, _ in parts]
+    total = sum(sizes)
+    data, where = [], {}
+    headers = []
+    for layout, effective_args in parts:
+        offsets, scalars = [], []
+        for kind, arg in zip(layout, effective_args, strict=True):
+            if kind is None:
+                continue
+            is_array, t = kind
+            if is_array:
+                key = (id(arg), t)
+                if key not in where:
+                    host = np.asarray(arrays.to_host(arrays.materialize(arg))).reshape(-1)
+                    where[key] = total + sum(len(d) for d in data)
+                    data.append(host.astype(_NUMPY[t]).view(np.uint32))
+                offsets.append(where[key])
+            else:
+                scalars.append(np.array([arg], _NUMPY[t]).view(np.uint32))
+        headers.append(np.concatenate([np.array(offsets, np.uint32), *scalars])
+                       if offsets or scalars else np.zeros(0, np.uint32))
+    words = np.concatenate([*headers, *data]) if total or data else np.zeros(1, np.uint32)
+    return words if len(words) else np.zeros(1, np.uint32)
+
+
+def export_shared(specs):
+    """Several functions reading one buffer, passed to each as its first parameter:
+    ``specs`` are ``export``'s arguments without ``binding`` (each ``(kernel, args,
+    name, slots, results)``). The functions and the buffer's words (``pack_shared``)."""
+    first = [export(*spec, binding=None) for spec in specs]
+    bases = np.cumsum([0] + [_header_size(e.layout) for e in first[:-1]])
+    outs = [export(*spec, binding=None, header_base=int(b)) for spec, b in zip(specs, bases)]
+    return outs, pack_shared([(e.layout, e.effective_args) for e in outs])
 
 
 def is_array(arg):
