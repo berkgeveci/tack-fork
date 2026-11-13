@@ -9,7 +9,11 @@ carrying what its field *is* on the GPU, for a mapper to volume render
 - Tack's packed buffer (field data ``TackPool``, 32-bit words);
 - ``tack_sample(pool, p)`` as Slang over that buffer (field data ``TackEvaluation``);
 - the bounds (``TackBounds``), the value range (``TackRange``) and the smallest cell
-  size (``TackCellSize``).
+  size (``TackCellSize``);
+- the macrocells for empty-space skipping: their grid (``TackMacroGrid``: origin,
+  size, dimensions) and the values each can take (``TackMacroLow``,
+  ``TackMacroHigh``), made by a Tack kernel over the cells
+  (``volume_tack.macro_grid``).
 
 The input holds cell-centred values (the cell array ``array``):
 
@@ -57,11 +61,12 @@ def _floats(name, values):
 class TackVolume(VTKPythonAlgorithmBase):
     """The input's cell array ``array`` as a volume to render (see the module)."""
 
-    def __init__(self, array="values", blend=1):
+    def __init__(self, array="values", blend=1, macrocells=64):
         super().__init__(nInputPorts=1, inputType="vtkDataObject", nOutputPorts=1,
                          outputType="vtkPolyData")
         self.array = array
         self.blend = blend
+        self.macrocells = macrocells          # at most, along the longest axis
         self._key = None
         self.timings = {}
 
@@ -77,7 +82,7 @@ class TackVolume(VTKPythonAlgorithmBase):
             spacing = data.GetSpacing()
             box = volume_tack.CellBox(tack.array(values.reshape(-1)), dims, data.GetOrigin(),
                                       spacing)
-            return box, data.GetBounds(), box.values, min(spacing)
+            return box, data.GetBounds(), box.values, min(spacing), spacing
         if isinstance(data, vtkOverlappingAMR):
             from tack.interop.vtk import vtk_to_dataset
 
@@ -93,7 +98,7 @@ class TackVolume(VTKPythonAlgorithmBase):
             data.GetBounds(bounds)
             volume = volume_tack.amr_volume(amr, spacings, bounds[::2], self.array, self.blend)
             self.amr = amr
-            return volume, tuple(bounds), volume.values, min(spacings[-1])
+            return volume, tuple(bounds), volume.values, min(spacings[-1]), spacings[0]
         raise TypeError(f"TackVolume takes an image or an overlapping AMR, not "
                         f"{data.GetClassName()}")
 
@@ -105,8 +110,11 @@ class TackVolume(VTKPythonAlgorithmBase):
         out = vtkPolyData.GetData(outInfo)
         key = (data.GetMTime(), self.array, self.blend)
         if key != self._key:
-            box, bounds, values, cell = self._sampler(data)
+            box, bounds, values, cell, coarse = self._sampler(data)
             t1 = time.perf_counter()
+            grid, lows, highs = volume_tack.macro_grid(box, len(values), bounds, coarse,
+                                                       self.macrocells)
+            t2 = time.perf_counter()
             evaluation, pool = volume_tack.sample_functions(box)
             self.box = box
             cube = vtkCubeSource(bounds=bounds)
@@ -127,10 +135,16 @@ class TackVolume(VTKPythonAlgorithmBase):
             fields.AddArray(_floats("TackBounds", bounds))
             fields.AddArray(_floats("TackRange", (values.min(), values.max())))
             fields.AddArray(_floats("TackCellSize", (cell,)))
+            fields.AddArray(_floats("TackMacroGrid", (*grid["origin"], *grid["size"],
+                                                      *grid["dims"])))
+            for name, array in (("TackMacroLow", lows), ("TackMacroHigh", highs)):
+                out_array = vtkFloatArray(array.numpy())
+                out_array.SetName(name)
+                fields.AddArray(out_array)
             self._key = key
-            self.timings = {"convert_ms": 1000 * (t1 - t0),
-                            "export_ms": 1000 * (time.perf_counter() - t1),
-                            "pool_bytes": 4 * len(pool)}
+            self.timings = {"convert_ms": 1000 * (t1 - t0), "macro_ms": 1000 * (t2 - t1),
+                            "export_ms": 1000 * (time.perf_counter() - t2),
+                            "pool_bytes": 4 * len(pool), "macrocells": grid["dims"]}
         out.ShallowCopy(self._surface)
         self.timings["tack_ms"] = 1000 * (time.perf_counter() - t0)
         return 1

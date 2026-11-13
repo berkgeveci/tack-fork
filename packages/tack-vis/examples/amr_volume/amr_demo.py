@@ -24,7 +24,7 @@ import numpy as np
 import volume_tack
 import vtkmodules.vtkRenderingCore as rr
 from tack_volume import TackVolume
-from volume_demo import grab, transfer_functions, write_png
+from volume_demo import grab, reference, transfer_functions, write_png
 from volume_mapper import VolumeMapper
 from vtkmodules.vtkFiltersSources import vtkOutlineSource
 
@@ -145,13 +145,8 @@ def main():
         write_png(os.path.join(args.out, f"amr_{name}{suffix}.png"), picture)
         if args.outlines:
             continue
-        cell = volume.GetOutputDataObject(0).GetFieldData().GetArray(
-            "TackCellSize").GetValue(0)
-        h, unit = mapper.steps(cell)
         t = time.perf_counter()
-        bounds = volume.GetOutputDataObject(0).GetFieldData().GetArray("TackBounds").GetTuple(0)
-        expected = volume_tack.reference(volume.box, camera, size, bounds,
-                                         mapper.table(lo, hi), lo, hi, h, unit, background)
+        expected = reference(volume, mapper, camera, size, background)
         reference_ms = 1000 * (time.perf_counter() - t)
         write_png(os.path.join(args.out, f"amr_{name}{suffix}_reference.png"), expected)
         d = np.abs(picture[..., :3].astype(int) - expected[..., :3].astype(int)).max(axis=2)

@@ -74,6 +74,14 @@ def grab(window):
     return np.ascontiguousarray(rgba[::-1])           # row 0 at the top, RGBA
 
 
+def reference(volume, mapper, camera, size, background):
+    """The picture the mapper's hook should draw, marched in Tack."""
+    march = mapper.march(volume.GetOutputDataObject(0))
+    return volume_tack.reference(volume.box, camera, size, march["bounds"], march["table"],
+                                 march["lo"], march["hi"], march["factor"], march["unit"],
+                                 march["grid"], march["seen"], march["skip"], background)
+
+
 def transfer_functions(mapper, lo, hi):
     r = hi - lo
     c = mapper.color
@@ -139,11 +147,7 @@ def main():
     write_png(os.path.join(args.out, f"volume{tag}.png"), picture)
 
     t = time.perf_counter()
-    poly = volume.GetOutputDataObject(0)
-    cell = poly.GetFieldData().GetArray("TackCellSize").GetValue(0)
-    h, unit = mapper.steps(cell)
-    expected = volume_tack.reference(volume.box, camera, size, source.GetBounds(),
-                                     mapper.table(lo, hi), lo, hi, h, unit, background)
+    expected = reference(volume, mapper, camera, size, background)
     print(f"reference (Tack, CPU) {1000 * (time.perf_counter() - t):.0f} ms", flush=True)
     write_png(os.path.join(args.out, f"volume{tag}_reference.png"), expected)
     d = np.abs(picture[..., :3].astype(int) - expected[..., :3].astype(int)).max(axis=2)

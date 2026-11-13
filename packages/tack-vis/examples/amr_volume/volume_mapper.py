@@ -23,12 +23,19 @@ turning the camera draws correctly from the state it was sent.
 **The marcher** (``HOOK``): fragments of the box's front faces are discarded (``clip``),
 so each pixel's fragment is on a back face, its ``positionMC`` the ray's far end; the
 inverse of ``modelToClip`` unprojects the same pixel onto the near plane, the ray's
-start. A slab test against the bounds gives where it enters; samples at the middles of
-steps ``h`` long from there; the transfer function by linear interpolation in its
-table; opacity corrected for the step (``1 - (1 - a)^(h / unit)``); composited front to
-back until the opacity reaches ``volume_tack.OPAQUE``. The hook writes ``(C / A, A)``,
-which the A-buffer composites over the opaque image. ``volume_tack.reference`` is the
-same march in Tack.
+start. A slab test against the bounds gives where it enters. From there:
+
+- in a macrocell the transfer function makes invisible (``hooks.visible``, 0), the ray
+  jumps to where it leaves it;
+- otherwise a step ``h`` is ``sample_distance`` times the local cell size
+  (``tack_cell_size``: the finest level holding the point), sampled at its middle;
+  the transfer function by linear interpolation in its table; opacity corrected for
+  the step (``1 - (1 - a)^(h / unit)``); composited front to back until the opacity
+  reaches ``volume_tack.OPAQUE``.
+
+The hook writes ``(C / A, A)``, which the A-buffer composites over the opaque image.
+``volume_tack.reference`` is the same march in Tack, and ``visible`` there what makes
+``hooks.visible`` (a Tack kernel over the input's macrocell ranges and the table).
 """
 
 import hashlib
@@ -87,11 +94,20 @@ float tack_safe_inverse(float x)
     return 1.f / (abs(x) < 1e-20f ? (x < 0.f ? -1e-20f : 1e-20f) : x);
 }
 
+float tack_exit(float q, float d, float inv, int mi, float m)
+{
+    float face = float(mi) * m;
+    if (d >= 0.f)
+        face = float(mi + 1) * m;
+    return (face - q) * inv;
+}
+
 public struct TackVolumeHook : IShaderHooks
 {
     StructuredBuffer<uint> pool;       // Tack's arrays
     StructuredBuffer<uint> tf;         // the transfer function's table
-    float tf_size;                     // its entries
+    StructuredBuffer<uint> visible;    // per macrocell: can it show (1) or not (0)
+    float tf_size;                     // the table's entries
     float lo;                          // the value range the table spans
     float hi;
     float x0;                          // the bounds
@@ -100,8 +116,18 @@ public struct TackVolumeHook : IShaderHooks
     float x1;
     float y1;
     float z1;
-    float h;                           // the step
+    float factor;                      // a step, in local cells
     float unit;                        // the opacity's unit distance
+    float skip;                        // past a macrocell's face
+    float gx;                          // the macrocells: how many,
+    float gy;
+    float gz;
+    float mox;                         // where they start,
+    float moy;
+    float moz;
+    float mx;                          // and their size
+    float my;
+    float mz;
     float max_steps;
     float opaque;
 
@@ -115,30 +141,43 @@ public struct TackVolumeHook : IShaderHooks
         float4 q = mul(tack_inverse4(f.modelToClip), float4(c.xy / c.w, 0.f, 1.f));
         float3 near = q.xyz / q.w;
         float3 d = back - near;
-        float len = length(d);
-        float3 dir = d / len;
+        float3 dir = d / length(d);
         float3 inv = float3(tack_safe_inverse(dir.x), tack_safe_inverse(dir.y),
                             tack_safe_inverse(dir.z));
         float3 ta = (float3(x0, y0, z0) - near) * inv;
         float3 tb = (float3(x1, y1, z1) - near) * inv;
         float3 tn = min(ta, tb), tx = max(ta, tb);
-        float t0 = max(max(max(tn.x, tn.y), tn.z), 0.f);
+        float t = max(max(max(tn.x, tn.y), tn.z), 0.f);
         float t1 = min(min(tx.x, tx.y), tx.z);
-        int n = 0;
-        if (t1 > t0)
-            n = min(int((t1 - t0) / h), int(max_steps));
+        float3 o = near - float3(mox, moy, moz);
+        int ngx = int(gx), ngy = int(gy), ngz = int(gz);
+        int most = int(max_steps);
         int entries = int(tf_size);
         float3 colour = float3(0.f);
         float a = 0.f;
-        for (int j = 0; j < n; ++j) {
-            float v = tack_sample(pool, near + dir * (t0 + (float(j) + 0.5f) * h));
-            float4 s = tack_transfer(tf, entries, (v - lo) / (hi - lo));
-            float alpha = 1.f - pow(1.f - s.w, h / unit);
-            float w = (1.f - a) * alpha;
-            colour += w * s.xyz;
-            a += w;
-            if (a >= opaque)
-                break;
+        int steps = 0;
+        while (t < t1 && steps < most) {
+            steps += 1;
+            int mi = min(max(int(floor((o.x + dir.x * t) / mx)), 0), ngx - 1);
+            int mj = min(max(int(floor((o.y + dir.y * t) / my)), 0), ngy - 1);
+            int mk = min(max(int(floor((o.z + dir.z * t) / mz)), 0), ngz - 1);
+            if (visible[mi + ngx * (mj + ngy * mk)] == 0u) {
+                float ex = tack_exit(o.x, dir.x, inv.x, mi, mx);
+                float ey = tack_exit(o.y, dir.y, inv.y, mj, my);
+                float ez = tack_exit(o.z, dir.z, inv.z, mk, mz);
+                t = max(min(min(ex, ey), ez), t) + skip;
+            } else {
+                float h = factor * tack_cell_size(pool, near + dir * t);
+                float v = tack_sample(pool, near + dir * (t + 0.5f * h));
+                float4 s = tack_transfer(tf, entries, (v - lo) / (hi - lo));
+                float alpha = 1.f - pow(1.f - s.w, h / unit);
+                float w = (1.f - a) * alpha;
+                colour += w * s.xyz;
+                a += w;
+                t += h;
+                if (a >= opaque)
+                    break;
+            }
         }
         f.color = a > 0.f ? float4(colour / a, a) : float4(0.f);
     }
@@ -156,8 +195,8 @@ def _words(values):
 class VolumeMapper(VTKPythonMapperBase):
     """Volume renders a ``TackVolume`` output (see the module's docstring). ``color``
     and ``opacity`` are the transfer functions, in data values; ``sample_distance`` is
-    the step in cells (of the smallest cell size), ``unit_distance`` the opacity's unit
-    in cells; ``table_size`` the transfer function table's entries."""
+    the step in local cells, ``unit_distance`` the opacity's unit in the finest cells;
+    ``table_size`` the transfer function table's entries."""
 
     def __init__(self, sample_distance=0.5, unit_distance=1.0, table_size=256):
         VTKPythonMapperBase.__init__(self)
@@ -168,6 +207,7 @@ class VolumeMapper(VTKPythonMapperBase):
         self.color = vtkColorTransferFunction()
         self.opacity = vtkPiecewiseFunction()
         self.sample_distance = sample_distance
+        self.skip_empty = True                # empty-space skipping (off: for measuring)
         self.unit_distance = unit_distance
         self.table_size = table_size
         self.body = None
@@ -181,16 +221,35 @@ class VolumeMapper(VTKPythonMapperBase):
         a = np.array([self.opacity.GetValue(v) for v in x])
         return np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32)
 
-    def steps(self, cell):
-        """The step and the opacity's unit distance, for the smallest cell size ``cell``."""
-        return self.sample_distance * cell, self.unit_distance * cell
+    def march(self, poly):
+        """What the hook marches with, from the input ``poly``: the table, its range,
+        the step factor, the opacity's unit, the macrocells and which can show (a Tack
+        kernel), the bounds and the skip past a macrocell's face."""
+        import tack
+
+        fields = poly.GetFieldData()
+        lo, hi = fields.GetArray("TackRange").GetTuple2(0)
+        cell = fields.GetArray("TackCellSize").GetValue(0)
+        g = fields.GetArray("TackMacroGrid").GetTuple(0)
+        grid = {"origin": g[0:3], "size": g[3:6], "dims": tuple(int(v) for v in g[6:9])}
+        table = self.table(lo, hi)
+        lows = tack.array(np.asarray(fields.GetArray("TackMacroLow")))
+        highs = tack.array(np.asarray(fields.GetArray("TackMacroHigh")))
+        if self.skip_empty:
+            seen = volume_tack.visible(lows, highs, table, lo, hi)
+        else:
+            seen = tack.array(np.ones(len(lows), np.int32))
+        return {"table": table, "lo": lo, "hi": hi, "factor": self.sample_distance,
+                "unit": self.unit_distance * cell, "skip": 0.01 * cell, "grid": grid,
+                "seen": seen,
+                "bounds": fields.GetArray("TackBounds").GetTuple(0)}
 
     def RequestSlang(self, renderer, actor):
         poly = self.GetInput()
         if poly is None:
             return
         key = (poly.GetMTime(), self.color.GetMTime(), self.opacity.GetMTime(),
-               self.sample_distance, self.unit_distance, self.table_size)
+               self.sample_distance, self.unit_distance, self.table_size, self.skip_empty)
         if key == self.seen:
             return
         self.seen = key
@@ -206,16 +265,20 @@ class VolumeMapper(VTKPythonMapperBase):
                                       + body.replace("TackVolumeHook", f"TackVolumeHook_{tag}"))
             self.slang.SetSlangSpecialization("IShaderHooks", f"TackVolumeHook_{tag}")
             self.body = body
-        lo, hi = fields.GetArray("TackRange").GetTuple2(0)
-        bounds = fields.GetArray("TackBounds").GetTuple(0)
-        cell = fields.GetArray("TackCellSize").GetValue(0)
-        h, unit = self.steps(cell)
-        self.tf = _words(self.table(lo, hi).reshape(-1))
+        march = self.march(poly)
+        self.tf = _words(march["table"].reshape(-1))
+        self.visible = _words(march["seen"].numpy().astype(np.uint32))
         self.slang.SetSlangBuffer("hooks.pool", pool)
         self.slang.SetSlangBuffer("hooks.tf", self.tf)
-        values = {"tf_size": self.table_size, "lo": lo, "hi": hi, "h": h, "unit": unit,
+        self.slang.SetSlangBuffer("hooks.visible", self.visible)
+        grid = march["grid"]
+        values = {"tf_size": self.table_size, "lo": march["lo"], "hi": march["hi"],
+                  "factor": march["factor"], "unit": march["unit"], "skip": march["skip"],
                   "max_steps": volume_tack.MAX_STEPS, "opaque": volume_tack.OPAQUE}
-        values.update(zip(("x0", "x1", "y0", "y1", "z0", "z1"), bounds, strict=True))
+        values.update(zip(("x0", "x1", "y0", "y1", "z0", "z1"), march["bounds"], strict=True))
+        values.update(zip(("gx", "gy", "gz"), grid["dims"], strict=True))
+        values.update(zip(("mox", "moy", "moz"), grid["origin"], strict=True))
+        values.update(zip(("mx", "my", "mz"), grid["size"], strict=True))
         for name, value in values.items():
             self.uniforms.SetUniformf(f"hooks.{name}", float(value))
         self.preparations += 1
