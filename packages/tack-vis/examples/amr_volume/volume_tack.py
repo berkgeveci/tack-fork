@@ -75,6 +75,10 @@ class CellBox:
         return min(self.sx, self.sy, self.sz)
 
     @tack.func
+    def classify(self, tf, lo, hi, p):
+        return _transfer(tf, (self.sample(p) - lo) / (hi - lo))
+
+    @tack.func
     def cell_info(self, n):
         """Cell ``n``: its value, whether it is active (1), its centre, size and level."""
         i = n % self.nx
@@ -144,6 +148,16 @@ class AMRVolume:
         return self.macro_first[m], self.macro_last[m]
 
     @tack.func
+    def value_at(self, n):
+        """Value ``n`` of the boxes' values (all boxes' cells one after another)."""
+        return self.values[n]
+
+    @tack.func
+    def classify(self, tf, lo, hi, p):
+        """The colour and opacity at ``p``: the value, through the table ``tf``."""
+        return _transfer(tf, (self.sample(p) - lo) / (hi - lo))
+
+    @tack.func
     def bin_slot(self, level, i, j, k):
         """The bin of ``level`` holding cell ``(i, j, k)``, or -1 outside the bins."""
         b = self.bin_size[level]
@@ -176,7 +190,7 @@ class AMRVolume:
         n = (i - self.box_lo[3 * box]) + dx * ((j - self.box_lo[3 * box + 1])
                                                + dy * (k - self.box_lo[3 * box + 2]))
         word = self.refined[self.box_refined[box] + n // 32]
-        return self.values[self.box_values[box] + n], (word >> (n % 32)) & 1
+        return self.value_at(self.box_values[box] + n), (word >> (n % 32)) & 1
 
     @tack.func
     def cell(self, level, i, j, k):
@@ -334,7 +348,7 @@ class AMRVolume:
         sy = self.spacing[3 * level + 1]
         sz = self.spacing[3 * level + 2]
         word = self.refined[self.box_refined[box] + local // 32]
-        return (self.values[n], 1 - ((word >> (local % 32)) & 1),
+        return (self.value_at(n), 1 - ((word >> (local % 32)) & 1),
                 self.ox + (tack.f32(self.box_lo[3 * box] + i) + 0.5) * sx,
                 self.oy + (tack.f32(self.box_lo[3 * box + 1] + j) + 0.5) * sy,
                 self.oz + (tack.f32(self.box_lo[3 * box + 2] + k) + 0.5) * sz, sx, sy, sz, level)
@@ -342,34 +356,345 @@ class AMRVolume:
 
 
 
-def amr_volume(amr, spacings, origin, field="values", blend=1):
+@tack.device_class
+class QuantizedAMRVolume(AMRVolume):
+    """An ``AMRVolume`` whose values are ``bits``-bit codes (16 or 8), packed
+    ``32 // bits`` to a word (``codes``): code ``c`` stands for ``qlo + c * qstep``, or
+    its exponential where ``qlog`` is 1 (a logarithmic scale). Made by ``amr_volume``
+    with ``quantize``."""
+
+    @tack.func
+    def value_at(self, n):
+        per = 32 // self.bits
+        word = self.codes[n // per]
+        code = (word >> ((n % per) * self.bits)) & ((1 << self.bits) - 1)
+        x = self.qlo + tack.f32(code) * self.qstep
+        if self.qlog == 1:
+            x = exp(x)
+        return x
+
+
+#: Bins of a stand-in cell's histogram, one byte each, four words a cell (two spare).
+BINS = tack.constant(14)
+
+
+@tack.device_class
+class HistogramAMRVolume(AMRVolume):
+    """An ``AMRVolume`` some of whose boxes are missing their finer data, each coarse
+    cell standing in for it (a *stand-in*) carrying a histogram of the finer cells'
+    values beneath it, weighted by volume: ``BINS`` bins over a logarithmic scale
+    (``hlo``, ``hstep``), each a byte holding the square root of its fraction (so a
+    single small fine cell under a coarse one still registers). ``box_hist`` is a
+    box's first word in ``hist`` (four a cell), or -1.
+
+    ``classify`` treats a stand-in as the distribution its histogram gives: every
+    bin's value through the table, weighted by the bin's fraction, which keeps peaks
+    a coarse value averages away (a sparse-PDF-like summary). The other cells are
+    interpolated and classified as usual, and the two parts mixed by their tents'
+    weights."""
+
+    @tack.func
+    def bins_of(self, box, n):
+        """The first word of cell ``n``'s histogram in ``box``, or -1 if it has none."""
+        out = -1
+        base = self.box_hist[box]
+        if base >= 0:
+            off = base + 4 * n
+            if (self.hist[off] | self.hist[off + 1] | self.hist[off + 2]
+                    | self.hist[off + 3]) != 0:
+                out = off
+        return out
+
+    @tack.func
+    def mixture(self, p):
+        """At ``p``: the interpolated value of the ordinary cells, their tents' weight,
+        and the stand-ins' tents' weight per bin (``BINS``): 16 numbers."""
+        acc = tack.local_array(tack.f32, 16)
+        for i in range(16):
+            acc[i] = 0.0
+        first, last = self.levels_at(p)
+        for level in range(first, last + 1):
+            ux = (p[0] - self.ox) / self.spacing[3 * level] - 0.5
+            uy = (p[1] - self.oy) / self.spacing[3 * level + 1] - 0.5
+            uz = (p[2] - self.oz) / self.spacing[3 * level + 2] - 0.5
+            fx = ux - floor(ux)
+            fy = uy - floor(uy)
+            fz = uz - floor(uz)
+            ix = int(floor(ux))
+            iy = int(floor(uy))
+            iz = int(floor(uz))
+            for corner in range(8):
+                cx = corner & 1
+                cy = (corner >> 1) & 1
+                cz = corner >> 2
+                w = ((tack.f32(cx) * fx + tack.f32(1 - cx) * (1.0 - fx))
+                     * (tack.f32(cy) * fy + tack.f32(1 - cy) * (1.0 - fy))
+                     * (tack.f32(cz) * fz + tack.f32(1 - cz) * (1.0 - fz)))
+                if w > 0.0:
+                    i = ix + cx
+                    j = iy + cy
+                    k = iz + cz
+                    box = self.find(level, i, j, k)
+                    if box >= 0:
+                        dx = self.box_dims[3 * box]
+                        dy = self.box_dims[3 * box + 1]
+                        n = (i - self.box_lo[3 * box]) + dx * (
+                            (j - self.box_lo[3 * box + 1]) + dy * (k - self.box_lo[3 * box + 2]))
+                        word = self.refined[self.box_refined[box] + n // 32]
+                        if ((word >> (n % 32)) & 1) == 0:
+                            off = self.bins_of(box, n)
+                            if off >= 0:
+                                total = 0.0
+                                for b in range(BINS):
+                                    q = tack.f32((self.hist[off + b // 4] >> ((b % 4) * 8)) & 255)
+                                    total += q * q
+                                for b in range(BINS):
+                                    q = tack.f32((self.hist[off + b // 4] >> ((b % 4) * 8)) & 255)
+                                    acc[2 + b] += w * q * q / total
+                            else:
+                                acc[0] += w * self.value_at(self.box_values[box] + n)
+                                acc[1] += w
+        value = 0.0
+        if acc[1] > 0.0:
+            value = acc[0] / acc[1]
+        return [value, acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7], acc[8], acc[9],
+                acc[10], acc[11], acc[12], acc[13], acc[14], acc[15]]
+
+    @tack.func
+    def classify(self, tf, lo, hi, p):
+        """The colour and opacity at ``p``: the ordinary cells' interpolated value and
+        each stand-in bin's value through the table, mixed by weight (opacity-weighted
+        colour)."""
+        m = self.mixture(p)
+        r = 0.0
+        g = 0.0
+        b = 0.0
+        a = 0.0
+        total = m[1]
+        if m[1] > 0.0:
+            c = _transfer(tf, (m[0] - lo) / (hi - lo))
+            r += m[1] * c[0] * c[3]
+            g += m[1] * c[1] * c[3]
+            b += m[1] * c[2] * c[3]
+            a += m[1] * c[3]
+        for k in range(BINS):
+            wk = m[2 + k]
+            if wk > 0.0:
+                c = _transfer(tf, (exp(self.hlo + (tack.f32(k) + 0.5) * self.hstep) - lo)
+                              / (hi - lo))
+                r += wk * c[0] * c[3]
+                g += wk * c[1] * c[3]
+                b += wk * c[2] * c[3]
+                a += wk * c[3]
+                total += wk
+        out = tack.vec4(0.0, 0.0, 0.0, 0.0)
+        if total > 0.0 and a > 0.0:
+            out = tack.vec4(r / a, g / a, b / a, a / total)
+        return out
+
+
+@tack.kernel
+def _histograms(full, held, cells, hlo, hstep, acc):
+    for n in range(cells):
+        v, active, cx, cy, cz, sx, sy, sz, level = full.cell_info(n)
+        if active == 1:
+            # The finest held level with a box holding the cell's centre: below the
+            # cell's own level, the box's cell there stands in for it.
+            found = -1
+            box = -1
+            i = 0
+            j = 0
+            k = 0
+            for back in range(held.nlevels):
+                lh = held.nlevels - 1 - back
+                if found < 0:
+                    ti = int(floor((cx - held.ox) / held.spacing[3 * lh]))
+                    tj = int(floor((cy - held.oy) / held.spacing[3 * lh + 1]))
+                    tk = int(floor((cz - held.oz) / held.spacing[3 * lh + 2]))
+                    tb = held.find(lh, ti, tj, tk)
+                    if tb >= 0:
+                        found = lh
+                        box = tb
+                        i = ti
+                        j = tj
+                        k = tk
+            if found >= 0 and found < level and held.box_hist[box] >= 0:
+                dx = held.box_dims[3 * box]
+                dy = held.box_dims[3 * box + 1]
+                local = (i - held.box_lo[3 * box]) + dx * (
+                    (j - held.box_lo[3 * box + 1]) + dy * (k - held.box_lo[3 * box + 2]))
+                weight = (sx * sy * sz) / (held.spacing[3 * found] * held.spacing[3 * found + 1]
+                                           * held.spacing[3 * found + 2])
+                which = min(max(int(floor((log(max(v, 1e-30)) - hlo) / hstep)), 0), BINS - 1)
+                tack.atomic_add(acc, (held.box_hist[box] // 4 + local) * BINS + which, weight)
+
+
+@tack.kernel
+def _pack_histograms(acc, words):
+    for c in range(words.shape[0] // 4):
+        total = 0.0
+        for b in range(BINS):
+            total += acc[c * BINS + b]
+        for w in range(4):
+            word = 0
+            for k in range(4):
+                b = 4 * w + k
+                if b < BINS and total > 0.0:
+                    q = min(int(floor(255.0 * sqrt(acc[c * BINS + b] / total) + 0.5)), 255)
+                    word = word | (q << (8 * k))
+            words[4 * c + w] = word
+
+
+def histogram_volume(amr, spacings, origin, field, keep, blend=1):
+    """A ``HistogramAMRVolume`` of the boxes ``keep`` of ``amr``: each held box under
+    which finer boxes are left out carries a histogram per cell of the finer data
+    beneath it (``_histograms``, from the whole hierarchy), on a log scale from the
+    data's 1st percentile to its largest value."""
+    held = amr_volume(amr, spacings, origin, field, blend, keep)
+    full = amr_volume(amr, spacings, origin, field)
+    levels = held.host["levels"]
+    # Which held boxes need histograms: those a left-out finer box meets.
+    box_hist, at = [], 0
+    boxes_held = [amr.boxes(level)[np.asarray(sorted(keep[level]), int)] if keep is not None
+                  else amr.boxes(level) for level in range(levels)]
+    for level in range(levels):
+        missing = np.zeros((0, 2, 3), np.int64)
+        for finer in range(level + 1, amr.num_levels):
+            chosen = np.zeros(len(amr.boxes(finer)), bool)
+            if finer < levels and keep is not None:
+                chosen[np.asarray(keep[finer], int)] = True
+            elif finer < levels:
+                chosen[:] = True
+            scale = 2 ** (finer - level)
+            gone = amr.boxes(finer)[~chosen]
+            missing = np.concatenate([missing, np.stack([gone[:, 0] // scale,
+                                                         -(-gone[:, 1] // scale)], axis=1)])
+        for lo, hi in boxes_held[level]:
+            meets = len(missing) and np.any(np.all((missing[:, 0] < hi) & (missing[:, 1] > lo),
+                                                   axis=1))
+            if meets:
+                box_hist.append(4 * at)
+                at += int(np.prod(hi - lo))
+            else:
+                box_hist.append(-1)
+    values = np.concatenate([piece.fields[field].values.numpy().reshape(-1)[::97]
+                             for _, piece in amr])
+    positive = values[values > 0]
+    hlo = float(np.log(np.percentile(positive, 1)))
+    hhi = float(np.log(positive.max()))
+    hstep = (hhi - hlo) / int(BINS)
+    acc = tack.array(np.zeros(max(at, 1) * int(BINS), np.float32))
+    out = HistogramAMRVolume.__new__(HistogramAMRVolume)
+    out.__dict__.update(held.__dict__)
+    out.box_hist = tack.array(np.asarray(box_hist, np.int32))
+    out.hist = tack.array(np.zeros(max(at, 1) * 4, np.int32))
+    out.hlo, out.hstep = hlo, hstep
+    _histograms(full, out, full.host["cells"], hlo, hstep, acc)
+    _pack_histograms(acc, out.hist)
+    out.host = dict(held.host, stand_in_cells=at)
+    return out
+
+
+@tack.kernel
+def _encode(values, lo, step, log_scale, top, codes):
+    for n in range(values.shape[0]):
+        x = values[n]
+        if log_scale == 1:
+            x = log(max(x, 1e-30))
+        codes[n] = min(max(int(floor((x - lo) / step + 0.5)), 0), top)
+
+
+@tack.kernel
+def _pack(codes, count, bits, words):
+    for w in range(words.shape[0]):
+        per = 32 // bits
+        word = 0
+        for k in range(per):
+            n = w * per + k
+            if n < count:
+                word = word | (codes[n] << (k * bits))
+        words[w] = word
+
+
+def quantize(values, bits, scale="linear"):
+    """``values`` (a Tack f32 array) as ``bits``-bit codes packed in i32 words, and
+    the decoding ``(qlo, qstep, qlog)``: linear over the values' range, or over their
+    logarithms (``scale="log"``, positive values)."""
+    host = values.numpy()
+    log_scale = scale == "log"
+    x = np.log(np.maximum(host, 1e-30)) if log_scale else host
+    lo, hi = float(x.min()), float(x.max())
+    top = (1 << bits) - 1
+    step = (hi - lo) / top if hi > lo else 1.0
+    codes = tack.empty((len(host),), tack.i32)
+    _encode(values, lo, step, int(log_scale), top, codes)
+    per = 32 // bits
+    words = tack.empty((-(-len(host) // per),), tack.i32)
+    _pack(codes, len(host), bits, words)
+    return words, (lo, step, int(log_scale))
+
+
+def _refined_by(lo, hi, children, ratio):
+    """Which cells of the box ``[lo, hi)`` the boxes ``children`` (``(n, 2, 3)``, the
+    next level's) cover: a bool array shaped z, y, x."""
+    out = np.zeros(tuple(int(v) for v in (hi - lo)[::-1]), bool)
+    if len(children):
+        clo = children[:, 0] // ratio
+        chi = -(-children[:, 1] // ratio)
+        meet = np.all((clo < hi) & (chi > lo), axis=1)
+        for a, b in zip(np.maximum(clo[meet], lo), np.minimum(chi[meet], hi)):
+            a, b = a - lo, b - lo
+            out[a[2]:b[2], a[1]:b[1], a[0]:b[0]] = True
+    return out
+
+
+def amr_volume(amr, spacings, origin, field="values", blend=1, keep=None, quantize_bits=None,
+               scale="linear"):
     """An ``AMRVolume`` of ``amr`` (a ``tack.dataset.AMRDataSet``) and its cell field
     ``field``: ``spacings`` each level's cell size (three per level), ``origin`` the
     domain's first point. The bins and boxes are the hierarchy's few numbers, made on
-    the host; the values and the refined marks are the boxes' own."""
-    from tack.dataset import Ghosts
+    the host.
 
+    ``keep`` says which boxes the volume holds: per level the indices of its boxes
+    (``amr.boxes(level)``'s order), all where None; a level with none ends the
+    hierarchy. A cell is refined where a finer box *held* covers it, so a coarse cell
+    stands in for a finer box left out. The finer boxes held must be properly nested
+    in the coarser ones held (``select_boxes`` makes them so).
+
+    ``quantize_bits`` (16 or 8) stores the values as codes (``QuantizedAMRVolume``),
+    linear over their range or logarithmic (``scale="log"``)."""
     levels = amr.num_levels
+    pieces = [[] for _ in range(levels)]
+    for level, piece in amr:
+        pieces[level].append(piece)
+    held = []
+    for level in range(levels):
+        count = len(amr.boxes(level))
+        chosen = np.arange(count) if keep is None else np.asarray(sorted(keep[level]), int)
+        if len(chosen) == 0:
+            break
+        held.append(chosen)
+    levels = len(held)
     box_lo, box_dims, box_values, box_refined, box_level = [], [], [], [], []
     values, refined = [], []
     bin_origin, bin_size, bin_dims, bin_base, brick_box = [], [], [], [], []
     at_value = at_word = first = 0
-    pieces = [[] for _ in range(levels)]
-    for level, piece in amr:
-        pieces[level].append(piece)
     for level in range(levels):
-        boxes = amr.boxes(level)
+        boxes = amr.boxes(level)[held[level]]
         lo, hi = boxes[:, 0], boxes[:, 1]
-        for (blo, bhi), piece in zip(zip(lo, hi), pieces[level], strict=True):
+        finer = amr.boxes(level + 1)[held[level + 1]] if level + 1 < levels else np.zeros(
+            (0, 2, 3), np.int64)
+        ratio = np.asarray(amr.ratios[level] if level < len(amr.ratios) else 1, np.int64)
+        for index, blo, bhi in zip(held[level], lo, hi, strict=True):
             cells = int(np.prod(bhi - blo))
             box_lo.extend(int(v) for v in blo)
             box_dims.extend(int(v) for v in bhi - blo)
             box_values.append(at_value)
             box_refined.append(at_word)
             box_level.append(level)
+            piece = pieces[level][index]
             values.append(piece.fields[field].values.numpy().reshape(-1).astype(np.float32))
-            marks = piece.ghosts.cells.numpy().reshape(-1)
-            bits = (marks & Ghosts.REFINEDCELL) != 0
+            bits = _refined_by(blo, bhi, finer, ratio).reshape(-1)
             words = -(-cells // 32)
             packed = np.zeros(words * 32, bool)
             packed[:cells] = bits
@@ -397,15 +722,69 @@ def amr_volume(amr, spacings, origin, field="values", blend=1):
         return tack.array(np.asarray(v, np.int32))
 
     arrays = {
-        "spacing": tack.array(np.asarray(spacings, np.float32).reshape(-1)),
+        "spacing": tack.array(np.asarray(spacings[:levels], np.float32).reshape(-1)),
         "bin_origin": ints(bin_origin), "bin_size": ints(bin_size), "bin_dims": ints(bin_dims),
         "bin_base": ints(bin_base), "brick_box": ints(np.concatenate(brick_box)),
         "box_lo": ints(box_lo), "box_dims": ints(box_dims), "box_values": ints(box_values),
         "box_refined": ints(box_refined), "box_level": ints(box_level),
-        "values": tack.array(np.concatenate(values)),
         "refined": tack.array(np.concatenate(refined)),
     }
-    return AMRVolume(arrays, origin, levels, len(box_level), blend)
+    flat = tack.array(np.concatenate(values))
+    if quantize_bits is None:
+        arrays["values"] = flat
+        out = AMRVolume(arrays, origin, levels, len(box_level), blend)
+    else:
+        arrays["codes"], (qlo, qstep, qlog) = quantize(flat, quantize_bits, scale)
+        out = QuantizedAMRVolume(arrays, origin, levels, len(box_level), blend)
+        out.bits, out.qlo, out.qstep, out.qlog = int(quantize_bits), qlo, qstep, qlog
+    # What the hierarchy holds, for the host (not the kernels): its cells and range.
+    out.host = {"cells": len(flat), "range": (flat.min(), flat.max()), "levels": levels,
+                "boxes": [len(h) for h in held]}
+    return out
+
+
+def select_boxes(amr, spacings, origin, camera, size, base, pixels=1.0):
+    """The boxes a view resolves, per level (``amr_volume``'s ``keep``): every box of
+    levels 0 to ``base``; of a finer level, each box in the view frustum whose cells
+    project to at least ``pixels`` at its nearest point to the camera, and whose
+    coarser boxes (those its region coarsened meets) are all held."""
+    w, h = size
+    m = np.array([[camera.GetCompositeProjectionTransformMatrix(w / h, -1, 1).GetElement(i, j)
+                   for j in range(4)] for i in range(4)])
+    eye = np.array(camera.GetPosition())
+    tan = np.tan(np.radians(camera.GetViewAngle()) / 2)
+    origin = np.asarray(origin, np.float64)
+    corners = np.array([[i, j, k] for i in (0, 1) for j in (0, 1) for k in (0, 1)], float)
+    keep = []
+    for level in range(amr.num_levels):
+        boxes = amr.boxes(level)
+        if level <= base:
+            keep.append(np.arange(len(boxes)))
+            continue
+        cell = np.asarray(spacings[level], np.float64)
+        a = origin + boxes[:, 0] * cell
+        b = origin + boxes[:, 1] * cell
+        # In the frustum: not all eight corners outside one clip plane.
+        points = a[:, None, :] + corners[None] * (b - a)[:, None, :]
+        clip = np.concatenate([points, np.ones((*points.shape[:2], 1))], axis=2) @ m.T
+        x, y, z, q = (clip[..., i] for i in range(4))
+        outside = (np.all(x > q, 1) | np.all(x < -q, 1) | np.all(y > q, 1) | np.all(y < -q, 1)
+                   | np.all(z > q, 1) | np.all(z < -q, 1))
+        # The cells' size on the screen at the box's nearest point.
+        distance = np.linalg.norm(np.clip(eye, a, b) - eye, axis=1)
+        projected = cell.min() / (2 * np.maximum(distance, 1e-9) * tan) * h
+        wanted = ~outside & (projected >= pixels)
+        # Nested: every coarser box the region meets is held.
+        ratio = np.asarray(amr.ratios[level - 1], np.int64)
+        coarse = amr.boxes(level - 1)
+        held = np.zeros(len(coarse), bool)
+        held[keep[level - 1]] = True
+        clo, chi = boxes[:, 0] // ratio, -(-boxes[:, 1] // ratio)
+        for i in np.nonzero(wanted)[0]:
+            meet = np.all((coarse[:, 0] < chi[i]) & (coarse[:, 1] > clo[i]), axis=1)
+            wanted[i] = bool(held[meet].all())
+        keep.append(np.nonzero(wanted)[0])
+    return keep
 
 
 @tack.kernel
@@ -421,17 +800,32 @@ def _cell_size_at(box, ps, out):
 
 
 def sample_functions(box):
-    """``tack_sample(pool, p)`` and ``tack_cell_size(pool, p)`` as Slang over one pool,
-    and the pool's words (``np.uint32``)."""
+    """``tack_sample(pool, p)`` and ``tack_cell_size(pool, p)`` as Slang over one pool
+    (and ``tack_mixture(pool, p)`` for a ``HistogramAMRVolume``: its ``mixture``, a
+    ``float4x4`` row by row), and the pool's words (``np.uint32``)."""
     ps = tack.array(np.zeros((1, 3), np.float32), tack.vec3())
     slots = {"ps": ("float", 3), "out": ("float", 1)}
-    outs, words = export_shared([
+    specs = [
         (_sample_at, (box, ps, tack.empty((1,), tack.f32)), "tack_sample", slots,
          ("float", "{out}[0]")),
         (_cell_size_at, (box, ps, tack.empty((1,), tack.f32)), "tack_cell_size", slots,
          ("float", "{out}[0]")),
-    ])
+    ]
+    if isinstance(box, HistogramAMRVolume):
+        specs.append((_mixture_at, (box, ps, tack.empty((16,), tack.f32)), "tack_mixture",
+                      {"ps": ("float", 3), "out": ("float", 16)},
+                      ("float4x4", "float4x4(" + ", ".join(f"{{out}}[{i}]" for i in range(16))
+                       + ")")))
+    outs, words = export_shared(specs)
     return joined(*outs), words
+
+
+@tack.kernel
+def _mixture_at(box, ps, out):
+    for k in range(ps.shape[0]):
+        m = box.mixture(ps[k])
+        for i in range(16):
+            out[16 * k + i] = m[i]
 
 
 # Empty-space skipping: a coarse grid of the values each macrocell can take.
@@ -591,8 +985,7 @@ def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, min_ste
                 if fresh == 1:
                     t += offset * h
                     fresh = 0
-                v = volume.sample(p0 + d * (t + 0.5 * h))
-                c = _transfer(tf, (v - lo) / (hi - lo))
+                c = volume.classify(tf, lo, hi, p0 + d * (t + 0.5 * h))
                 alpha = 1.0 - pow(1.0 - c[3], h / unit)
                 w = (1.0 - a) * alpha
                 r += w * c[0]

@@ -58,6 +58,66 @@ from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
 from vtkmodules.vtkRenderingCore import vtkColorTransferFunction
 from vtkmodules.vtkRenderingWebGPU import vtkWebGPUShaderProperty
 
+#: How a sample is classified, by the input's ``TackKind``: the interpolated value
+#: through the table (``scalar``), or a ``HistogramAMRVolume``'s mixture (``mixture``):
+#: the ordinary cells' value and each stand-in bin's value through the table, mixed by
+#: weight with opacity-weighted colour (``volume_tack.HistogramAMRVolume.classify``).
+CLASSIFY = {
+    "scalar": r"""
+void tack_prepare(StructuredBuffer<uint> tf, int entries, float lo, float hi, float hlo,
+                  float hstep, out float4 bins[14])
+{
+    for (int k = 0; k < 14; ++k)
+        bins[k] = float4(0.f);
+}
+
+float4 tack_classify(StructuredBuffer<uint> pool, StructuredBuffer<uint> tf, int entries,
+                     float lo, float hi, float4 bins[14], float3 p)
+{
+    return tack_transfer(tf, entries, (tack_sample(pool, p) - lo) / (hi - lo));
+}
+""",
+    "mixture": r"""
+// Each bin's value through the table, opacity-weighted: the same for every cell, so
+// made once a pixel.
+void tack_prepare(StructuredBuffer<uint> tf, int entries, float lo, float hi, float hlo,
+                  float hstep, out float4 bins[14])
+{
+    for (int k = 0; k < 14; ++k) {
+        float4 c = tack_transfer(tf, entries,
+                                 (exp(hlo + (float(k) + 0.5f) * hstep) - lo) / (hi - lo));
+        bins[k] = float4(c.xyz * c.w, c.w);
+    }
+}
+
+float4 tack_classify(StructuredBuffer<uint> pool, StructuredBuffer<uint> tf, int entries,
+                     float lo, float hi, float4 bins[14], float3 p)
+{
+    float4x4 m = tack_mixture(pool, p);
+    float r = 0.f, g = 0.f, b = 0.f, a = 0.f;
+    float total = m[0][1];
+    if (m[0][1] > 0.f) {
+        float4 c = tack_transfer(tf, entries, (m[0][0] - lo) / (hi - lo));
+        r += m[0][1] * c.x * c.w;
+        g += m[0][1] * c.y * c.w;
+        b += m[0][1] * c.z * c.w;
+        a += m[0][1] * c.w;
+    }
+    for (int k = 0; k < 14; ++k) {
+        float wk = m[(k + 2) / 4][(k + 2) % 4];
+        if (wk > 0.f) {
+            r += wk * bins[k].x;
+            g += wk * bins[k].y;
+            b += wk * bins[k].z;
+            a += wk * bins[k].w;
+            total += wk;
+        }
+    }
+    return total > 0.f && a > 0.f ? float4(r / a, g / a, b / a, a / total) : float4(0.f);
+}
+""",
+}
+
 HOOK = r"""
 // The inverse of a 4x4 matrix (by 2x2 sub-determinants; the layout's convention
 // does not matter, since inversion commutes with transposition).
@@ -151,6 +211,8 @@ public struct TackVolumeHook : IShaderHooks
     float max_steps;
     float opaque;
     float jitter;                      // 1: start each run of steps at a per-pixel offset
+    float hlo;                         // a mixture's histogram bins: the first's log,
+    float hstep;                       // and their width
 
     // One fragment a pixel: the back face's.
     public override bool clip(inout FragmentContext f) { return !f.frontFacing; }
@@ -177,6 +239,8 @@ public struct TackVolumeHook : IShaderHooks
         float3 colour = float3(0.f);
         float a = 0.f;
         int steps = 0;
+        float4 bins[14];
+        tack_prepare(tf, entries, lo, hi, hlo, hstep, bins);
         // Each run of steps (from the entry, and from each skip) starts a per-pixel
         // fraction of its first step in, so that neighbouring rays do not sample on
         // the same planes.
@@ -199,8 +263,8 @@ public struct TackVolumeHook : IShaderHooks
                     t += offset * h;
                     fresh = false;
                 }
-                float v = tack_sample(pool, near + dir * (t + 0.5f * h));
-                float4 s = tack_transfer(tf, entries, (v - lo) / (hi - lo));
+                float4 s = tack_classify(pool, tf, entries, lo, hi, bins,
+                                         near + dir * (t + 0.5f * h));
                 float alpha = 1.f - pow(1.f - s.w, h / unit);
                 float w = (1.f - a) * alpha;
                 colour += w * s.xyz;
@@ -276,7 +340,10 @@ class VolumeMapper(VTKPythonMapperBase):
             seen = volume_tack.visible(lows, highs, table, lo, hi)
         else:
             seen = tack.array(np.ones(len(lows), np.int32))
+        histogram = fields.GetArray("TackHistogram")
+        hlo, hstep = histogram.GetTuple2(0) if histogram is not None else (0.0, 1.0)
         return {"table": table, "lo": lo, "hi": hi, "factor": self.sample_distance,
+                "hlo": hlo, "hstep": hstep,
                 "unit": self.unit_distance * cell, "skip": 0.01 * cell, "grid": grid,
                 "seen": seen,
                 "bounds": fields.GetArray("TackBounds").GetTuple(0)}
@@ -304,7 +371,9 @@ class VolumeMapper(VTKPythonMapperBase):
         pool = fields.GetArray("TackPool")
         if evaluation is None or pool is None:
             return
-        body = evaluation.GetValue(0) + HOOK
+        kind = fields.GetAbstractArray("TackKind")
+        kind = kind.GetValue(0) if kind is not None else "scalar"
+        body = evaluation.GetValue(0) + CLASSIFY[kind] + HOOK
         if body != self.body:
             tag = hashlib.sha1(body.encode()).hexdigest()[:12]
             self.slang.SetSlangModule(f"module tack_volume_{tag};\nimport slangkit_hooks;\n\n"
@@ -320,6 +389,7 @@ class VolumeMapper(VTKPythonMapperBase):
         grid = march["grid"]
         values = {"tf_size": self.table_size, "lo": march["lo"], "hi": march["hi"],
                   "factor": march["factor"], "min_step": 0.0, "jitter": 0.0,
+                  "hlo": march["hlo"], "hstep": march["hstep"],
                   "unit": march["unit"],
                   "skip": march["skip"],
                   "max_steps": volume_tack.MAX_STEPS, "opaque": volume_tack.OPAQUE}

@@ -94,7 +94,7 @@ def main():
     volume.Update()
     timings = volume.timings
     poly = volume.GetOutputDataObject(0)
-    cells = len(volume.box.values)
+    cells = volume.timings['cells']
     print(f"Tack {time.perf_counter() - t:.1f} s: convert {timings['convert_ms'] / 1000:.1f} s, "
           f"export {timings['export_ms'] / 1000:.1f} s, macrocells "
           f"{timings['macro_ms'] / 1000:.1f} s {timings['macrocells']}; {cells / 1e6:.1f}M "

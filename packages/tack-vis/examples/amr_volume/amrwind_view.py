@@ -51,7 +51,7 @@ def main():
     volume.SetInputDataObject(source)
     volume.Update()
     print(f"read and Tack: {time.perf_counter() - t:.1f} s; "
-          f"{len(volume.box.values) / 1e6:.0f}M cells, pool "
+          f"{volume.timings['cells'] / 1e6:.0f}M cells, pool "
           f"{volume.timings['pool_bytes'] / 2**20:.0f} MiB", flush=True)
 
     mapper = VolumeMapper()
