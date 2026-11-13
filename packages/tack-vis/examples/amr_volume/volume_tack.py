@@ -75,7 +75,7 @@ class CellBox:
         return min(self.sx, self.sy, self.sz)
 
     @tack.func
-    def classify(self, tf, lo, hi, p):
+    def classify(self, tf, bins, lo, hi, p):
         return _transfer(tf, (self.sample(p) - lo) / (hi - lo))
 
     @tack.func
@@ -153,8 +153,9 @@ class AMRVolume:
         return self.values[n]
 
     @tack.func
-    def classify(self, tf, lo, hi, p):
-        """The colour and opacity at ``p``: the value, through the table ``tf``."""
+    def classify(self, tf, bins, lo, hi, p):
+        """The colour and opacity at ``p``: the value, through the table ``tf``
+        (``bins``, a mixture's bin colours, unused)."""
         return _transfer(tf, (self.sample(p) - lo) / (hi - lo))
 
     @tack.func
@@ -206,6 +207,40 @@ class AMRVolume:
         return value, found, refined
 
     @tack.func
+    def corners(self, level, ix, iy, iz):
+        """How to find the eight cells of ``level`` from ``(ix, iy, iz)`` to one more on
+        each axis: ``(1, box)`` when ``box``, the first's, holds all eight (read them
+        directly); ``(-1, -1)`` when none can be in a box (all in one empty brick, or
+        beyond the level's bricks on an axis); ``(0, box)`` otherwise (look each up)."""
+        mode = 0
+        box = self.find(level, ix, iy, iz)
+        if box >= 0:
+            if (ix + 1 < self.box_lo[3 * box] + self.box_dims[3 * box]
+                    and iy + 1 < self.box_lo[3 * box + 1] + self.box_dims[3 * box + 1]
+                    and iz + 1 < self.box_lo[3 * box + 2] + self.box_dims[3 * box + 2]):
+                mode = 1
+        else:
+            first = self.bin_slot(level, ix, iy, iz)
+            last = self.bin_slot(level, ix + 1, iy + 1, iz + 1)
+            b = self.bin_size[level]
+            # The eight cells in one brick (no brick boundary between them on any axis).
+            one = ((ix - self.bin_origin[3 * level]) % b != b - 1
+                   and (iy - self.bin_origin[3 * level + 1]) % b != b - 1
+                   and (iz - self.bin_origin[3 * level + 2]) % b != b - 1)
+            if first < 0 and last < 0:
+                # Outside the bricks on some axis at both corners: no box near.
+                if (ix + 1 < self.bin_origin[3 * level] or iy + 1 < self.bin_origin[3 * level + 1]
+                        or iz + 1 < self.bin_origin[3 * level + 2] or ix >= self.bin_origin[3 * level]
+                        + b * self.bin_dims[3 * level] or iy >= self.bin_origin[3 * level + 1]
+                        + b * self.bin_dims[3 * level + 1] or iz >= self.bin_origin[3 * level + 2]
+                        + b * self.bin_dims[3 * level + 2]):
+                    mode = -1
+            elif first >= 0 and one:
+                if self.brick_box[first] < 0:
+                    mode = -1
+        return mode, box
+
+    @tack.func
     def level_sum(self, level, p, active_only):
         """The tents of ``level`` at ``p``: the sum of weight times value and of weight,
         over the level's cells around ``p`` that are in a box (and active, if
@@ -225,33 +260,7 @@ class AMRVolume:
         iz = int(floor(uz))
         num = 0.0
         den = 0.0
-        # 1: the box of the first cell holds all eight; -1: none can be in a box; 0: look.
-        mode = 0
-        box = self.find(level, ix, iy, iz)
-        if box >= 0:
-            if (ix + 1 < self.box_lo[3 * box] + self.box_dims[3 * box]
-                    and iy + 1 < self.box_lo[3 * box + 1] + self.box_dims[3 * box + 1]
-                    and iz + 1 < self.box_lo[3 * box + 2] + self.box_dims[3 * box + 2]):
-                mode = 1
-        else:
-            first = self.bin_slot(level, ix, iy, iz)
-            last = self.bin_slot(level, ix + 1, iy + 1, iz + 1)
-            b = self.bin_size[level]
-            # The eight cells in one bin (no bin boundary between them on any axis).
-            one = ((ix - self.bin_origin[3 * level]) % b != b - 1
-                   and (iy - self.bin_origin[3 * level + 1]) % b != b - 1
-                   and (iz - self.bin_origin[3 * level + 2]) % b != b - 1)
-            if first < 0 and last < 0:
-                # Outside the bins on some axis at both corners: no box near.
-                if (ix + 1 < self.bin_origin[3 * level] or iy + 1 < self.bin_origin[3 * level + 1]
-                        or iz + 1 < self.bin_origin[3 * level + 2] or ix >= self.bin_origin[3 * level]
-                        + b * self.bin_dims[3 * level] or iy >= self.bin_origin[3 * level + 1]
-                        + b * self.bin_dims[3 * level + 1] or iz >= self.bin_origin[3 * level + 2]
-                        + b * self.bin_dims[3 * level + 2]):
-                    mode = -1
-            elif first >= 0 and one:
-                if self.brick_box[first] < 0:
-                    mode = -1
+        mode, box = self.corners(level, ix, iy, iz)
         if mode >= 0:
             for corner in range(8):
                 cx = corner & 1
@@ -374,18 +383,20 @@ class QuantizedAMRVolume(AMRVolume):
         return x
 
 
-#: Bins of a stand-in cell's histogram, one byte each, four words a cell (two spare).
-BINS = tack.constant(14)
+#: The most bins a stand-in cell's histogram has (what ``tack_mixture`` returns room for).
+MAX_BINS = tack.constant(13)
 
 
 @tack.device_class
 class HistogramAMRVolume(AMRVolume):
     """An ``AMRVolume`` some of whose boxes are missing their finer data, each coarse
     cell standing in for it (a *stand-in*) carrying a histogram of the finer cells'
-    values beneath it, weighted by volume: ``BINS`` bins over a logarithmic scale
-    (``hlo``, ``hstep``), each a byte holding the square root of its fraction (so a
-    single small fine cell under a coarse one still registers). ``box_hist`` is a
-    box's first word in ``hist`` (four a cell), or -1.
+    values beneath it, weighted by volume: ``nbins`` bins (at most ``MAX_BINS``) over a
+    logarithmic scale (``hlo``, ``hstep``), each ``hbits`` bits (8 or 4) holding the
+    square root of its fraction (so a single small fine cell under a coarse one still
+    registers), ``hwords`` words a cell. ``box_hist`` is a box's first word in
+    ``hist``, or -1 where its cells have none (a box whose finer data is all below the
+    builder's floor, say: invisible, and its stand-ins keep their values).
 
     ``classify`` treats a stand-in as the distribution its histogram gives: every
     bin's value through the table, weighted by the bin's fraction, which keeps peaks
@@ -394,24 +405,15 @@ class HistogramAMRVolume(AMRVolume):
     weights."""
 
     @tack.func
-    def bins_of(self, box, n):
-        """The first word of cell ``n``'s histogram in ``box``, or -1 if it has none."""
-        out = -1
-        base = self.box_hist[box]
-        if base >= 0:
-            off = base + 4 * n
-            if (self.hist[off] | self.hist[off + 1] | self.hist[off + 2]
-                    | self.hist[off + 3]) != 0:
-                out = off
-        return out
-
-    @tack.func
     def mixture(self, p):
         """At ``p``: the interpolated value of the ordinary cells, their tents' weight,
-        and the stand-ins' tents' weight per bin (``BINS``): 16 numbers."""
+        the stand-ins' tents' weight, and that per bin (``MAX_BINS``): 16 numbers. Each
+        level's eight cells are found as ``level_sum`` finds them (``corners``)."""
         acc = tack.local_array(tack.f32, 16)
         for i in range(16):
             acc[i] = 0.0
+        words = tack.local_array(tack.i32, 4)
+        top = (1 << self.hbits) - 1
         first, last = self.levels_at(p)
         for level in range(first, last + 1):
             ux = (p[0] - self.ox) / self.spacing[3 * level] - 0.5
@@ -423,37 +425,48 @@ class HistogramAMRVolume(AMRVolume):
             ix = int(floor(ux))
             iy = int(floor(uy))
             iz = int(floor(uz))
-            for corner in range(8):
-                cx = corner & 1
-                cy = (corner >> 1) & 1
-                cz = corner >> 2
-                w = ((tack.f32(cx) * fx + tack.f32(1 - cx) * (1.0 - fx))
-                     * (tack.f32(cy) * fy + tack.f32(1 - cy) * (1.0 - fy))
-                     * (tack.f32(cz) * fz + tack.f32(1 - cz) * (1.0 - fz)))
-                if w > 0.0:
-                    i = ix + cx
-                    j = iy + cy
-                    k = iz + cz
-                    box = self.find(level, i, j, k)
-                    if box >= 0:
-                        dx = self.box_dims[3 * box]
-                        dy = self.box_dims[3 * box + 1]
-                        n = (i - self.box_lo[3 * box]) + dx * (
-                            (j - self.box_lo[3 * box + 1]) + dy * (k - self.box_lo[3 * box + 2]))
-                        word = self.refined[self.box_refined[box] + n // 32]
-                        if ((word >> (n % 32)) & 1) == 0:
-                            off = self.bins_of(box, n)
-                            if off >= 0:
-                                total = 0.0
-                                for b in range(BINS):
-                                    q = tack.f32((self.hist[off + b // 4] >> ((b % 4) * 8)) & 255)
-                                    total += q * q
-                                for b in range(BINS):
-                                    q = tack.f32((self.hist[off + b // 4] >> ((b % 4) * 8)) & 255)
-                                    acc[2 + b] += w * q * q / total
-                            else:
-                                acc[0] += w * self.value_at(self.box_values[box] + n)
-                                acc[1] += w
+            mode, whole = self.corners(level, ix, iy, iz)
+            if mode >= 0:
+                for corner in range(8):
+                    cx = corner & 1
+                    cy = (corner >> 1) & 1
+                    cz = corner >> 2
+                    w = ((tack.f32(cx) * fx + tack.f32(1 - cx) * (1.0 - fx))
+                         * (tack.f32(cy) * fy + tack.f32(1 - cy) * (1.0 - fy))
+                         * (tack.f32(cz) * fz + tack.f32(1 - cz) * (1.0 - fz)))
+                    if w > 0.0:
+                        i = ix + cx
+                        j = iy + cy
+                        k = iz + cz
+                        box = whole
+                        if mode == 0:
+                            box = self.find(level, i, j, k)
+                        if box >= 0:
+                            dx = self.box_dims[3 * box]
+                            dy = self.box_dims[3 * box + 1]
+                            n = (i - self.box_lo[3 * box]) + dx * (
+                                (j - self.box_lo[3 * box + 1])
+                                + dy * (k - self.box_lo[3 * box + 2]))
+                            word = self.refined[self.box_refined[box] + n // 32]
+                            if ((word >> (n % 32)) & 1) == 0:
+                                # The cell's histogram words, read once (none: zeros).
+                                seen = 0
+                                base = self.box_hist[box]
+                                for q in range(self.hwords):
+                                    words[q] = 0
+                                    if base >= 0:
+                                        words[q] = self.hist[base + self.hwords * n + q]
+                                    seen = seen | words[q]
+                                if seen != 0:
+                                    acc[2] += w
+                                    for b in range(self.nbins):
+                                        bit = b * self.hbits
+                                        f = tack.f32((words[bit // 32] >> (bit % 32)) & top) \
+                                            / tack.f32(top)
+                                        acc[3 + b] += w * f * f
+                                else:
+                                    acc[0] += w * self.value_at(self.box_values[box] + n)
+                                    acc[1] += w
         value = 0.0
         if acc[1] > 0.0:
             value = acc[0] / acc[1]
@@ -461,10 +474,10 @@ class HistogramAMRVolume(AMRVolume):
                 acc[10], acc[11], acc[12], acc[13], acc[14], acc[15]]
 
     @tack.func
-    def classify(self, tf, lo, hi, p):
-        """The colour and opacity at ``p``: the ordinary cells' interpolated value and
-        each stand-in bin's value through the table, mixed by weight (opacity-weighted
-        colour)."""
+    def classify(self, tf, bins, lo, hi, p):
+        """The colour and opacity at ``p``: the ordinary cells' interpolated value
+        through the table, and each stand-in bin's colour (``bins``: opacity-weighted,
+        the table averaged over the bin, ``bin_colours``), mixed by weight."""
         m = self.mixture(p)
         r = 0.0
         g = 0.0
@@ -477,14 +490,13 @@ class HistogramAMRVolume(AMRVolume):
             g += m[1] * c[1] * c[3]
             b += m[1] * c[2] * c[3]
             a += m[1] * c[3]
-        for k in range(BINS):
-            wk = m[2 + k]
-            if wk > 0.0:
-                c = _transfer(tf, (exp(self.hlo + (tack.f32(k) + 0.5) * self.hstep) - lo)
-                              / (hi - lo))
-                r += wk * c[0] * c[3]
-                g += wk * c[1] * c[3]
-                b += wk * c[2] * c[3]
+        for k in range(MAX_BINS):
+            wk = m[3 + k]
+            if m[2] > 0.0 and wk > 0.0:
+                c = bins[k]
+                r += wk * c[0]
+                g += wk * c[1]
+                b += wk * c[2]
                 a += wk * c[3]
                 total += wk
         out = tack.vec4(0.0, 0.0, 0.0, 0.0)
@@ -494,7 +506,35 @@ class HistogramAMRVolume(AMRVolume):
 
 
 @tack.kernel
-def _histograms(full, held, cells, hlo, hstep, acc):
+def _bin_colours(tf, lo, hi, hlo, hstep, nbins, out):
+    for k in range(out.shape[0]):
+        r = 0.0
+        g = 0.0
+        b = 0.0
+        a = 0.0
+        if k < nbins:
+            for s in range(16):
+                x = exp(hlo + (tack.f32(k) + (tack.f32(s) + 0.5) / 16.0) * hstep)
+                c = _transfer(tf, (x - lo) / (hi - lo))
+                r += c[0] * c[3] / 16.0
+                g += c[1] * c[3] / 16.0
+                b += c[2] * c[3] / 16.0
+                a += c[3] / 16.0
+        out[k] = tack.vec4(r, g, b, a)
+
+
+def bin_colours(table, lo, hi, hlo, hstep, nbins):
+    """Each histogram bin's colour: the transfer function (``table`` over ``[lo, hi]``)
+    averaged over the bin's range (16 samples, uniform on the log scale), with
+    opacity-weighted colour. ``(MAX_BINS, 4)`` f32; bins past ``nbins`` are zero."""
+    out = tack.empty((int(MAX_BINS),), tack.vec4(tack.f32))
+    _bin_colours(tack.array(np.asarray(table, np.float32), tack.vec4()), float(lo), float(hi),
+                 float(hlo), float(hstep), int(nbins), out)
+    return out.numpy().reshape(-1, 4)
+
+
+@tack.kernel
+def _histograms(full, held, box_cell, cells, hlo, hstep, nbins, acc, peaks):
     for n in range(cells):
         v, active, cx, cy, cz, sx, sy, sz, level = full.cell_info(n)
         if active == 1:
@@ -518,43 +558,54 @@ def _histograms(full, held, cells, hlo, hstep, acc):
                         i = ti
                         j = tj
                         k = tk
-            if found >= 0 and found < level and held.box_hist[box] >= 0:
+            if found >= 0 and found < level and box_cell[box] >= 0:
                 dx = held.box_dims[3 * box]
                 dy = held.box_dims[3 * box + 1]
-                local = (i - held.box_lo[3 * box]) + dx * (
+                c = box_cell[box] + (i - held.box_lo[3 * box]) + dx * (
                     (j - held.box_lo[3 * box + 1]) + dy * (k - held.box_lo[3 * box + 2]))
                 weight = (sx * sy * sz) / (held.spacing[3 * found] * held.spacing[3 * found + 1]
                                            * held.spacing[3 * found + 2])
-                which = min(max(int(floor((log(max(v, 1e-30)) - hlo) / hstep)), 0), BINS - 1)
-                tack.atomic_add(acc, (held.box_hist[box] // 4 + local) * BINS + which, weight)
+                which = min(max(int(floor((log(max(v, 1e-30)) - hlo) / hstep)), 0), nbins - 1)
+                tack.atomic_add(acc, c * nbins + which, weight)
+                tack.atomic_max(peaks, c, v)
 
 
 @tack.kernel
-def _pack_histograms(acc, words):
-    for c in range(words.shape[0] // 4):
+def _pack_histograms(acc, nbins, hbits, hwords, words):
+    for c in range(words.shape[0] // hwords):
         total = 0.0
-        for b in range(BINS):
-            total += acc[c * BINS + b]
-        for w in range(4):
+        for b in range(nbins):
+            total += acc[c * nbins + b]
+        per = 32 // hbits
+        top = tack.f32((1 << hbits) - 1)
+        for w in range(hwords):
             word = 0
-            for k in range(4):
-                b = 4 * w + k
-                if b < BINS and total > 0.0:
-                    q = min(int(floor(255.0 * sqrt(acc[c * BINS + b] / total) + 0.5)), 255)
-                    word = word | (q << (8 * k))
-            words[4 * c + w] = word
+            for k in range(per):
+                b = w * per + k
+                if b < nbins and total > 0.0:
+                    q = min(int(floor(top * sqrt(acc[c * nbins + b] / total) + 0.5)),
+                            (1 << hbits) - 1)
+                    word = word | (q << (k * hbits))
+            words[c * hwords + w] = word
 
 
-def histogram_volume(amr, spacings, origin, field, keep, blend=1):
+def histogram_volume(amr, spacings, origin, field, keep, blend=1, bins=13, bits=8,
+                     floor_value=None):
     """A ``HistogramAMRVolume`` of the boxes ``keep`` of ``amr``: each held box under
     which finer boxes are left out carries a histogram per cell of the finer data
-    beneath it (``_histograms``, from the whole hierarchy), on a log scale from the
-    data's 1st percentile to its largest value."""
+    beneath it (``_histograms``, from the whole hierarchy): ``bins`` bins (at most
+    ``MAX_BINS``) of ``bits`` bits (8 or 4), on a log scale from the data's 1st
+    percentile to its largest value. With ``floor_value``, a box all of whose finer
+    data lies below it (where a transfer function transparent below the floor shows
+    nothing) gets no histograms, its stand-ins keeping their values."""
+    if bins > int(MAX_BINS) or bits not in (4, 8):
+        raise ValueError(f"{bins} bins of {bits} bits: at most {int(MAX_BINS)}, of 4 or 8")
     held = amr_volume(amr, spacings, origin, field, blend, keep)
     full = amr_volume(amr, spacings, origin, field)
     levels = held.host["levels"]
-    # Which held boxes need histograms: those a left-out finer box meets.
-    box_hist, at = [], 0
+    hwords = -(-bins * bits // 32)
+    # The candidates: held boxes a left-out finer box meets.
+    box_cell, sizes, at = [], [], 0
     boxes_held = [amr.boxes(level)[np.asarray(sorted(keep[level]), int)] if keep is not None
                   else amr.boxes(level) for level in range(levels)]
     for level in range(levels):
@@ -570,28 +621,43 @@ def histogram_volume(amr, spacings, origin, field, keep, blend=1):
             missing = np.concatenate([missing, np.stack([gone[:, 0] // scale,
                                                          -(-gone[:, 1] // scale)], axis=1)])
         for lo, hi in boxes_held[level]:
+            cells = int(np.prod(hi - lo))
             meets = len(missing) and np.any(np.all((missing[:, 0] < hi) & (missing[:, 1] > lo),
                                                    axis=1))
-            if meets:
-                box_hist.append(4 * at)
-                at += int(np.prod(hi - lo))
-            else:
-                box_hist.append(-1)
+            box_cell.append(at if meets else -1)
+            sizes.append(cells)
+            at += cells if meets else 0
     values = np.concatenate([piece.fields[field].values.numpy().reshape(-1)[::97]
                              for _, piece in amr])
     positive = values[values > 0]
     hlo = float(np.log(np.percentile(positive, 1)))
     hhi = float(np.log(positive.max()))
-    hstep = (hhi - hlo) / int(BINS)
-    acc = tack.array(np.zeros(max(at, 1) * int(BINS), np.float32))
+    hstep = (hhi - hlo) / bins
+    acc = tack.array(np.zeros(max(at, 1) * bins, np.float32))
+    peaks = tack.array(np.full(max(at, 1), -3.0e38, np.float32))
+    _histograms(full, held, tack.array(np.asarray(box_cell, np.int32)), full.host["cells"],
+                hlo, hstep, bins, acc, peaks)
+    words = tack.empty((max(at, 1) * hwords,), tack.i32)
+    _pack_histograms(acc, bins, bits, hwords, words)
+    # The boxes that keep their histograms (all, or those with data at the floor or
+    # above), one after another.
+    words, peaks = words.numpy(), peaks.numpy()
+    box_hist, kept, at_word = [], [], 0
+    for first, cells in zip(box_cell, sizes, strict=True):
+        if first >= 0 and (floor_value is None
+                           or peaks[first:first + cells].max() >= floor_value):
+            box_hist.append(at_word)
+            kept.append(words[first * hwords:(first + cells) * hwords])
+            at_word += cells * hwords
+        else:
+            box_hist.append(-1)
     out = HistogramAMRVolume.__new__(HistogramAMRVolume)
     out.__dict__.update(held.__dict__)
     out.box_hist = tack.array(np.asarray(box_hist, np.int32))
-    out.hist = tack.array(np.zeros(max(at, 1) * 4, np.int32))
+    out.hist = tack.array(np.concatenate(kept) if kept else np.zeros(1, np.int32))
     out.hlo, out.hstep = hlo, hstep
-    _histograms(full, out, full.host["cells"], hlo, hstep, acc)
-    _pack_histograms(acc, out.hist)
-    out.host = dict(held.host, stand_in_cells=at)
+    out.nbins, out.hbits, out.hwords = int(bins), int(bits), int(hwords)
+    out.host = dict(held.host, stand_in_cells=at_word // hwords, candidate_cells=at)
     return out
 
 
@@ -948,7 +1014,7 @@ def _exit(q, d, inv, mi, m):
 
 
 @tack.kernel
-def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, min_step, unit, gx,
+def _march(volume, starts, dirs, tmins, tmaxs, tf, bins, seen, lo, hi, factor, min_step, unit, gx,
            gy, gz, ox, oy, oz, mx, my, mz, skip, jitter, width, out):
     for k in range(starts.shape[0]):
         p0 = starts[k]
@@ -985,7 +1051,7 @@ def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, min_ste
                 if fresh == 1:
                     t += offset * h
                     fresh = 0
-                c = volume.classify(tf, lo, hi, p0 + d * (t + 0.5 * h))
+                c = volume.classify(tf, bins, lo, hi, p0 + d * (t + 0.5 * h))
                 alpha = 1.0 - pow(1.0 - c[3], h / unit)
                 w = (1.0 - a) * alpha
                 r += w * c[0]
@@ -1026,7 +1092,7 @@ def rays(camera, size, bounds):
 
 
 def reference(volume, camera, size, bounds, tf, lo, hi, factor, unit, grid, seen, skip,
-              background, min_step=0.0, jitter=0.0):
+              background, min_step=0.0, jitter=0.0, bins=None):
     """The picture the hook should draw (``(h, w, 4)`` u8, row 0 at the top): the
     rays marched in Tack as the hook marches them (steps ``factor`` times the local
     cell size and at least ``min_step``, macrocells ``grid`` skipped where ``seen`` is
@@ -1036,7 +1102,9 @@ def reference(volume, camera, size, bounds, tf, lo, hi, factor, unit, grid, seen
     out = tack.empty((len(near),), tack.vec4(tack.f32))
     _march(volume, tack.array(near.astype(f32), tack.vec3()),
            tack.array(d.astype(f32), tack.vec3()), tack.array(tmin.astype(f32)),
-           tack.array(tmax.astype(f32)), tack.array(np.asarray(tf, f32), tack.vec4()), seen,
+           tack.array(tmax.astype(f32)), tack.array(np.asarray(tf, f32), tack.vec4()),
+           tack.array(np.asarray(bins if bins is not None else np.zeros((int(MAX_BINS), 4)),
+                                 f32), tack.vec4()), seen,
            float(lo), float(hi), float(factor), float(min_step), float(unit), *grid["dims"],
            *grid["origin"],
            *grid["size"], float(skip), float(jitter), int(size[0]), out)

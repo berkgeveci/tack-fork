@@ -82,7 +82,7 @@ class TackVolume(VTKPythonAlgorithmBase):
         self.keep = None
         self.average = False
         self.quantize = (None, "linear")
-        self.histograms = False
+        self.histograms = None
         self._key = None
         self._converted = {}
         self.timings = {}
@@ -99,10 +99,11 @@ class TackVolume(VTKPythonAlgorithmBase):
         self.average = bool(average)
         self.Modified()
 
-    def SetHistograms(self, histograms):
+    def SetHistograms(self, histograms, bins=13, bits=8, floor_value=None):
         """Stand-in cells carry histograms of the finer data they stand in for
-        (``volume_tack.HistogramAMRVolume``); needs ``SetKeep``."""
-        self.histograms = bool(histograms)
+        (``volume_tack.HistogramAMRVolume``: ``bins`` bins of ``bits`` bits; with
+        ``floor_value``, none where all that data is below it); needs ``SetKeep``."""
+        self.histograms = (bins, bits, floor_value) if histograms else None
         self.Modified()
 
     def SetQuantize(self, bits, scale="linear"):
@@ -164,9 +165,11 @@ class TackVolume(VTKPythonAlgorithmBase):
             bounds = [0.0] * 6
             data.GetBounds(bounds)
             bits, scale = self.quantize
-            if self.histograms and self.keep is not None:
+            if self.histograms is not None and self.keep is not None:
+                bins, hbits, floor_value = self.histograms
                 volume = volume_tack.histogram_volume(amr, spacings, bounds[::2], self.array,
-                                                      self.keep, self.blend)
+                                                      self.keep, self.blend, bins, hbits,
+                                                      floor_value)
             else:
                 volume = volume_tack.amr_volume(amr, spacings, bounds[::2], self.array,
                                                 self.blend, self.keep, bits, scale)
@@ -223,7 +226,7 @@ class TackVolume(VTKPythonAlgorithmBase):
                                  else "scalar")
             fields.AddArray(kind)
             if isinstance(box, volume_tack.HistogramAMRVolume):
-                fields.AddArray(_floats("TackHistogram", (box.hlo, box.hstep)))
+                fields.AddArray(_floats("TackHistogram", (box.hlo, box.hstep, box.nbins)))
             fields.AddArray(_floats("TackBounds", bounds))
             fields.AddArray(_floats("TackRange", value_range))
             fields.AddArray(_floats("TackCellSize", (cell,)))

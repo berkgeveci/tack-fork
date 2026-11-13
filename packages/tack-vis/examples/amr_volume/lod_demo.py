@@ -9,7 +9,9 @@ coarse levels alone (0-1, then 0-2), the finer levels left out:
 
 - as values: a coarse cell stands in for the finer data beneath it with its own value;
 - with histograms: each stand-in carries a histogram of the finer values beneath it
-  (``volume_tack.HistogramAMRVolume``), classified bin by bin.
+  (``volume_tack.HistogramAMRVolume``), classified bin by bin: 13 or 8 bins of 8 or 4
+  bits, and with a floor (``--floor``, the transfer function's transparent threshold)
+  below which no histogram is kept.
 
 (``select_boxes`` and quantization were measured with an earlier version of this
 script: the client data plan's "First results".)
@@ -79,6 +81,9 @@ def main():
     parser.add_argument("--plotfile", default=PLOTFILE)
     parser.add_argument("--field", default="mag_vorticity")
     parser.add_argument("--size", default="1280x800")
+    parser.add_argument("--floor", type=float, default=0.4,
+                        help="no histograms where the finer data is all below this "
+                             "(the transfer function is transparent there)")
     args = parser.parse_args()
     tack.set_default_device("cpu")
     size = tuple(int(v) for v in args.size.split("x"))
@@ -104,11 +109,11 @@ def main():
         return [np.arange(len(volume.amr.boxes(level))) if level <= base
                 else np.array([], int) for level in range(levels)]
 
-    def draw(name, label, view, keep=None, average=False, bits=None, histograms=False):
+    def draw(name, label, view, keep=None, average=False, bits=None, histograms=None):
         volume.SetKeep(keep)
         volume.SetAverageDown(average)
         volume.SetQuantize(bits, "log")
-        volume.SetHistograms(histograms)
+        volume.SetHistograms(histograms is not None, *(histograms or ()))
         t = time.perf_counter()
         volume.Update()
         tack_s = time.perf_counter() - t
@@ -118,7 +123,9 @@ def main():
         write_png(os.path.join(args.out, f"lod_{view}_{name}.png"), picture)
         timings = volume.timings
         held = volume.box.host["boxes"]
-        print(f"  {label:44s} {timings['cells'] / 1e6:6.1f}M cells "
+        stand_ins = volume.box.host.get("stand_in_cells")
+        label = label if stand_ins is None else f"{label} ({stand_ins / 1e6:.1f}M)"
+        print(f"  {label:52s} {timings['cells'] / 1e6:6.1f}M cells "
               f"{timings['pool_bytes'] / 2**20:6.0f} MiB  boxes {held}  Tack {tack_s:4.1f} s  "
               f"frame {ms:5.0f} ms", flush=True)
         return picture
@@ -127,12 +134,14 @@ def main():
         place(camera, renderer, centre, span)
         print(f"{view} view:", flush=True)
         reference = draw("all", "all five levels, f32", view)
-        rows = [("l01", "levels 0-1, values", up_to(1), False, None, False),
-                ("l01hist", "levels 0-1 + histograms of levels 2-4", up_to(1), False, None,
-                 True),
-                ("l02", "levels 0-2, values", up_to(2), False, None, False),
-                ("l02hist", "levels 0-2 + histograms of levels 3-4", up_to(2), False, None,
-                 True)]
+        rows = [("l01", "levels 0-1, values", up_to(1), False, None, None),
+                ("l02", "levels 0-2, values", up_to(2), False, None, None)]
+        for bins, hbits in ((13, 8), (8, 8), (8, 4)):
+            for floor_value in (None, args.floor):
+                tag = f"l01h{bins}x{hbits}" + ("f" if floor_value is not None else "")
+                label = (f"levels 0-1 + histograms {bins}x{hbits} bits"
+                         + (f", floor {floor_value:g}" if floor_value is not None else ""))
+                rows.append((tag, label, up_to(1), False, None, (bins, hbits, floor_value)))
         for name, label, keep, average, bits, histograms in rows:
             picture = draw(name, label, view, keep, average, bits, histograms)
             print(f"  {'':44s} vs all: {difference(picture, reference)}", flush=True)

@@ -64,34 +64,23 @@ from vtkmodules.vtkRenderingWebGPU import vtkWebGPUShaderProperty
 #: weight with opacity-weighted colour (``volume_tack.HistogramAMRVolume.classify``).
 CLASSIFY = {
     "scalar": r"""
-void tack_prepare(StructuredBuffer<uint> tf, int entries, float lo, float hi, float hlo,
-                  float hstep, out float4 bins[14])
-{
-    for (int k = 0; k < 14; ++k)
-        bins[k] = float4(0.f);
-}
-
-float4 tack_classify(StructuredBuffer<uint> pool, StructuredBuffer<uint> tf, int entries,
-                     float lo, float hi, float4 bins[14], float3 p)
+float4 tack_classify(StructuredBuffer<uint> pool, StructuredBuffer<uint> tf,
+                     StructuredBuffer<uint> bins, int entries, float lo, float hi, float3 p)
 {
     return tack_transfer(tf, entries, (tack_sample(pool, p) - lo) / (hi - lo));
 }
 """,
     "mixture": r"""
-// Each bin's value through the table, opacity-weighted: the same for every cell, so
-// made once a pixel.
-void tack_prepare(StructuredBuffer<uint> tf, int entries, float lo, float hi, float hlo,
-                  float hstep, out float4 bins[14])
+// Bin k's colour (opacity-weighted, the table averaged over the bin: bin_colours).
+float4 tack_bin(StructuredBuffer<uint> bins, int k)
 {
-    for (int k = 0; k < 14; ++k) {
-        float4 c = tack_transfer(tf, entries,
-                                 (exp(hlo + (float(k) + 0.5f) * hstep) - lo) / (hi - lo));
-        bins[k] = float4(c.xyz * c.w, c.w);
-    }
+    return float4(asfloat(bins[4 * k]), asfloat(bins[4 * k + 1]), asfloat(bins[4 * k + 2]),
+                  asfloat(bins[4 * k + 3]));
 }
 
-float4 tack_classify(StructuredBuffer<uint> pool, StructuredBuffer<uint> tf, int entries,
-                     float lo, float hi, float4 bins[14], float3 p)
+// The mixture's bins unrolled (a matrix indexed by a loop variable goes to memory).
+float4 tack_classify(StructuredBuffer<uint> pool, StructuredBuffer<uint> tf,
+                     StructuredBuffer<uint> bins, int entries, float lo, float hi, float3 p)
 {
     float4x4 m = tack_mixture(pool, p);
     float r = 0.f, g = 0.f, b = 0.f, a = 0.f;
@@ -103,14 +92,110 @@ float4 tack_classify(StructuredBuffer<uint> pool, StructuredBuffer<uint> tf, int
         b += m[0][1] * c.z * c.w;
         a += m[0][1] * c.w;
     }
-    for (int k = 0; k < 14; ++k) {
-        float wk = m[(k + 2) / 4][(k + 2) % 4];
-        if (wk > 0.f) {
-            r += wk * bins[k].x;
-            g += wk * bins[k].y;
-            b += wk * bins[k].z;
-            a += wk * bins[k].w;
-            total += wk;
+    if (m[0][2] > 0.f) {
+        if (m[0][3] > 0.f) {
+            float4 c = tack_bin(bins, 0);
+            r += m[0][3] * c.x;
+            g += m[0][3] * c.y;
+            b += m[0][3] * c.z;
+            a += m[0][3] * c.w;
+            total += m[0][3];
+        }
+        if (m[1][0] > 0.f) {
+            float4 c = tack_bin(bins, 1);
+            r += m[1][0] * c.x;
+            g += m[1][0] * c.y;
+            b += m[1][0] * c.z;
+            a += m[1][0] * c.w;
+            total += m[1][0];
+        }
+        if (m[1][1] > 0.f) {
+            float4 c = tack_bin(bins, 2);
+            r += m[1][1] * c.x;
+            g += m[1][1] * c.y;
+            b += m[1][1] * c.z;
+            a += m[1][1] * c.w;
+            total += m[1][1];
+        }
+        if (m[1][2] > 0.f) {
+            float4 c = tack_bin(bins, 3);
+            r += m[1][2] * c.x;
+            g += m[1][2] * c.y;
+            b += m[1][2] * c.z;
+            a += m[1][2] * c.w;
+            total += m[1][2];
+        }
+        if (m[1][3] > 0.f) {
+            float4 c = tack_bin(bins, 4);
+            r += m[1][3] * c.x;
+            g += m[1][3] * c.y;
+            b += m[1][3] * c.z;
+            a += m[1][3] * c.w;
+            total += m[1][3];
+        }
+        if (m[2][0] > 0.f) {
+            float4 c = tack_bin(bins, 5);
+            r += m[2][0] * c.x;
+            g += m[2][0] * c.y;
+            b += m[2][0] * c.z;
+            a += m[2][0] * c.w;
+            total += m[2][0];
+        }
+        if (m[2][1] > 0.f) {
+            float4 c = tack_bin(bins, 6);
+            r += m[2][1] * c.x;
+            g += m[2][1] * c.y;
+            b += m[2][1] * c.z;
+            a += m[2][1] * c.w;
+            total += m[2][1];
+        }
+        if (m[2][2] > 0.f) {
+            float4 c = tack_bin(bins, 7);
+            r += m[2][2] * c.x;
+            g += m[2][2] * c.y;
+            b += m[2][2] * c.z;
+            a += m[2][2] * c.w;
+            total += m[2][2];
+        }
+        if (m[2][3] > 0.f) {
+            float4 c = tack_bin(bins, 8);
+            r += m[2][3] * c.x;
+            g += m[2][3] * c.y;
+            b += m[2][3] * c.z;
+            a += m[2][3] * c.w;
+            total += m[2][3];
+        }
+        if (m[3][0] > 0.f) {
+            float4 c = tack_bin(bins, 9);
+            r += m[3][0] * c.x;
+            g += m[3][0] * c.y;
+            b += m[3][0] * c.z;
+            a += m[3][0] * c.w;
+            total += m[3][0];
+        }
+        if (m[3][1] > 0.f) {
+            float4 c = tack_bin(bins, 10);
+            r += m[3][1] * c.x;
+            g += m[3][1] * c.y;
+            b += m[3][1] * c.z;
+            a += m[3][1] * c.w;
+            total += m[3][1];
+        }
+        if (m[3][2] > 0.f) {
+            float4 c = tack_bin(bins, 11);
+            r += m[3][2] * c.x;
+            g += m[3][2] * c.y;
+            b += m[3][2] * c.z;
+            a += m[3][2] * c.w;
+            total += m[3][2];
+        }
+        if (m[3][3] > 0.f) {
+            float4 c = tack_bin(bins, 12);
+            r += m[3][3] * c.x;
+            g += m[3][3] * c.y;
+            b += m[3][3] * c.z;
+            a += m[3][3] * c.w;
+            total += m[3][3];
         }
     }
     return total > 0.f && a > 0.f ? float4(r / a, g / a, b / a, a / total) : float4(0.f);
@@ -186,6 +271,7 @@ public struct TackVolumeHook : IShaderHooks
     StructuredBuffer<uint> pool;       // Tack's arrays
     StructuredBuffer<uint> tf;         // the transfer function's table
     StructuredBuffer<uint> visible;    // per macrocell: can it show (1) or not (0)
+    StructuredBuffer<uint> bins;       // a mixture's bin colours (bin_colours)
     float tf_size;                     // the table's entries
     float lo;                          // the value range the table spans
     float hi;
@@ -211,8 +297,6 @@ public struct TackVolumeHook : IShaderHooks
     float max_steps;
     float opaque;
     float jitter;                      // 1: start each run of steps at a per-pixel offset
-    float hlo;                         // a mixture's histogram bins: the first's log,
-    float hstep;                       // and their width
 
     // One fragment a pixel: the back face's.
     public override bool clip(inout FragmentContext f) { return !f.frontFacing; }
@@ -239,8 +323,6 @@ public struct TackVolumeHook : IShaderHooks
         float3 colour = float3(0.f);
         float a = 0.f;
         int steps = 0;
-        float4 bins[14];
-        tack_prepare(tf, entries, lo, hi, hlo, hstep, bins);
         // Each run of steps (from the entry, and from each skip) starts a per-pixel
         // fraction of its first step in, so that neighbouring rays do not sample on
         // the same planes.
@@ -263,7 +345,7 @@ public struct TackVolumeHook : IShaderHooks
                     t += offset * h;
                     fresh = false;
                 }
-                float4 s = tack_classify(pool, tf, entries, lo, hi, bins,
+                float4 s = tack_classify(pool, tf, bins, entries, lo, hi,
                                          near + dir * (t + 0.5f * h));
                 float alpha = 1.f - pow(1.f - s.w, h / unit);
                 float w = (1.f - a) * alpha;
@@ -341,9 +423,13 @@ class VolumeMapper(VTKPythonMapperBase):
         else:
             seen = tack.array(np.ones(len(lows), np.int32))
         histogram = fields.GetArray("TackHistogram")
-        hlo, hstep = histogram.GetTuple2(0) if histogram is not None else (0.0, 1.0)
+        if histogram is not None:
+            hlo, hstep, nbins = histogram.GetTuple3(0)
+            bins = volume_tack.bin_colours(table, lo, hi, hlo, hstep, int(nbins))
+        else:
+            bins = np.zeros((int(volume_tack.MAX_BINS), 4), np.float32)
         return {"table": table, "lo": lo, "hi": hi, "factor": self.sample_distance,
-                "hlo": hlo, "hstep": hstep,
+                "bins": bins,
                 "unit": self.unit_distance * cell, "skip": 0.01 * cell, "grid": grid,
                 "seen": seen,
                 "bounds": fields.GetArray("TackBounds").GetTuple(0)}
@@ -386,10 +472,11 @@ class VolumeMapper(VTKPythonMapperBase):
         self.slang.SetSlangBuffer("hooks.pool", pool)
         self.slang.SetSlangBuffer("hooks.tf", self.tf)
         self.slang.SetSlangBuffer("hooks.visible", self.visible)
+        self.bins = _words(np.asarray(march["bins"], np.float32).reshape(-1))
+        self.slang.SetSlangBuffer("hooks.bins", self.bins)
         grid = march["grid"]
         values = {"tf_size": self.table_size, "lo": march["lo"], "hi": march["hi"],
                   "factor": march["factor"], "min_step": 0.0, "jitter": 0.0,
-                  "hlo": march["hlo"], "hstep": march["hstep"],
                   "unit": march["unit"],
                   "skip": march["skip"],
                   "max_steps": volume_tack.MAX_STEPS, "opaque": volume_tack.OPAQUE}

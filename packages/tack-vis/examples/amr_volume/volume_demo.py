@@ -85,7 +85,7 @@ def reference(volume, mapper, camera, size, background, interactive=False):
     return volume_tack.reference(volume.box, camera, size, march["bounds"], march["table"],
                                  march["lo"], march["hi"], factor, march["unit"],
                                  march["grid"], march["seen"], march["skip"], background,
-                                 min_step, jitter)
+                                 min_step, jitter, march["bins"])
 
 
 def transfer_functions(mapper, lo, hi):
