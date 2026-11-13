@@ -82,37 +82,21 @@ class LIC:
         ``cells`` (a triangle's cell) and ``pcs`` (``(k, 3, 3)``, each triangle vertex's
         parametric coordinates there); ``points`` are then per triangle vertex
         (``(3k, 3)``) and ``triangles`` ``arange(3k)``."""
-        self.size, self.ss = size, supersample
-        self.w, self.h = size[0] * supersample, size[1] * supersample
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         self.device = d = adapter.request_device_sync()
         storage = wgpu.BufferUsage.STORAGE
-        self.points = d.create_buffer_with_data(data=points.reshape(-1), usage=storage)
-        # Unread in the exact path, but bound: a word each.
-        vectors = np.zeros(1, np.float32) if vectors is None else vectors
-        self.vectors = d.create_buffer_with_data(data=vectors.reshape(-1), usage=storage)
-        self.triangles = d.create_buffer_with_data(data=triangles.reshape(-1), usage=storage)
-        scalars = np.zeros(1, np.float32) if scalars is None else scalars
-        self.scalars = d.create_buffer_with_data(data=np.asarray(scalars, np.float32),
-                                                 usage=storage)
-        self.count = triangles.size
         self.frame = d.create_buffer(size=128, usage=storage | wgpu.BufferUsage.COPY_DST)
         self.ranges = [d.create_buffer(size=4 * 258, usage=storage | wgpu.BufferUsage.COPY_DST
                                        | wgpu.BufferUsage.COPY_SRC) for _ in range(2)]
 
         defines = ()
-        self.exact = {}
+        self.source = None
         if exact is not None:
             os.makedirs(out_dir, exist_ok=True)
             with open(os.path.join(out_dir, "tack_volume.slang"), "w") as f:
                 f.write(exact["source"])
             defines = ("TACK_EXACT",)
-            self.exact[TACK_POOL] = d.create_buffer_with_data(
-                data=np.ascontiguousarray(exact["pool"], np.uint32), usage=storage)
-            self.exact[TRIANGLE_CELLS] = d.create_buffer_with_data(
-                data=np.ascontiguousarray(exact["cells"], np.uint32), usage=storage)
-            self.exact[PARAMETRIC] = d.create_buffer_with_data(
-                data=np.ascontiguousarray(exact["pcs"], np.float32).reshape(-1), usage=storage)
+            self.source = exact["source"]
         self.modules = compile_passes(out_dir, defines)
         code, self.surface_bindings = self.modules["surface"]
         module = d.create_shader_module(code=code)
@@ -135,7 +119,43 @@ class LIC:
                 layout="auto", compute={"module": d.create_shader_module(code=code),
                                         "entry_point": name})
             self.compute[name] = (pipeline, used)
+        self.resize(size, supersample)
+        self.set_slice(points, triangles, vectors, scalars, exact)
 
+    def set_slice(self, points, triangles, vectors, scalars=None, exact=None):
+        """A new surface to draw (``__init__``'s arguments), without compiling again:
+        in the exact path, ``exact``'s source must be the compiled one (a slice of the
+        same structure -- another plane through the same mesh -- gives the same)."""
+        d = self.device
+        storage = wgpu.BufferUsage.STORAGE
+
+        def buffer(data, dtype):
+            data = np.ascontiguousarray(data, dtype).reshape(-1)
+            return d.create_buffer_with_data(data=data if data.size else np.zeros(1, dtype),
+                                             usage=storage)
+
+        # Unread in the exact path, but bound: a word each.
+        self.points = buffer(points, np.float32)
+        self.vectors = buffer(np.zeros(1) if vectors is None else vectors, np.float32)
+        self.triangles = buffer(triangles, np.uint32)
+        self.scalars = buffer(np.zeros(1) if scalars is None else scalars, np.float32)
+        self.count = triangles.size
+        self.exact = {}
+        if (exact is None) != (self.source is None):
+            raise ValueError("a slice for the other path (exact or per vertex)")
+        if exact is not None:
+            if exact["source"] != self.source:
+                raise ValueError("the slice's generated Slang differs from the compiled")
+            self.exact[TACK_POOL] = buffer(exact["pool"], np.uint32)
+            self.exact[TRIANGLE_CELLS] = buffer(exact["cells"], np.uint32)
+            self.exact[PARAMETRIC] = buffer(exact["pcs"], np.float32)
+
+    def resize(self, size, supersample=None):
+        """The picture's size (and supersampling): the targets made again."""
+        d = self.device
+        self.size = tuple(int(v) for v in size)
+        self.ss = self.ss if supersample is None else supersample
+        self.w, self.h = self.size[0] * self.ss, self.size[1] * self.ss
         T = wgpu.TextureUsage
         w, h = self.w, self.h
 
@@ -170,16 +190,22 @@ class LIC:
 
     def render(self, eye, target, up, field_range, noise_pixels=1.5, step=1.0, steps=20,
                depth_jump=0.05, smallest=1e-3, highpass=0.6, clip=0.01, enhanced=True,
-               fovy=30.0, by_scalar=False, check=False):
+               fovy=30.0, by_scalar=False, check=False, near_far=None, picture_only=False,
+               aspect=None):
         """The picture (``(h, w, 4)`` u8, downsampled) and, at full resolution, the
         field target, the noise and the LIC intensity; GPU times (ms). With ``check``,
         the surface pass alone, its field target holding the field and the scalar
         themselves per pixel (``values``, ``(h, w, 4)``: x, y, z, scalar; scalar 0
-        where no surface), and ``rows``, the projection the pixels are of."""
+        where no surface), and ``rows``, the projection the pixels are of.
+        ``near_far`` sets the depth range (by default from the eye's distance);
+        ``picture_only`` reads back the picture alone. ``aspect`` (the picture's own by
+        default) is the projection's: a window's, when the picture is stretched onto
+        one whose width is not a multiple of 64 (readbacks need rows of 256 bytes)."""
         d, w, h = self.device, self.w, self.h
         eye, target = np.asarray(eye, float), np.asarray(target, float)
         distance = float(np.linalg.norm(eye - target))
-        rows = perspective(fovy, w / h, 0.05 * distance, 4.0 * distance) @ look_at(
+        near, far = near_far if near_far is not None else (0.05 * distance, 4.0 * distance)
+        rows = perspective(fovy, aspect or w / h, near, far) @ look_at(
             eye, target, np.asarray(up, float))
         frame = np.zeros((8, 4), np.float32)
         frame[:4] = rows
@@ -212,7 +238,8 @@ class LIC:
         rp.set_pipeline(self.surface)
         rp.set_bind_group(0, self._bind(self.surface, self.surface_bindings,
                                         {b: {"buffer": v} for b, v in buffers.items()}))
-        rp.draw(self.count, 1, 0, 0)
+        if self.count:
+            rp.draw(self.count, 1, 0, 0)
         rp.end()
         d.queue.submit([encoder.finish()])
         d.queue.read_buffer(self.ranges[1])         # waits
@@ -257,9 +284,12 @@ class LIC:
         d.queue.read_buffer(self.ranges[1])         # waits
         timings["lic"] = 1000 * (time.perf_counter() - t0)
 
-        final = read(self.final, 4, np.uint8).astype(np.float32)
+        final = read(self.final, 4, np.uint8)
         s = self.ss
-        picture = final.reshape(h // s, s, w // s, s, 4).mean(axis=(1, 3)).round().astype(np.uint8)
+        picture = final if s == 1 else final.astype(np.float32).reshape(
+            h // s, s, w // s, s, 4).mean(axis=(1, 3)).round().astype(np.uint8)
+        if picture_only:
+            return {"picture": picture, "timings": timings}
         return {"picture": picture, "field": read(self.field, 4, np.float32),
                 "noise": read(self.noise, 1, np.float32)[..., 0],
                 "lic": read(self.b, 1, np.float32)[..., 0], "timings": timings}

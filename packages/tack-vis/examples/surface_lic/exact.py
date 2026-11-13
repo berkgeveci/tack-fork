@@ -86,10 +86,11 @@ def cut_cells(data, cells):
     return td.extract_cells(data, kept), np.searchsorted(kept, cells).astype(np.uint32)
 
 
-def slice_cells(data, points, triangles, nudge=1e-3):
+def slice_cells(data, points, triangles, nudge=1e-3, locator=None):
     """Per triangle its cell, and per triangle vertex (unshared: ``(k, 3)``) its
-    position and parametric coordinates in that cell."""
-    locator = td.CellLocator(data)
+    position and parametric coordinates in that cell. ``locator``: a ``CellLocator``
+    of ``data`` to reuse (one is made otherwise)."""
+    locator = locator or td.CellLocator(data)
     corners = points[triangles.astype(np.int64)].astype(np.float64)       # (k, 3, 3)
     centroid = corners.mean(axis=1)
     found = locator.find(centroid)
