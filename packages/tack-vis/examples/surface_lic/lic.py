@@ -43,16 +43,21 @@ PASSES = {
 # Bindings, by the numbers in lic.slang.
 FRAME, FIELD, INPUT, OUTPUT, RANGE, COLOR, FINAL, POINTS, VECTORS, TRIANGLES, SCALARS = (
     0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13)
+GEOMETRY_POOL, VECTOR_POOL, SCALAR_POOL, TRIANGLE_CELLS, PARAMETRIC = 14, 15, 16, 17, 18
 
 
-def compile_passes(out_dir):
-    """Each pass's WGSL and the bindings it uses."""
+def compile_passes(out_dir, defines=()):
+    """Each pass's WGSL and the bindings it uses; ``defines`` for the surface pass
+    (``TACK_EXACT`` includes ``out_dir``'s ``tack_volume.slang``)."""
     os.makedirs(out_dir, exist_ok=True)
     source = os.path.join(HERE, "lic.slang")
     modules = {}
     for name, entries in PASSES.items():
         out = os.path.join(out_dir, name + ".wgsl")
-        args = [SLANGC, source, "-target", "wgsl", "-o", out]
+        args = [SLANGC, source, "-target", "wgsl", "-o", out, "-I", out_dir]
+        if name == "surface":
+            for d in defines:
+                args += ["-D", d]
         for entry, stage in entries:
             args += ["-entry", entry, "-stage", stage]
         r = subprocess.run(args, capture_output=True, text=True)
@@ -67,9 +72,16 @@ def compile_passes(out_dir):
 
 class LIC:
     def __init__(self, points, triangles, vectors, out_dir, size=(1280, 800), supersample=2,
-                 scalars=None):
+                 scalars=None, exact=None):
         """``scalars`` (one a point), if given, colour the surface instead of the
-        field's tangential speed (``render(..., by_scalar=True)``)."""
+        field's tangential speed (``render(..., by_scalar=True)``).
+
+        ``exact`` evaluates the fields per pixel with the cells' own basis instead of
+        interpolating ``vectors`` and ``scalars`` (then unused): a dict of ``source``
+        (``exact.volume_functions``' Slang), ``pools`` (its three buffers' words),
+        ``cells`` (a triangle's cell) and ``pcs`` (``(k, 3, 3)``, each triangle vertex's
+        parametric coordinates there); ``points`` are then per triangle vertex
+        (``(3k, 3)``) and ``triangles`` ``arange(3k)``."""
         self.size, self.ss = size, supersample
         self.w, self.h = size[0] * supersample, size[1] * supersample
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
@@ -86,7 +98,22 @@ class LIC:
         self.ranges = [d.create_buffer(size=4 * 258, usage=storage | wgpu.BufferUsage.COPY_DST
                                        | wgpu.BufferUsage.COPY_SRC) for _ in range(2)]
 
-        self.modules = compile_passes(out_dir)
+        defines = ()
+        self.exact = {}
+        if exact is not None:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "tack_volume.slang"), "w") as f:
+                f.write(exact["source"])
+            defines = ("TACK_EXACT",)
+            for b, words in zip((GEOMETRY_POOL, VECTOR_POOL, SCALAR_POOL), exact["pools"],
+                                strict=True):
+                self.exact[b] = d.create_buffer_with_data(
+                    data=np.ascontiguousarray(words, np.uint32), usage=storage)
+            self.exact[TRIANGLE_CELLS] = d.create_buffer_with_data(
+                data=np.ascontiguousarray(exact["cells"], np.uint32), usage=storage)
+            self.exact[PARAMETRIC] = d.create_buffer_with_data(
+                data=np.ascontiguousarray(exact["pcs"], np.float32).reshape(-1), usage=storage)
+        self.modules = compile_passes(out_dir, defines)
         code, self.surface_bindings = self.modules["surface"]
         module = d.create_shader_module(code=code)
         self.surface = d.create_render_pipeline(
@@ -143,9 +170,12 @@ class LIC:
 
     def render(self, eye, target, up, field_range, noise_pixels=1.5, step=1.0, steps=20,
                depth_jump=0.05, smallest=1e-3, highpass=0.6, clip=0.01, enhanced=True,
-               fovy=30.0, by_scalar=False):
+               fovy=30.0, by_scalar=False, check=False):
         """The picture (``(h, w, 4)`` u8, downsampled) and, at full resolution, the
-        field target, the noise and the LIC intensity; GPU times (ms)."""
+        field target, the noise and the LIC intensity; GPU times (ms). With ``check``,
+        the surface pass alone, its field target holding the field and the scalar
+        themselves per pixel (``values``, ``(h, w, 4)``: x, y, z, scalar; scalar 0
+        where no surface), and ``rows``, the projection the pixels are of."""
         d, w, h = self.device, self.w, self.h
         eye, target = np.asarray(eye, float), np.asarray(target, float)
         distance = float(np.linalg.norm(eye - target))
@@ -153,7 +183,7 @@ class LIC:
             eye, target, np.asarray(up, float))
         frame = np.zeros((8, 4), np.float32)
         frame[:4] = rows
-        frame[4, :3] = eye
+        frame[4] = (*eye, float(check))
         frame[5] = (field_range[0], field_range[1], noise_pixels, float(by_scalar))
         frame[6] = (w, h, step * self.ss, steps * self.ss)
         frame[7] = (depth_jump, smallest, highpass, clip)
@@ -178,7 +208,7 @@ class LIC:
                                       "depth_load_op": wgpu.LoadOp.clear,
                                       "depth_store_op": wgpu.StoreOp.store})
         buffers = {FRAME: self.frame, POINTS: self.points, VECTORS: self.vectors,
-                   TRIANGLES: self.triangles, SCALARS: self.scalars}
+                   TRIANGLES: self.triangles, SCALARS: self.scalars, **self.exact}
         rp.set_pipeline(self.surface)
         rp.set_bind_group(0, self._bind(self.surface, self.surface_bindings,
                                         {b: {"buffer": v} for b, v in buffers.items()}))
@@ -187,6 +217,16 @@ class LIC:
         d.queue.submit([encoder.finish()])
         d.queue.read_buffer(self.ranges[1])         # waits
         timings["surface"] = 1000 * (time.perf_counter() - t0)
+
+        def read(texture, channels, dtype):
+            size = np.dtype(dtype).itemsize * channels
+            data = d.queue.read_texture({"texture": texture, "origin": (0, 0, 0), "mip_level": 0},
+                                        {"offset": 0, "bytes_per_row": w * size}, (w, h, 1))
+            return np.frombuffer(data, dtype).reshape(h, w, channels)
+
+        if check:
+            return {"values": read(self.field, 4, np.float32), "rows": rows,
+                    "timings": timings}
 
         # LIC, contrast, (LIC, contrast,) composite.
         t0 = time.perf_counter()
@@ -216,12 +256,6 @@ class LIC:
         d.queue.submit([encoder.finish()])
         d.queue.read_buffer(self.ranges[1])         # waits
         timings["lic"] = 1000 * (time.perf_counter() - t0)
-
-        def read(texture, channels, dtype):
-            size = np.dtype(dtype).itemsize * channels
-            data = d.queue.read_texture({"texture": texture, "origin": (0, 0, 0), "mip_level": 0},
-                                        {"offset": 0, "bytes_per_row": w * size}, (w, h, 1))
-            return np.frombuffer(data, dtype).reshape(h, w, channels)
 
         final = read(self.final, 4, np.uint8).astype(np.float32)
         s = self.ss

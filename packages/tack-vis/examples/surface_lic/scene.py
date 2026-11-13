@@ -3,9 +3,11 @@
 
 """The LIC prototype's data: a linear hexahedral mesh of the unit cube (geometry p=1)
 with a linear vector field (H1 p=1) interpolated from an analytic flow, cut by an
-oblique plane. The cut's triangles carry the field at their points, where p=1 is exact
-and linear between them, so a renderer interpolating per vertex draws the field
-exactly."""
+oblique plane. The cut's triangles carry the field at their points, which lie on the
+hexahedra's edges, where the trilinear field is linear, so the values there are exact.
+Between them a renderer interpolating per vertex is only an approximation: a trilinear
+field cut by a plane is not linear over the cut (it would be on tetrahedra). Exact
+per-pixel values need the hexahedra's basis evaluated per pixel (the plan's step 2)."""
 
 import numpy as np
 

@@ -20,7 +20,7 @@ struct Frame
     float4 row1;
     float4 row2;
     float4 row3;
-    float4 eye;      // xyz
+    float4 eye;      // xyz; w 1: the check (target 0 holds the field and the scalar)
     float4 field;    // colour range lo, hi; noise cell in pixels; colour by: 0 |v_t|, 1 the scalar
     float4 size;     // width, height in pixels; step in pixels; steps each way
     float4 lic;      // depth jump (relative); smallest |v_t|; high-pass weight; 0
@@ -42,6 +42,19 @@ float4 clipOf(Frame f, float4 p)
 [vk::binding(12, 0)] StructuredBuffer<uint> triangles;
 [vk::binding(13, 0)] StructuredBuffer<float> scalars;
 
+#ifdef TACK_EXACT
+// The fields evaluated per pixel with the cells' own basis: Tack's evaluation as
+// Slang (exact.py: tack_cell_geometry, tack_vector, tack_scalar), the slice's
+// triangles each with its cell, and each triangle vertex's parametric coordinates
+// there (points are per triangle vertex: point i is triangle i / 3's vertex i % 3).
+#include "tack_volume.slang"
+[vk::binding(14, 0)] StructuredBuffer<uint> geometryPool;
+[vk::binding(15, 0)] StructuredBuffer<uint> vectorPool;
+[vk::binding(16, 0)] StructuredBuffer<uint> scalarPool;
+[vk::binding(17, 0)] StructuredBuffer<uint> triangleCells;
+[vk::binding(18, 0)] StructuredBuffer<float> parametric;
+#endif
+
 struct SurfaceVertex
 {
     float4 position : SV_Position;
@@ -49,6 +62,10 @@ struct SurfaceVertex
     float3 vector : VECTOR;
     float scalar : SCALAR;
     nointerpolation float3 normal : NORMAL;
+#ifdef TACK_EXACT
+    float3 pc : PCOORD;
+    nointerpolation uint cell : CELL;
+#endif
 };
 
 float3 pointAt(uint i) { return float3(points[3 * i], points[3 * i + 1], points[3 * i + 2]); }
@@ -63,8 +80,15 @@ SurfaceVertex vs_surface(uint vertex : SV_VertexID)
     SurfaceVertex out;
     out.position = clipOf(frame[0], float4(p, 1.f));
     out.model = p;
+#ifdef TACK_EXACT
+    out.vector = float3(0.f);
+    out.scalar = 0.f;
+    out.pc = float3(parametric[3 * i], parametric[3 * i + 1], parametric[3 * i + 2]);
+    out.cell = triangleCells[t];
+#else
     out.vector = float3(vectors[3 * i], vectors[3 * i + 1], vectors[3 * i + 2]);
     out.scalar = scalars[i];
+#endif
     out.normal = normalize(cross(pointAt(b) - pointAt(a), pointAt(c) - pointAt(a)));
     return out;
 }
@@ -91,6 +115,32 @@ float latticeNoise(int3 cell, uint octave)
     return float(v.x & 0xffffffu) / 16777215.f;
 }
 
+#ifdef TACK_EXACT
+float3x3 inverse3(float3x3 m)
+{
+    float3 a = m[0], b = m[1], c = m[2];
+    float3 r0 = cross(b, c), r1 = cross(c, a), r2 = cross(a, b);
+    float det = dot(a, r0);
+    return transpose(float3x3(r0, r1, r2)) / det;
+}
+
+// The point x's parametric coordinates in cell c, by Newton's method on the cell's map
+// from the guess xi (exact for an affine cell in one step).
+float3 locate(uint c, float3 x, float3 xi)
+{
+    for (int it = 0; it < 8; ++it) {
+        float4x3 g = tack_cell_geometry(geometryPool, int(c), xi);
+        // Rows 1-3 are the Jacobian's columns, so their matrix is its transpose.
+        float3x3 jacobian = transpose(float3x3(g[1], g[2], g[3]));
+        float3 step = mul(inverse3(jacobian), x - g[0]);
+        xi += step;
+        if (dot(step, step) < 1e-14f)
+            break;
+    }
+    return xi;
+}
+#endif
+
 struct SurfaceTargets
 {
     float4 field : SV_Target0;   // screen direction x, y; |v_t|; view depth. Cleared (0, 0, -1, 0)
@@ -103,7 +153,16 @@ SurfaceTargets fs_surface(SurfaceVertex in)
 {
     Frame f = frame[0];
     float3 n = in.normal;
+    // The noise's footprint first: derivatives need uniform control flow.
+    float footprint = max(length(ddx(in.model)), length(ddy(in.model)));
+#ifdef TACK_EXACT
+    float3 xi = locate(in.cell, in.model, in.pc);
+    float3 v = tack_vector(vectorPool, int(in.cell), xi);
+    float scalar = tack_scalar(scalarPool, int(in.cell), xi);
+#else
     float3 v = in.vector;
+    float scalar = in.scalar;
+#endif
     float3 vt = v - dot(v, n) * n;            // the field's tangential part
     // Its screen-space direction: the derivative of the pixel position along vt.
     float4 c = clipOf(f, float4(in.model, 1.f));
@@ -114,16 +173,17 @@ SurfaceTargets fs_surface(SurfaceVertex in)
 
     SurfaceTargets out;
     out.field = float4(len > 0.f ? dpix / len : float2(0.f), length(vt), c.w);
+    if (f.eye.w > 0.5f)
+        out.field = float4(v, scalar);        // the check: the values themselves
 
     float3 view = normalize(f.eye.xyz - in.model);
     float light = 0.3f + 0.7f * abs(dot(n, view));
-    float coloured = f.field.w > 0.5f ? in.scalar : length(vt);
+    float coloured = f.field.w > 0.5f ? scalar : length(vt);
     float t = saturate((coloured - f.field.x) / (f.field.y - f.field.x));
     out.color = float4(viridis(t) * light, 1.f);
 
     // Noise fixed to the surface: a lattice in model space whose cell is about
     // f.field.z pixels, quantized to octaves and faded between two of them.
-    float footprint = max(length(ddx(in.model)), length(ddy(in.model)));
     float level = log2(max(f.field.z * footprint, 1e-9f));
     float l0 = floor(level);
     float fade = level - l0;
