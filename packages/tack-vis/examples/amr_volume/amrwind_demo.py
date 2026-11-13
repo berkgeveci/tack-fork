@@ -143,6 +143,16 @@ def main():
     print(f"frames at {size[0]}x{size[1]}: first {first:.0f} ms; then {skipping:.1f} ms with "
           f"empty-space skipping ({100 * seen.mean():.0f}% of macrocells visible), "
           f"{marching:.1f} ms without", flush=True)
+    # As an interactor style does while the camera moves.
+    window.SetDesiredUpdateRate(15.0)
+    window.Render()
+    moving = frames(window)
+    write_png(os.path.join(args.out, f"{tag}_moving.png"), grab(window))
+    window.SetDesiredUpdateRate(0.0001)
+    window.Render()
+    print(f"while the camera moves: {moving:.1f} ms (steps of "
+          f"{mapper.interactive_sample_distance:g} local cells, at most about "
+          f"{mapper.interactive_steps} a ray)", flush=True)
 
     if args.check:
         # A window of its own: one resized after rendering came out empty.
@@ -163,6 +173,14 @@ def main():
               f"{100 * float((d > 2).mean()):.3f}% of pixels differ by more than 2/255, "
               f"{100 * float((d > 8).mean()):.3f}% by more than 8 (max {int(d.max())})",
               flush=True)
+        check_window.SetDesiredUpdateRate(15.0)
+        check_window.Render()
+        check_window.Render()
+        moving = grab(check_window)
+        expected_moving = reference(volume, mapper, camera, small, background, True)
+        d = np.abs(moving[..., :3].astype(int) - expected_moving[..., :3].astype(int)).max(axis=2)
+        print(f"  while moving: {100 * float((d > 2).mean()):.3f}% of pixels differ by more "
+              f"than 2/255 (max {int(d.max())})", flush=True)
         write_png(os.path.join(args.out, f"{tag}_check.png"), picture)
         write_png(os.path.join(args.out, f"{tag}_reference.png"), expected)
     print(f"  pictures in {os.path.abspath(args.out)}", flush=True)

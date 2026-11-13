@@ -33,6 +33,13 @@ start. A slab test against the bounds gives where it enters. From there:
   the step (``1 - (1 - a)^(h / unit)``); composited front to back until the opacity
   reaches ``volume_tack.OPAQUE``.
 
+While the camera moves the steps are longer: ``interactive_sample_distance`` local
+cells and at least the bounds' diagonal over ``interactive_steps`` (``min_step``), so
+a ray takes at most about that many. These go to the shader property's interactive
+uniforms (``GetInteractiveFragmentCustomUniforms``), which VTK uses while the render
+window's desired update rate is raised, as an interactor style raises it for the
+length of an interaction: the client's own interactor switches them, Python or not.
+
 The hook writes ``(C / A, A)``, which the A-buffer composites over the opaque image.
 ``volume_tack.reference`` is the same march in Tack, and ``visible`` there what makes
 ``hooks.visible`` (a Tack kernel over the input's macrocell ranges and the table).
@@ -116,7 +123,8 @@ public struct TackVolumeHook : IShaderHooks
     float x1;
     float y1;
     float z1;
-    float factor;                      // a step, in local cells
+    float factor;                      // a step, in local cells,
+    float min_step;                    // and at least this long
     float unit;                        // the opacity's unit distance
     float skip;                        // past a macrocell's face
     float gx;                          // the macrocells: how many,
@@ -167,7 +175,7 @@ public struct TackVolumeHook : IShaderHooks
                 float ez = tack_exit(o.z, dir.z, inv.z, mk, mz);
                 t = max(min(min(ex, ey), ez), t) + skip;
             } else {
-                float h = factor * tack_cell_size(pool, near + dir * t);
+                float h = max(factor * tack_cell_size(pool, near + dir * t), min_step);
                 float v = tack_sample(pool, near + dir * (t + 0.5f * h));
                 float4 s = tack_transfer(tf, entries, (v - lo) / (hi - lo));
                 float alpha = 1.f - pow(1.f - s.w, h / unit);
@@ -208,6 +216,12 @@ class VolumeMapper(VTKPythonMapperBase):
         self.opacity = vtkPiecewiseFunction()
         self.sample_distance = sample_distance
         self.skip_empty = True                # empty-space skipping (off: for measuring)
+        # While the camera moves (the render window's desired update rate at least the
+        # property's InteractiveUpdateRate): steps of ``interactive_sample_distance``
+        # local cells, and no shorter than the bounds' diagonal over
+        # ``interactive_steps``, so a ray takes at most about that many steps.
+        self.interactive_sample_distance = 1.0
+        self.interactive_steps = 400
         self.unit_distance = unit_distance
         self.table_size = table_size
         self.body = None
@@ -244,12 +258,21 @@ class VolumeMapper(VTKPythonMapperBase):
                 "seen": seen,
                 "bounds": fields.GetArray("TackBounds").GetTuple(0)}
 
+    def interactive(self, march):
+        """The uniforms that differ while the camera moves: the step factor and the
+        shortest step."""
+        b = march["bounds"]
+        diagonal = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]]))
+        return {"factor": self.interactive_sample_distance,
+                "min_step": diagonal / self.interactive_steps}
+
     def RequestSlang(self, renderer, actor):
         poly = self.GetInput()
         if poly is None:
             return
         key = (poly.GetMTime(), self.color.GetMTime(), self.opacity.GetMTime(),
-               self.sample_distance, self.unit_distance, self.table_size, self.skip_empty)
+               self.sample_distance, self.unit_distance, self.table_size, self.skip_empty,
+               self.interactive_sample_distance, self.interactive_steps)
         if key == self.seen:
             return
         self.seen = key
@@ -273,7 +296,8 @@ class VolumeMapper(VTKPythonMapperBase):
         self.slang.SetSlangBuffer("hooks.visible", self.visible)
         grid = march["grid"]
         values = {"tf_size": self.table_size, "lo": march["lo"], "hi": march["hi"],
-                  "factor": march["factor"], "unit": march["unit"], "skip": march["skip"],
+                  "factor": march["factor"], "min_step": 0.0, "unit": march["unit"],
+                  "skip": march["skip"],
                   "max_steps": volume_tack.MAX_STEPS, "opaque": volume_tack.OPAQUE}
         values.update(zip(("x0", "x1", "y0", "y1", "z0", "z1"), march["bounds"], strict=True))
         values.update(zip(("gx", "gy", "gz"), grid["dims"], strict=True))
@@ -281,4 +305,7 @@ class VolumeMapper(VTKPythonMapperBase):
         values.update(zip(("mx", "my", "mz"), grid["size"], strict=True))
         for name, value in values.items():
             self.uniforms.SetUniformf(f"hooks.{name}", float(value))
+        interactive = self.slang.GetInteractiveFragmentCustomUniforms()
+        for name, value in self.interactive(march).items():
+            interactive.SetUniformf(f"hooks.{name}", float(value))
         self.preparations += 1

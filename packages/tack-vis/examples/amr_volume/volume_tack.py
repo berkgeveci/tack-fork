@@ -101,10 +101,11 @@ class AMRVolume:
     cells there (``CellBox``'s clamp).
 
     At ``p`` each level has at most eight tents: the cells around ``p`` in the level's
-    index space. A cell is found through the level's bins: a uniform grid over the
-    level's boxes (``bin_size`` cells, at most a box's smallest extent, so a bin meets
-    at most eight boxes), each listing the boxes it meets (CSR). Refined cells are one
-    bit each (``refined``, 32 to a word).
+    index space. A cell's box is one load from the level's dense table of bricks
+    (``brick_box``): bricks of ``bin_size`` cells over the level's boxes, the greatest
+    common divisor of their corners, so a brick lies in one box or none (AMReX's
+    blocking factor makes it 8 or more), each holding that box or -1. Refined cells
+    are one bit each (``refined``, 32 to a word).
 
     ``blend`` 0 instead takes the finest level with an active cell containing ``p``
     and only that level's cells: per-level trilinear interpolation, clamped at its
@@ -163,15 +164,7 @@ class AMRVolume:
         out = -1
         slot = self.bin_slot(level, i, j, k)
         if slot >= 0:
-            for q in range(self.bin_offsets[slot], self.bin_offsets[slot + 1]):
-                box = self.bin_boxes[q]
-                a = i - self.box_lo[3 * box]
-                c = j - self.box_lo[3 * box + 1]
-                e = k - self.box_lo[3 * box + 2]
-                if (a >= 0 and a < self.box_dims[3 * box] and c >= 0
-                        and c < self.box_dims[3 * box + 1] and e >= 0
-                        and e < self.box_dims[3 * box + 2]):
-                    out = box
+            out = self.brick_box[slot]
         return out
 
     @tack.func
@@ -243,7 +236,7 @@ class AMRVolume:
                         + b * self.bin_dims[3 * level + 2]):
                     mode = -1
             elif first >= 0 and one:
-                if self.bin_offsets[first] == self.bin_offsets[first + 1]:
+                if self.brick_box[first] < 0:
                     mode = -1
         if mode >= 0:
             for corner in range(8):
@@ -359,7 +352,7 @@ def amr_volume(amr, spacings, origin, field="values", blend=1):
     levels = amr.num_levels
     box_lo, box_dims, box_values, box_refined, box_level = [], [], [], [], []
     values, refined = [], []
-    bin_origin, bin_size, bin_dims, bin_base, bin_offsets, bin_boxes = [], [], [], [], [], []
+    bin_origin, bin_size, bin_dims, bin_base, brick_box = [], [], [], [], []
     at_value = at_word = first = 0
     pieces = [[] for _ in range(levels)]
     for level, piece in amr:
@@ -383,26 +376,21 @@ def amr_volume(amr, spacings, origin, field="values", blend=1):
             refined.append(np.packbits(packed, bitorder="little").view(np.int32))
             at_value += cells
             at_word += words
-        # The level's bins: a box's smallest extent (or less), over the level's boxes.
-        size = int(max(1, (hi - lo).min()))
+        # The level's bricks: the corners' greatest common divisor, so that a brick lies
+        # in one box or none; a dense table of each brick's box over the level's boxes.
+        size = int(np.gcd.reduce(np.concatenate([lo.ravel(), hi.ravel()]).astype(np.int64)))
+        size = max(size, 1)
         start = lo.min(axis=0)
-        dims = -(-(hi.max(axis=0) - start) // size)
-        members = [[] for _ in range(int(np.prod(dims)))]
+        dims = (hi.max(axis=0) - start) // size
+        table = np.full(tuple(int(d) for d in dims[::-1]), -1, np.int32)
         for b, (blo, bhi) in enumerate(zip(lo, hi)):
-            a = (blo - start) // size
-            z = -(-(bhi - start) // size)
-            for bk in range(a[2], z[2]):
-                for bj in range(a[1], z[1]):
-                    for bi in range(a[0], z[0]):
-                        members[bi + dims[0] * (bj + dims[1] * bk)].append(first + b)
+            a, z = (blo - start) // size, (bhi - start) // size
+            table[a[2]:z[2], a[1]:z[1], a[0]:z[0]] = first + b
         bin_origin.extend(int(v) for v in start)
         bin_size.append(size)
         bin_dims.extend(int(v) for v in dims)
-        bin_base.append(len(bin_offsets))
-        for m in members:
-            bin_offsets.append(len(bin_boxes))
-            bin_boxes.extend(m)
-        bin_offsets.append(len(bin_boxes))
+        bin_base.append(sum(len(t) for t in brick_box))
+        brick_box.append(table.reshape(-1))
         first += len(boxes)
 
     def ints(v):
@@ -411,8 +399,7 @@ def amr_volume(amr, spacings, origin, field="values", blend=1):
     arrays = {
         "spacing": tack.array(np.asarray(spacings, np.float32).reshape(-1)),
         "bin_origin": ints(bin_origin), "bin_size": ints(bin_size), "bin_dims": ints(bin_dims),
-        "bin_base": ints(bin_base), "bin_offsets": ints(bin_offsets),
-        "bin_boxes": ints(bin_boxes or [0]),
+        "bin_base": ints(bin_base), "brick_box": ints(np.concatenate(brick_box)),
         "box_lo": ints(box_lo), "box_dims": ints(box_dims), "box_values": ints(box_values),
         "box_refined": ints(box_refined), "box_level": ints(box_level),
         "values": tack.array(np.concatenate(values)),
@@ -556,8 +543,8 @@ def _exit(q, d, inv, mi, m):
 
 
 @tack.kernel
-def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, unit, gx, gy, gz,
-           ox, oy, oz, mx, my, mz, skip, out):
+def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, min_step, unit, gx,
+           gy, gz, ox, oy, oz, mx, my, mz, skip, out):
     for k in range(starts.shape[0]):
         p0 = starts[k]
         d = dirs[k]
@@ -586,7 +573,7 @@ def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, unit, g
                 ez = _exit(qz, d[2], iz, mk, mz)
                 t = max(min(ex, ey, ez), t) + skip
             else:
-                h = factor * volume.cell_size(p0 + d * t)
+                h = max(factor * volume.cell_size(p0 + d * t), min_step)
                 v = volume.sample(p0 + d * (t + 0.5 * h))
                 c = _transfer(tf, (v - lo) / (hi - lo))
                 alpha = 1.0 - pow(1.0 - c[3], h / unit)
@@ -629,18 +616,19 @@ def rays(camera, size, bounds):
 
 
 def reference(volume, camera, size, bounds, tf, lo, hi, factor, unit, grid, seen, skip,
-              background):
+              background, min_step=0.0):
     """The picture the hook should draw (``(h, w, 4)`` u8, row 0 at the top): the
     rays marched in Tack as the hook marches them (steps ``factor`` times the local
-    cell size, macrocells ``grid`` skipped where ``seen`` is 0), composited over
-    ``background`` as the A-buffer does."""
+    cell size and at least ``min_step``, macrocells ``grid`` skipped where ``seen`` is
+    0), composited over ``background`` as the A-buffer does."""
     near, d, tmin, tmax = rays(camera, size, bounds)
     f32 = np.float32
     out = tack.empty((len(near),), tack.vec4(tack.f32))
     _march(volume, tack.array(near.astype(f32), tack.vec3()),
            tack.array(d.astype(f32), tack.vec3()), tack.array(tmin.astype(f32)),
            tack.array(tmax.astype(f32)), tack.array(np.asarray(tf, f32), tack.vec4()), seen,
-           float(lo), float(hi), float(factor), float(unit), *grid["dims"], *grid["origin"],
+           float(lo), float(hi), float(factor), float(min_step), float(unit), *grid["dims"],
+           *grid["origin"],
            *grid["size"], float(skip), out)
     rgba = out.numpy().astype(np.float64)
     a = rgba[:, 3:]

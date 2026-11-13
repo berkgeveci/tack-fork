@@ -74,12 +74,18 @@ def grab(window):
     return np.ascontiguousarray(rgba[::-1])           # row 0 at the top, RGBA
 
 
-def reference(volume, mapper, camera, size, background):
-    """The picture the mapper's hook should draw, marched in Tack."""
+def reference(volume, mapper, camera, size, background, interactive=False):
+    """The picture the mapper's hook should draw, marched in Tack (``interactive``: as
+    while the camera moves)."""
     march = mapper.march(volume.GetOutputDataObject(0))
+    factor, min_step = march["factor"], 0.0
+    if interactive:
+        changed = mapper.interactive(march)
+        factor, min_step = changed["factor"], changed["min_step"]
     return volume_tack.reference(volume.box, camera, size, march["bounds"], march["table"],
-                                 march["lo"], march["hi"], march["factor"], march["unit"],
-                                 march["grid"], march["seen"], march["skip"], background)
+                                 march["lo"], march["hi"], factor, march["unit"],
+                                 march["grid"], march["seen"], march["skip"], background,
+                                 min_step)
 
 
 def transfer_functions(mapper, lo, hi):
