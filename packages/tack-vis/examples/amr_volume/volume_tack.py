@@ -533,6 +533,17 @@ def _safe_inverse(x):
 
 
 @tack.func
+def _jitter(px, py):
+    """A pixel's offset in [0, 1): a PCG hash of its position (the hook's
+    ``tack_jitter``)."""
+    state = (tack.u32(px) + tack.u32(4096) * tack.u32(py)) * tack.u32(747796405) \
+        + tack.u32(2891336453)
+    word = ((state >> ((state >> tack.u32(28)) + tack.u32(4))) ^ state) * tack.u32(277803737)
+    word = (word >> tack.u32(22)) ^ word
+    return tack.f32(word >> tack.u32(8)) * (1.0 / 16777216.0)
+
+
+@tack.func
 def _exit(q, d, inv, mi, m):
     """Where the ray ``q + t d`` (from the macrocells' origin) leaves macrocell ``mi``
     (``m`` wide) on one axis: its face ahead."""
@@ -544,7 +555,7 @@ def _exit(q, d, inv, mi, m):
 
 @tack.kernel
 def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, min_step, unit, gx,
-           gy, gz, ox, oy, oz, mx, my, mz, skip, out):
+           gy, gz, ox, oy, oz, mx, my, mz, skip, jitter, width, out):
     for k in range(starts.shape[0]):
         p0 = starts[k]
         d = dirs[k]
@@ -562,6 +573,8 @@ def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, min_ste
         b = 0.0
         a = 0.0
         steps = 0
+        offset = jitter * _jitter(k % width, k // width)
+        fresh = 1
         while t < t1 and steps < MAX_STEPS:
             steps += 1
             mi = min(max(int(floor((qx + d[0] * t) / mx)), 0), gx - 1)
@@ -572,8 +585,12 @@ def _march(volume, starts, dirs, tmins, tmaxs, tf, seen, lo, hi, factor, min_ste
                 ey = _exit(qy, d[1], iy, mj, my)
                 ez = _exit(qz, d[2], iz, mk, mz)
                 t = max(min(ex, ey, ez), t) + skip
+                fresh = 1
             else:
                 h = max(factor * volume.cell_size(p0 + d * t), min_step)
+                if fresh == 1:
+                    t += offset * h
+                    fresh = 0
                 v = volume.sample(p0 + d * (t + 0.5 * h))
                 c = _transfer(tf, (v - lo) / (hi - lo))
                 alpha = 1.0 - pow(1.0 - c[3], h / unit)
@@ -616,7 +633,7 @@ def rays(camera, size, bounds):
 
 
 def reference(volume, camera, size, bounds, tf, lo, hi, factor, unit, grid, seen, skip,
-              background, min_step=0.0):
+              background, min_step=0.0, jitter=0.0):
     """The picture the hook should draw (``(h, w, 4)`` u8, row 0 at the top): the
     rays marched in Tack as the hook marches them (steps ``factor`` times the local
     cell size and at least ``min_step``, macrocells ``grid`` skipped where ``seen`` is
@@ -629,7 +646,7 @@ def reference(volume, camera, size, bounds, tf, lo, hi, factor, unit, grid, seen
            tack.array(tmax.astype(f32)), tack.array(np.asarray(tf, f32), tack.vec4()), seen,
            float(lo), float(hi), float(factor), float(min_step), float(unit), *grid["dims"],
            *grid["origin"],
-           *grid["size"], float(skip), out)
+           *grid["size"], float(skip), float(jitter), int(size[0]), out)
     rgba = out.numpy().astype(np.float64)
     a = rgba[:, 3:]
     # The hook writes (C / A, A) through an 8-bit target; the resolve multiplies back.

@@ -35,7 +35,10 @@ start. A slab test against the bounds gives where it enters. From there:
 
 While the camera moves the steps are longer: ``interactive_sample_distance`` local
 cells and at least the bounds' diagonal over ``interactive_steps`` (``min_step``), so
-a ray takes at most about that many. These go to the shader property's interactive
+a ray takes at most about that many; and each run of steps (from the entry, and from
+each skip) starts a per-pixel fraction of its first step in (``jitter``, a PCG hash
+of the pixel), which turns the bands that long steps restarting on the same planes
+would draw into fine noise. These go to the shader property's interactive
 uniforms (``GetInteractiveFragmentCustomUniforms``), which VTK uses while the render
 window's desired update rate is raised, as an interactor style raises it for the
 length of an interaction: the client's own interactor switches them, Python or not.
@@ -101,6 +104,15 @@ float tack_safe_inverse(float x)
     return 1.f / (abs(x) < 1e-20f ? (x < 0.f ? -1e-20f : 1e-20f) : x);
 }
 
+// A pixel's offset in [0, 1): a PCG hash of its position (volume_tack._jitter too).
+float tack_jitter(uint px, uint py)
+{
+    uint state = (px + 4096u * py) * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    word = (word >> 22u) ^ word;
+    return float(word >> 8u) * (1.f / 16777216.f);
+}
+
 float tack_exit(float q, float d, float inv, int mi, float m)
 {
     float face = float(mi) * m;
@@ -138,6 +150,7 @@ public struct TackVolumeHook : IShaderHooks
     float mz;
     float max_steps;
     float opaque;
+    float jitter;                      // 1: start each run of steps at a per-pixel offset
 
     // One fragment a pixel: the back face's.
     public override bool clip(inout FragmentContext f) { return !f.frontFacing; }
@@ -164,6 +177,11 @@ public struct TackVolumeHook : IShaderHooks
         float3 colour = float3(0.f);
         float a = 0.f;
         int steps = 0;
+        // Each run of steps (from the entry, and from each skip) starts a per-pixel
+        // fraction of its first step in, so that neighbouring rays do not sample on
+        // the same planes.
+        float offset = jitter * tack_jitter(uint(f.fragCoord.x), uint(f.fragCoord.y));
+        bool fresh = true;
         while (t < t1 && steps < most) {
             steps += 1;
             int mi = min(max(int(floor((o.x + dir.x * t) / mx)), 0), ngx - 1);
@@ -174,8 +192,13 @@ public struct TackVolumeHook : IShaderHooks
                 float ey = tack_exit(o.y, dir.y, inv.y, mj, my);
                 float ez = tack_exit(o.z, dir.z, inv.z, mk, mz);
                 t = max(min(min(ex, ey), ez), t) + skip;
+                fresh = true;
             } else {
                 float h = max(factor * tack_cell_size(pool, near + dir * t), min_step);
+                if (fresh) {
+                    t += offset * h;
+                    fresh = false;
+                }
                 float v = tack_sample(pool, near + dir * (t + 0.5f * h));
                 float4 s = tack_transfer(tf, entries, (v - lo) / (hi - lo));
                 float alpha = 1.f - pow(1.f - s.w, h / unit);
@@ -259,12 +282,12 @@ class VolumeMapper(VTKPythonMapperBase):
                 "bounds": fields.GetArray("TackBounds").GetTuple(0)}
 
     def interactive(self, march):
-        """The uniforms that differ while the camera moves: the step factor and the
-        shortest step."""
+        """The uniforms that differ while the camera moves: the step factor, the
+        shortest step and the jitter."""
         b = march["bounds"]
         diagonal = float(np.linalg.norm([b[1] - b[0], b[3] - b[2], b[5] - b[4]]))
         return {"factor": self.interactive_sample_distance,
-                "min_step": diagonal / self.interactive_steps}
+                "min_step": diagonal / self.interactive_steps, "jitter": 1.0}
 
     def RequestSlang(self, renderer, actor):
         poly = self.GetInput()
@@ -296,7 +319,8 @@ class VolumeMapper(VTKPythonMapperBase):
         self.slang.SetSlangBuffer("hooks.visible", self.visible)
         grid = march["grid"]
         values = {"tf_size": self.table_size, "lo": march["lo"], "hi": march["hi"],
-                  "factor": march["factor"], "min_step": 0.0, "unit": march["unit"],
+                  "factor": march["factor"], "min_step": 0.0, "jitter": 0.0,
+                  "unit": march["unit"],
                   "skip": march["skip"],
                   "max_steps": volume_tack.MAX_STEPS, "opaque": volume_tack.OPAQUE}
         values.update(zip(("x0", "x1", "y0", "y1", "z0", "z1"), march["bounds"], strict=True))
