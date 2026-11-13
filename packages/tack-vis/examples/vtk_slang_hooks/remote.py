@@ -21,6 +21,9 @@ has no Slang compiler), the positions the browser's GPU computes (the placing pa
 camera is the browser's own after the first update.
 
     python remote.py [straight|curved|tets] [n] [--port 8765] [--wasm DIR]
+
+Without a kind, three scenes to choose from on the page: one curved cell, curved 32
+(6,144 faces, 786k triangles) and curved 64 (24,576 faces, 3.1M triangles).
 """
 
 import argparse
@@ -29,6 +32,7 @@ import json
 import mimetypes
 import os
 import time
+import urllib.parse
 
 os.environ.setdefault("INSTANCED", "1")
 
@@ -58,6 +62,7 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <div id="bar">
+  <select id="scene">{{SCENES}}</select>
   <button id="geometry">geometry step</button><button id="field">field step</button>
   <div id="log">loading VTK...</div>
 </div>
@@ -108,6 +113,9 @@ async function step(kind) {
   await apply(update, kind + " step", t0);
 }
 
+document.getElementById("scene").onchange = (event) => {
+  location.search = "?scene=" + encodeURIComponent(event.target.value);
+};
 document.getElementById("geometry").onclick = () => step("geometry");
 document.getElementById("field").onclick = () => step("field");
 document.getElementById("log").textContent = "WebGPU: " + ("gpu" in navigator);
@@ -121,8 +129,10 @@ await apply(await (await fetch("/update")).json(), "first update");
 class Scene:
     """The server's scene and what the browser has of it."""
 
-    def __init__(self, kind, n):
+    def __init__(self, kind, n, label=None):
         tack.set_default_device("cpu")
+        start = time.perf_counter()
+        self.label = label or f"{kind} {n}"
         self.kind, self.n, self.steps = kind, n, 0
         self.surf = demo.tets_surface(n) if kind == "tets" else demo.surface(kind, n)
         self.groups, (self.lo, self.hi) = surface_actors(self.surf, "f")
@@ -139,6 +149,9 @@ class Scene:
         self.sent_states, self.sent_blobs = {}, set()
         self.blobs = {}
         self.camera_sent = False
+        print(f"{self.label}: {self.surf.num_cells} faces, "
+              f"{sum(g.triangles for g in self.groups)} triangles, ready in "
+              f"{time.perf_counter() - start:.1f} s", flush=True)
 
     def new_client(self):
         """A page loaded: the browser has nothing yet."""
@@ -198,7 +211,15 @@ def _step_surface():
     return module.step_surface
 
 
-def serve(scene, port, wasm):
+def serve(scenes, port, wasm):
+    current = {"scene": next(iter(scenes.values()))}
+
+    def page():
+        options = "".join(
+            f'<option value="{key}"{" selected" if s is current["scene"] else ""}>{s.label}</option>'
+            for key, s in scenes.items())
+        return PAGE.replace("{{SCENES}}", options)
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def _send(self, body, kind, status=200):
             self.send_response(status)
@@ -209,10 +230,16 @@ def serve(scene, port, wasm):
             self.wfile.write(body)
 
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                scene.new_client()
-                self._send(PAGE.encode(), "text/html")
-            elif self.path == "/update":
+            path, _, query = self.path.partition("?")
+            if path in ("/", "/index.html"):
+                key = urllib.parse.parse_qs(query).get("scene", [None])[0]
+                if key in scenes:
+                    current["scene"] = scenes[key]
+                current["scene"].new_client()
+                self._send(page().encode(), "text/html")
+                return
+            scene = current["scene"]
+            if self.path == "/update":
                 self._send(json.dumps(scene.update()).encode(), "application/json")
             elif self.path.startswith("/blob/"):
                 blob = scene.blobs.get(self.path[len("/blob/"):])
@@ -235,7 +262,7 @@ def serve(scene, port, wasm):
 
         def do_POST(self):
             if self.path in ("/step/geometry", "/step/field"):
-                update = scene.step(self.path.rsplit("/", 1)[1])
+                update = current["scene"].step(self.path.rsplit("/", 1)[1])
                 self._send(json.dumps(update).encode(), "application/json")
             else:
                 self._send(b"not found", "text/plain", 404)
@@ -245,19 +272,25 @@ def serve(scene, port, wasm):
 
     # One thread: VTK and Tack are used from the thread that made them.
     server = http.server.HTTPServer(("127.0.0.1", port), Handler)
-    print(f"serving {scene.kind} {scene.n} on http://127.0.0.1:{port}/ "
+    print(f"serving {', '.join(s.label for s in scenes.values())} on http://127.0.0.1:{port}/ "
           f"(VTK WebAssembly from {wasm})", flush=True)
     server.serve_forever()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("kind", nargs="?", default="curved")
+    parser.add_argument("kind", nargs="?")
     parser.add_argument("n", nargs="?", type=int, default=32)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--wasm", default=WASM)
     args = parser.parse_args()
-    serve(Scene(args.kind, args.n), args.port, os.path.abspath(args.wasm))
+    if args.kind:
+        scenes = {"scene": Scene(args.kind, args.n)}
+    else:
+        scenes = {"cell": Scene("curved", 1, "1 curved cell (order-2 geometry, order-5 field)"),
+                  "c32": Scene("curved", 32, "curved 32: 6,144 faces, 786k triangles"),
+                  "c64": Scene("curved", 64, "curved 64: 24,576 faces, 3.1M triangles")}
+    serve(scenes, args.port, os.path.abspath(args.wasm))
 
 
 if __name__ == "__main__":
