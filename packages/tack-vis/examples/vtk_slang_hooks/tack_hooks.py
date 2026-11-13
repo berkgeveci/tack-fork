@@ -86,6 +86,8 @@ public struct TackSurface : IShaderHooks
     int probe;                         // 0: the picture; 1 value, 2 u, 3 v, 4 face + 1
     int base;                          // the group's first face in the surface
     int instanced;                     // 1: the face is the instance
+    StructuredBuffer<float> placed;    // tack_place's positions and normals (computed)
+    int computed;                      // 1: the vertex hook reads them from placed
 
     int face(uint cell, uint instance)
     {
@@ -94,7 +96,11 @@ public struct TackSurface : IShaderHooks
 
     public override void vertex(inout VertexContext v)
     {
-        if (place != 0) {
+        if (computed != 0) {
+            uint at = 6u * (uint(face(v.cellId, v.instanceId)) * tack_template_points + v.pointId);
+            v.positionMC = float4(placed[at], placed[at + 1u], placed[at + 2u], 1.f);
+            v.normalMC = float3(placed[at + 3u], placed[at + 4u], placed[at + 5u]);
+        } else if (place != 0) {
             float3x3 g = tack_geometry(geometry, face(v.cellId, v.instanceId), float3(v.uv, 0.f));
             v.positionMC = float4(g[0], 1.f);
             v.normalMC = normalize(cross(g[1], g[2]));
@@ -129,9 +135,44 @@ def _words(array):
     return out
 
 
-def group_module(surface, name, group):
+PLACE = r"""
+// The placing pass: Tack's geometry at every face's template points, once per geometry
+// change (vtkWebGPUShaderProperty.SetSlangComputedBuffer), for the vertex hook to read.
+StructuredBuffer<uint> geometry;       // the property's "hooks.geometry"
+RWStructuredBuffer<float> placed;      // the computed "hooks.placed": 6 floats a point
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void tack_place(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x + id.y * 4194240u;
+    uint n, stride;
+    placed.GetDimensions(n, stride);
+    if (6u * i >= n)
+        return;
+    uint face = i / tack_template_points;
+    uint k = i % tack_template_points;
+    float3x3 g = tack_geometry(geometry, int(face), float3(tack_template[k], 0.f));
+    float3 normal = normalize(cross(g[1], g[2]));
+    for (uint c = 0u; c < 3u; ++c) {
+        placed[6u * i + c] = g[0][c];
+        placed[6u * i + 3u + c] = normal[c];
+    }
+}
+"""
+
+
+def _template_source(points):
+    """The template's (u, v) as constants: the placing pass's points."""
+    uv = ", ".join(f"float2({u!r}, {v!r})" for u, v in points.astype(np.float64).tolist())
+    return (f"static const uint tack_template_points = {len(points)}u;\n"
+            f"static const float2 tack_template[{len(points)}] = {{ {uv} }};\n")
+
+
+def group_module(surface, name, group, points=None):
     """The group's Slang module (its type named after its source) and the two buffers'
-    words: ``(source, type name, geometry words, field words)``."""
+    words: ``(source, type name, geometry words, field words)``. With the template's
+    ``points``, the module has the placing pass too (``tack_place``)."""
     field = surface.fields[name]
     cells = surface.domain_view("cells", group)
     ids, pcs = _one_cell_arrays()
@@ -143,7 +184,8 @@ def group_module(surface, name, group):
     value = export(_value_at, (field.view(group), ids, pcs, tack.empty((1,), tack.f32)),
                    "tack_value", {"ids": ("int", 1), "pcs": ("float", 3), "out": ("float", 1)},
                    ("float", "{out}[0]"), binding=None)
-    body = joined(geometry, value) + HOOKS
+    points = np.zeros((1, 2), np.float32) if points is None else points
+    body = joined(geometry, value) + _template_source(points) + HOOKS + PLACE
     tag = hashlib.sha1(body.encode()).hexdigest()[:12]
     type_name = f"TackSurface_{tag}"
     source = (f"module tack_{tag};\nimport slangkit_hooks;\n\n"
@@ -188,6 +230,9 @@ class GroupActor:
     def __init__(self, surface, name, group, level, place, lo, hi, base, instanced=False):
         self.name, self.level, self.instanced = name, level, instanced
         self.place = place or instanced
+        # Instanced: the placing pass computes the points once per geometry change
+        # (COMPUTED=0: the vertex hook evaluates them every frame).
+        self.computed = instanced and os.environ.get("COMPUTED", "1") != "0"
         self.source = None
         self.geometry_words = self.field_words = None
         self.mapper = rr.vtkPolyDataMapper()
@@ -198,6 +243,7 @@ class GroupActor:
         self.uniforms.SetUniformf("hooks.hi", hi)
         self.uniforms.SetUniformi("hooks.place", int(self.place))
         self.uniforms.SetUniformi("hooks.instanced", int(instanced))
+        self.uniforms.SetUniformi("hooks.computed", 0)
         self.uniforms.SetUniformi("hooks.probe", 0)
         self.set_surface(surface, group, base)
 
@@ -212,10 +258,10 @@ class GroupActor:
         quad = group.shape.NUM_POINTS == 4
         curved = surface.geometry.space.order > 1
         self.group, self.base, self.count = group, base, group.count
-        source, type_name, gwords, fwords = group_module(surface, self.name, group)
+        points, tris = indexed_template(quad, self.level if curved else 1)
+        source, type_name, gwords, fwords = group_module(surface, self.name, group, points)
         timings = {"export": time.perf_counter() - t}
         t = time.perf_counter()
-        points, tris = indexed_template(quad, self.level if curved else 1)
         self.points = points
         m, per_face = len(points), len(tris) // 3
         if self.instanced:
@@ -271,12 +317,22 @@ class GroupActor:
             self.poly = poly
             self.mapper.SetInputData(poly)
         self.triangles = group.count * (len(tris) // 3)
+        sp = self.actor.GetShaderProperty()
+        if self.computed:
+            # Tack's geometry at the template points, once per geometry change, on the GPU.
+            sp.SetSlangComputedBuffer("hooks.placed", "tack_place", 6 * group.count * len(points),
+                                      group.count * len(points))
+        self.uniforms.SetUniformi("hooks.computed", int(self.computed))
         self.mapper.SetNumberOfInstances(group.count)
         self.mapper.SetDrawnBounds(lo[0] - pad, hi[0] + pad, lo[1] - pad, hi[1] + pad,
                                    lo[2] - pad, hi[2] + pad)
 
     def _set_module(self, source, type_name, gwords, fwords, per_face, base):
         sp = self.actor.GetShaderProperty()
+        if not self.computed and sp.GetSlangBuffer("hooks.placed") is None:
+            # The hook declares the placing pass's buffer: a word to bind when unused.
+            self.unused_placed = _words(np.zeros(1, np.uint32))
+            sp.SetSlangBuffer("hooks.placed", self.unused_placed)
         if source != self.source:
             sp.SetSlangModule(source)
             sp.SetSlangSpecialization("IShaderHooks", type_name)
