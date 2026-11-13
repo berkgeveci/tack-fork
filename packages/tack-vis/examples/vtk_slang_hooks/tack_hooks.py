@@ -20,6 +20,12 @@ module: Tack's own ``position``/Jacobian and ``value`` exported as Slang functio
 - ``output``: probes for checking (``probe`` 1-4: the value, u, v, the face, as 24-bit
   numbers in the pixel's colour).
 
+Instanced (``instanced=True``): the polydata is one face's template, drawn once per face
+(``vtkWebGPUPolyDataMapper.SetNumberOfInstances``, added on the VTK branch); the face is
+the instance (``instanceId``), the vertex hook places every point, and the mapper's
+bounds are given (``SetDrawnBounds``), from Tack's geometry at a coarse template. No
+polydata of the surface: a geometry step changes Tack's buffer and the bounds alone.
+
 VTK keeps everything else: camera, lights, depth, the actor's property, picking.
 """
 
@@ -79,16 +85,17 @@ public struct TackSurface : IShaderHooks
     int place;                         // 1: the vertex hook places the points
     int probe;                         // 0: the picture; 1 value, 2 u, 3 v, 4 face + 1
     int base;                          // the group's first face in the surface
+    int instanced;                     // 1: the face is the instance
 
-    int face(uint cell)
+    int face(uint cell, uint instance)
     {
-        return int(cell) / per_face;
+        return instanced != 0 ? int(instance) : int(cell) / per_face;
     }
 
     public override void vertex(inout VertexContext v)
     {
         if (place != 0) {
-            float3x3 g = tack_geometry(geometry, face(v.cellId), float3(v.uv, 0.f));
+            float3x3 g = tack_geometry(geometry, face(v.cellId, v.instanceId), float3(v.uv, 0.f));
             v.positionMC = float4(g[0], 1.f);
             v.normalMC = normalize(cross(g[1], g[2]));
         }
@@ -96,20 +103,20 @@ public struct TackSurface : IShaderHooks
 
     public override void color(inout FragmentContext f)
     {
-        float value = tack_value(field, face(f.cellId), float3(f.uv, 0.f));
+        float value = tack_value(field, face(f.cellId, f.instanceId), float3(f.uv, 0.f));
         f.diffuseColor = tack_viridis(saturate((value - lo) / (hi - lo)));
     }
 
     public override void output(inout FragmentContext f)
     {
         if (probe == 1)
-            f.color = tack_unit((tack_value(field, face(f.cellId), float3(f.uv, 0.f)) - lo) / (hi - lo));
+            f.color = tack_unit((tack_value(field, face(f.cellId, f.instanceId), float3(f.uv, 0.f)) - lo) / (hi - lo));
         else if (probe == 2)
             f.color = tack_unit(f.uv.x);
         else if (probe == 3)
             f.color = tack_unit(f.uv.y);
         else if (probe == 4)
-            f.color = tack_bytes(uint(base + face(f.cellId) + 1));
+            f.color = tack_bytes(uint(base + face(f.cellId, f.instanceId) + 1));
     }
 };
 """
@@ -178,8 +185,9 @@ def _corners_only(x, points, count, quad):
 class GroupActor:
     """One launch group as a VTK actor drawn through the hooks."""
 
-    def __init__(self, surface, name, group, level, place, lo, hi, base):
-        self.name, self.level, self.place = name, level, place
+    def __init__(self, surface, name, group, level, place, lo, hi, base, instanced=False):
+        self.name, self.level, self.instanced = name, level, instanced
+        self.place = place or instanced
         self.source = None
         self.geometry_words = self.field_words = None
         self.mapper = rr.vtkPolyDataMapper()
@@ -188,7 +196,8 @@ class GroupActor:
         self.uniforms = self.actor.GetShaderProperty().GetFragmentCustomUniforms()
         self.uniforms.SetUniformf("hooks.lo", lo)
         self.uniforms.SetUniformf("hooks.hi", hi)
-        self.uniforms.SetUniformi("hooks.place", int(place))
+        self.uniforms.SetUniformi("hooks.place", int(self.place))
+        self.uniforms.SetUniformi("hooks.instanced", int(instanced))
         self.uniforms.SetUniformi("hooks.probe", 0)
         self.set_surface(surface, group, base)
 
@@ -209,6 +218,12 @@ class GroupActor:
         points, tris = indexed_template(quad, self.level if curved else 1)
         self.points = points
         m, per_face = len(points), len(tris) // 3
+        if self.instanced:
+            self._set_instanced(surface, group, quad, curved, points, tris, timings, t)
+            self._set_module(source, type_name, gwords, fwords, per_face, base)
+            timings["polydata"] = time.perf_counter() - t - timings["evaluate"]
+            self.timings = timings
+            return
         x, normals = _evaluate(surface.domain_view("cells", group), group.count, points)
         if self.place:
             x = _corners_only(x, points, group.count, quad)
@@ -227,6 +242,40 @@ class GroupActor:
             poly.GetPointData().SetNormals(nv)
         self.poly, self.triangles = poly, len(conn) // 3
         self.mapper.SetInputData(poly)
+        self._set_module(source, type_name, gwords, fwords, per_face, base)
+        timings["polydata"] = time.perf_counter() - t
+        self.timings = timings
+
+    def _set_instanced(self, surface, group, quad, curved, points, tris, timings, t):
+        """One face's template as the polydata, drawn once per face; the bounds from
+        Tack's geometry at a coarse template (level 2), padded by 2% of the diagonal for
+        the curvature between its points."""
+        import time
+
+        coarse = indexed_template(quad, 2 if curved else 1)[0]
+        x, _ = _evaluate(surface.domain_view("cells", group), group.count, coarse)
+        lo, hi = x.min(axis=0), x.max(axis=0)
+        pad = 0.02 * float(np.linalg.norm(hi - lo))
+        timings["evaluate"] = time.perf_counter() - t
+        if getattr(self, "poly", None) is None or self.poly.GetNumberOfPoints() != len(points):
+            # The template, kept across steps: (u, v, 0) points, (u, v) coordinates.
+            poly = vtkPolyData()
+            xyz = np.zeros((len(points), 3), np.float32)
+            xyz[:, :2] = points
+            poly.points = vtkPoints(data=vtkFloatArray(xyz))
+            conn = tris.astype(np.int64)
+            poly.polys = vtkCellArray(offsets=np.arange(0, len(conn) + 1, 3), connectivity=conn)
+            uv = vtkFloatArray(points.astype(np.float32))
+            uv.SetName("uv")
+            poly.GetPointData().SetTCoords(uv)
+            self.poly = poly
+            self.mapper.SetInputData(poly)
+        self.triangles = group.count * (len(tris) // 3)
+        self.mapper.SetNumberOfInstances(group.count)
+        self.mapper.SetDrawnBounds(lo[0] - pad, hi[0] + pad, lo[1] - pad, hi[1] + pad,
+                                   lo[2] - pad, hi[2] + pad)
+
+    def _set_module(self, source, type_name, gwords, fwords, per_face, base):
         sp = self.actor.GetShaderProperty()
         if source != self.source:
             sp.SetSlangModule(source)
@@ -243,8 +292,6 @@ class GroupActor:
                 sp.SetSlangBuffer(path, getattr(self, attr))
         self.uniforms.SetUniformi("hooks.per_face", per_face)
         self.uniforms.SetUniformi("hooks.base", base)
-        timings["polydata"] = time.perf_counter() - t
-        self.timings = timings
 
     def set_probe(self, probe):
         self.uniforms.SetUniformi("hooks.probe", probe)
@@ -257,9 +304,12 @@ class GroupActor:
         self.field_words.Modified()
 
 
-def surface_actors(surface, name, level=8, place=False, margin=0.05):
+def surface_actors(surface, name, level=8, place=False, margin=0.05, instanced=None):
     """Every launch group of ``surface``'s field ``name`` as a ``GroupActor``, and the
-    colour range ``(lo, hi)``."""
+    colour range ``(lo, hi)``. ``instanced`` None: the environment's ``INSTANCED=1``
+    (so every script here runs either way)."""
+    if instanced is None:
+        instanced = os.environ.get("INSTANCED") == "1"
     values = surface.fields[name].values.numpy().reshape(-1)
     lo, hi = float(values.min()), float(values.max())
     span = hi - lo or 1.0
@@ -268,7 +318,7 @@ def surface_actors(surface, name, level=8, place=False, margin=0.05):
     for group in surface.launch_groups("cells", [surface.fields[name]]):
         if not group.count:
             continue
-        actors.append(GroupActor(surface, name, group, level, place, lo, hi, base))
+        actors.append(GroupActor(surface, name, group, level, place, lo, hi, base, instanced))
         base += group.count
     return actors, (lo, hi)
 

@@ -184,7 +184,8 @@ def main(kind, n, how, mode, steps):
         pixels, faces, worst, median = check(new, group_actors, lo, hi, window, renderer)
         print(f"  check after the last step: {pixels} pixels on {faces} faces, max "
               f"{worst:.2e}, median {median:.2e}", flush=True)
-    tris = sum(a.GetMapper().GetInput().GetNumberOfCells() for a in actors)
+    tris = sum(a.GetMapper().GetInput().GetNumberOfCells()
+               * (a.GetMapper().GetNumberOfInstances() if how == "hooks" else 1) for a in actors)
     med = {k: 1e3 * float(np.median([r[k] for r in rows[1:] or rows])) for k in rows[0]}
     print(f"{kind} {n} {how} {mode} ({tris} triangles, {steps} steps): "
           + " ".join(f"{k}={v:.0f}" for k, v in med.items())

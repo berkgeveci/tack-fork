@@ -9,7 +9,8 @@ in the ``output`` hook, 24-bit numbers in the colour); Tack then evaluates the f
 each covered pixel's (face, u, v) on the CPU, and the shader's value must agree to f32
 (and the 24-bit encoding of the range). So the pixels are Tack's own evaluation.
 
-    python demo.py [straight|curved|tets] [n] [place: 0 cached geometry, 1 the vertex hook]
+    python demo.py [straight|curved|tets] [n] [place: 0 cached geometry, 1 the vertex hook,
+                                               2 instanced templates]
 """
 
 import os
@@ -117,7 +118,8 @@ def main(kind="straight", n=16, place=0, frames=30):
     tack.set_default_device("cpu")
     surf = tets_surface(n) if kind == "tets" else surface(kind, n)
     start = time.perf_counter()
-    actors, (lo, hi) = surface_actors(surf, "f", place=bool(place))
+    actors, (lo, hi) = surface_actors(surf, "f", place=bool(place),
+                                      instanced=True if place == 2 else None)
     setup = time.perf_counter() - start
     window, renderer = window_for(actors)
     start = time.perf_counter()
