@@ -20,7 +20,11 @@ its GPU) with the server's compiled Slang; it moves the widget and the camera it
 posts the plane as the widget moves (its InteractionEvent: the latest only, one at a time). The camera's, the
 widget's and its representation's states go once: the browser's are its own after.
 
-    python lic_server.py [--port 8766] [--wasm DIR]
+    python lic_server.py [--port 8766] [--wasm DIR] [--refine N]
+
+``--refine N`` cuts every hexahedron into N x N x N (Tack's ``subdivide``: the fields
+evaluated at the new lattice points, exactly for these trilinear fields): a bigger mesh
+of the same field.
 """
 
 import argparse
@@ -41,6 +45,7 @@ from vtkmodules.vtkSerializationManager import vtkObjectManager
 
 import disk
 import tack
+import tack.dataset as td
 import vtk_lic
 
 WASM = "/usr/local/scratch/builds/webgpu-perf/vtk-wasm-build/bin"
@@ -140,9 +145,16 @@ log(`first update: ${first.states.length} states, ${(bytes / 2 ** 10).toFixed(0)
 
 
 class Scene:
-    def __init__(self):
+    def __init__(self, refine=1):
         tack.set_default_device("cpu")
         self.data, bounds = disk.read(disk.DISK)
+        if refine > 1:
+            t = time.perf_counter()
+            coarse = self.data.num_cells
+            self.data = td.subdivide(self.data, level=refine, fields=["V", "Temp"])
+            print(f"refined {coarse} hexahedra {refine}x{refine}x{refine}: "
+                  f"{self.data.num_cells} hexahedra, {self.data.num_points} points, in "
+                  f"{time.perf_counter() - t:.1f} s", flush=True)
         lo, hi = np.array(bounds[::2]), np.array(bounds[1::2])
         self.centre, span = 0.5 * (lo + hi), float(np.max(hi - lo))
         temp = self.data.fields["Temp"].values.numpy().reshape(-1)
@@ -302,8 +314,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--wasm", default=WASM)
+    parser.add_argument("--refine", type=int, default=1)
     args = parser.parse_args()
-    serve(Scene(), args.port, os.path.abspath(args.wasm))
+    serve(Scene(args.refine), args.port, os.path.abspath(args.wasm))
 
 
 if __name__ == "__main__":
