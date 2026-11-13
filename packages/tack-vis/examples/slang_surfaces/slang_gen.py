@@ -98,37 +98,50 @@ class SlangCodeGen(MSLCodeGen):
         # Every array and scalar of the function in one buffer of 32-bit words, read by
         # offset with a bit cast: one binding whatever the view holds (WebGPU's default
         # is 8 storage buffers a stage; a curved geometry's view alone holds 18 arrays).
-        lines, words, scalars = [], [], []
+        # The buffer opens with a header of fixed size: each array's offset, then the
+        # scalars; the arrays follow. The function reads the offsets at run time, so its
+        # source does not depend on the arrays' lengths: a mesh of other sizes (in situ,
+        # each step's) keeps the same source, and the renderer's compiled shader.
+        lines, scalars, array_params = [], [], []
         pool = f"{self._name}__pool"
-        at = 0
-        for param, arg in zip(func.params, effective_args, strict=True):
+        # The packing's layout: per parameter, None (a slot) or (is an array, Slang type).
+        self.layout = []
+        for param in func.params:
             self._param_types[param.name] = param.type_annotation
             if param.name in self._slots:
                 self._array_params.add(param.name)
+                self.layout.append(None)
                 continue
             t = SLANG_TYPES[param.type_annotation]
+            self.layout.append((bool(param._is_array), t))
             if param._is_array:
                 self._array_params.add(param.name)
-                host = np.asarray(arrays.to_host(arrays.materialize(arg))).reshape(-1)
-                data = host.astype(_NUMPY[t]).view(np.uint32)
-                self._globals[param.name] = (pool, at, t)
+                array_params.append((param, t))
             else:
-                data = np.array([arg], _NUMPY[t]).view(np.uint32)
-                scalars.append((param, at))
-            words.append(data)
-            at += len(data)
-        packed = np.concatenate(words) if words else np.zeros(1, np.uint32)
-        lines.append(f"[[vk::binding({self._binding}, {self._group})]] "
-                     f"StructuredBuffer<uint> {pool};")
-        buffers = [(self._binding, packed)]
-        self.next_binding = self._binding + 1
+                scalars.append(param)
+        offset_names = []
+        for k, (param, t) in enumerate(array_params):
+            offset_names.append((f"{self._name}__at{k}", k))
+            self._globals[param.name] = (pool, offset_names[-1][0], t)
+        scalars = [(param, len(array_params) + k) for k, param in enumerate(scalars)]
+        packed = pack(self.layout, effective_args)
+        if self._binding is None:
+            # The buffer is the function's first parameter: the caller's own (a field of
+            # a renderer's hook type, which the renderer binds).
+            buffers = [(None, packed)]
+            self.next_binding = None
+        else:
+            lines.append(f"[[vk::binding({self._binding}, {self._group})]] "
+                         f"StructuredBuffer<uint> {pool};")
+            buffers = [(self._binding, packed)]
+            self.next_binding = self._binding + 1
 
-        body_start = len(lines)
         self._lines = lines
         ret_type, _ = self._results
-        args = ", ".join(f"{t} {own}" if length == 1 else f"float3 {own}"
-                         for n, (t, length, own) in self._slots.items()
-                         if n != _result_slot(self._slots))
+        args = ", ".join(([f"StructuredBuffer<uint> {pool}"] if self._binding is None else [])
+                         + [f"{t} {own}" if length == 1 else f"float3 {own}"
+                            for n, (t, length, own) in self._slots.items()
+                            if n != _result_slot(self._slots)])
         self._emit(f"{ret_type} {self._name}({args})")
         self._emit("{")
         self._indent += 1
@@ -141,6 +154,8 @@ class SlangCodeGen(MSLCodeGen):
             else:
                 for c in range(length):
                     self._emit(f"{n}[{c}] = {own}[{c}];")
+        for name, slot in offset_names:
+            self._emit(f"int {name} = asint({pool}[{slot}]);")
         for param, offset in scalars:
             t = SLANG_TYPES[param.type_annotation]
             self._emit(f"{t} {param.name} = {_READ[t]}({pool}[{offset}]);")
@@ -248,6 +263,27 @@ def _result_slot(slots):
     return list(slots)[-1]
 
 
+def pack(layout, effective_args):
+    """The words of one function's buffer: a header (each array's offset, then the
+    scalars) and the arrays, in the generator's ``layout`` (per parameter: None for a
+    slot, else (is an array, Slang type))."""
+    data, scalars = [], []
+    for kind, arg in zip(layout, effective_args, strict=True):
+        if kind is None:
+            continue
+        is_array, t = kind
+        if is_array:
+            host = np.asarray(arrays.to_host(arrays.materialize(arg))).reshape(-1)
+            data.append(host.astype(_NUMPY[t]).view(np.uint32))
+        else:
+            scalars.append(np.array([arg], _NUMPY[t]).view(np.uint32))
+    header = len(data) + len(scalars)
+    if not header:
+        return np.zeros(1, np.uint32)
+    offsets = header + np.cumsum([0] + [len(d) for d in data[:-1]])
+    return np.concatenate([offsets.astype(np.uint32)[:len(data)], *scalars, *data])
+
+
 def _slang_spelling(source, prefix):
     """Metal's spellings the shared helpers use, in Slang's; tables named per function."""
     source = re.sub(r"as_type<(\w+)>", r"bit_cast<\1>", source)
@@ -258,13 +294,48 @@ def _slang_spelling(source, prefix):
     return source.replace("__tack_table_", f"__tack_table_{prefix}_")
 
 
+#: export's code by the call's structure: (Export, layout, next binding).
+_EXPORTS = {}
+
+
+def _structure(kernel, args, effective_args, *rest):
+    """What the generated code depends on: the templates' keys (classes, compile-time
+    constants, arrays' ranks and types, nesting) and each expanded array's type and
+    inner dimensions (compiled in); not the lengths, which the buffer's header holds."""
+    from tack.lang.kernel import _template_key
+    from tack.runtime.kernel_utils import _detect_template_args
+
+    templates = _detect_template_args(kernel, args)
+    return (id(kernel), *rest,
+            tuple((i, _template_key(obj)) for i, (_, obj) in sorted(templates.items())),
+            tuple(("a", str(a.dtype), tuple(a.shape[1:]), getattr(a, "_vector_n", None),
+                   getattr(a, "_matrix_shape", None)) if isinstance(a, Array)
+                  else ("s", type(a).__name__) for a in effective_args))
+
+
 def export(kernel, args, name, slots, results, binding, group=0):
     """``kernel`` called with ``args`` (Tack arrays, views), its one iteration as a Slang
     function ``name``: ``slots`` names the kernel's per-iteration parameters in order,
     each ``(Slang type, length)``, the last the result; ``results`` is ``(return type,
-    expression of the slots)``."""
-    from tack.lang.inspect_kernel import _prepare_ir
+    expression of the slots)``.
 
+    The code is generated once per structure (``_structure``); a later call of the same
+    structure (a new mesh, another step) only packs its arrays into the buffer."""
+    from dataclasses import replace
+
+    from tack.lang.inspect_kernel import _prepare_ir
+    from tack.runtime.kernel_utils import _detect_template_args, _expand_template_args
+
+    effective_args = _expand_template_args(args, _detect_template_args(kernel, args))
+    key = _structure(kernel, args, effective_args, name, repr(slots), repr(results), binding,
+                     group)
+    hit = _EXPORTS.get(key)
+    if hit is not None:
+        out, layout, next_binding = hit
+        words = pack(layout, effective_args)
+        out = replace(out, buffers=[(out.buffers[0][0], words)])
+        out.next_binding = next_binding
+        return out
     ir_func, effective_args = _prepare_ir(kernel, args)
     for node in walk_ir(ir_func.body):
         if isinstance(node, (ir.IRAtomicOp, ir.IRBarrier, ir.IRSharedAlloc)):
@@ -272,6 +343,9 @@ def export(kernel, args, name, slots, results, binding, group=0):
     gen = SlangCodeGen(ir_func, name, slots, results, binding, group)
     out = gen.generate(effective_args)
     out.next_binding = gen.next_binding
+    # Kept without its words, which the next call packs afresh.
+    _EXPORTS[key] = (replace(out, buffers=[(b, None) for b, _ in out.buffers]), gen.layout,
+                     gen.next_binding)
     return out
 
 
