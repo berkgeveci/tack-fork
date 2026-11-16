@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.expanduser("~/Work/amrex-reader"))
 
 from amrex_reader import read_plotfile
 
-PLOTFILE = "/Volumes/T7/data/plt255900"
+PLOTFILE = os.path.expanduser("~/Data/amrwind/plt255900")
 
 
 def transfer_functions(mapper, lo, hi):
