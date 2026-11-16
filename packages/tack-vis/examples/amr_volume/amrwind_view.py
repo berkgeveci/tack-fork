@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--plotfile", default=PLOTFILE)
     parser.add_argument("--field", default="mag_vorticity")
     parser.add_argument("--max-level", type=int, default=None)
-    parser.add_argument("--size", default="1600x1000")
+    parser.add_argument("--size", default="2400x1500", help="in pixels; points are half that on a Retina screen")
     args = parser.parse_args()
     tack.set_default_device("cpu")
 
