@@ -1,7 +1,8 @@
 # Cut filters' memory
 
-**Status: proposed.** Issue [#318](https://github.com/Kitware/tack/issues/318),
-2026-11-10.
+**Status: accepted.** Issue [#318](https://github.com/Kitware/tack/issues/318),
+2026-11-10. Accepted in [#416](https://github.com/Kitware/tack/pull/416),
+merged 2026-11-15.
 
 ## Summary
 

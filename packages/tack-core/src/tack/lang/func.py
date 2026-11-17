@@ -82,6 +82,18 @@ class Func:
             self._funcdef.args.args[0].arg == 'self'
         )
 
+    def source_names(self) -> frozenset:
+        """Every name and parameter its source spells, once: the template rewrite
+        reserves them on every lowering of a kernel that takes its class. The
+        source tree is never changed (callers copy it first)."""
+        names = self.__dict__.get('_source_names')
+        if names is None:
+            names = frozenset(n.id if isinstance(n, ast.Name) else n.arg
+                              for n in ast.walk(self._funcdef)
+                              if isinstance(n, (ast.Name, ast.arg)))
+            self._source_names = names
+        return names
+
     def host(self, implementation):
         """Give this function a host implementation, which calling it from Python runs,
         as a method bound to its instance; kernels still inline the device body. As a

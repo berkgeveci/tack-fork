@@ -50,7 +50,7 @@ flowchart TD
     hit -- no --> dvar{".variant entry on disk?"}
     dvar -- "yes: backend.load_variant" --> cache
     dvar -- no --> clone["clone_ir(template)"]
-    clone --> passes["resolve → infer → check types →<br/>localize scalars → atomics/workgroups →<br/>optimize (verify after each)"]
+    clone --> passes["resolve → infer → check types →<br/>localize scalars → atomics/workgroups →<br/>optimize (verified after each in<br/>debug mode or with TACK_VERIFY_ALL)"]
     passes --> build["backend build callback:<br/>[GPU: clone + pack_scalars] →<br/>annotate_types → codegen → native compile"]
     build --> cache["store KernelVariant"]
     cache --> launch
@@ -361,22 +361,25 @@ unloadable entry is ignored. Otherwise it runs the common passes on a
 private copy, and afterwards stores the new variant on disk
 (`_store_variant`) when the backend has a `cache_target()`. The
 order matters: each step relies on annotations an earlier one established,
-and each verification boundary rechecks the whole tree.
+and each verification boundary rechecks the whole tree. Outside debug mode
+only the lowered and final (`typed`) boundaries run; the ones between
+(`verify_stage`) run in debug mode or with `TACK_VERIFY_ALL` set, which the
+test suite sets (see [below](#verification-at-pass-boundaries)).
 
 | # | Step | Function | Establishes | Rejects |
 |---|------|----------|-------------|---------|
 | 1 | Copy | `clone_ir(template)` | a private, fully independent IR graph | — |
 | 2 | Resolve | `resolve_ir` (`lang/ir_resolve.py`) | every `IRDimSize` outside the parallel loop's end becomes a constant, following `@tack.func` array aliases; `shared_like`/`local_array_like` dtypes and texture extents are filled in | unknown array: `RuntimeError` |
-| | | `verify_ir(…, 'resolved')` | | |
+| | | `verify_stage(…, 'resolved')` | | |
 | 3 | Infer | `infer_param_types` (`lang/type_inference.py`), `store_texture_shapes` | `type_annotation`, `_is_array`, `_is_texture` and `_texture_shape` on every parameter | wrong argument count or unsupported argument type: `TypeError` |
-| | | `verify_ir(…, 'inferred')` | | |
+| | | `verify_stage(…, 'inferred')` | | |
 | 4 | Check types | `check_dispatch_types` | every array dtype is in `backend.supported_dtypes` | `TypeError` naming the kernel, parameter, dtype and backend |
 | 5 | Localize scalars | `_localize_outer_scalars` (`runtime/kernel_utils.py`) | a scalar parameter, or a local bound before the loop, that the loop body assigns to becomes a fresh local, seeded at the top of each iteration (regression **LC6**) | — |
-| | | `verify_ir(…, 'localized')` | | |
+| | | `verify_stage(…, 'localized')` | | |
 | 6 | Atomics | `check_atomic_support`, `check_atomic_alignment` (`lang/atomic_support.py`) | each atomic target is a global array parameter of a dtype the backend supports, and suitably aligned | `TypeError` (target or dtype), `ValueError` (alignment) |
 | 7 | Workgroups (GPU) | `check_workgroup_participation`, `check_workgroup_launch` (`lang/workgroup_participation.py`) | collectives sit in provably uniform control flow; records whether the variant needs full 256-lane groups | `ValueError` |
 | 8 | Optimize | `optimize_ir` (`lang/ir_optimize.py`) | conservative copy propagation only | — |
-| | | `verify_ir(…, 'optimized')` | | |
+| | | `verify_stage(…, 'optimized')` | | |
 | 9 | Record | `ir_func.disjoint_arrays = disjoint` | the CPU no-overlap promise, for codegen | — |
 | 10 | Build | the backend's `build(ir_func, effective_args)` | see below | backend compiler errors |
 
@@ -402,7 +405,7 @@ describes each pass in detail.
 | Backend | Build steps | Code generator | Native compilation |
 |---------|-------------|----------------|--------------------|
 | CPU | `annotate_types` → `verify_ir('typed')` | `generate_llvm_ir` (`codegen/llvm_gen.py`) | `llvm.parse_assembly` and `verify()`, O3 pipeline, MCJIT, `get_function_address` |
-| Metal | `clone_ir` → `pack_scalars` → `verify_ir('packed')` → `annotate_types` → `verify_ir('typed')` | `generate_msl_source` | `newLibraryWithSource_options_error_` (fast math off), then a compute pipeline |
+| Metal | `clone_ir` → `pack_scalars` → `verify_packed` → `annotate_types` → `verify_ir('typed')` | `generate_msl_source` | `newLibraryWithSource_options_error_` (fast math off), then a compute pipeline |
 | CUDA | same as Metal | `generate_cuda_source` | NVRTC → PTX → `cuModuleLoadData` |
 | HIP | same as Metal | `generate_hip_source` | hipRTC → code object |
 | Level Zero | same as Metal | `generate_opencl_source` | `oclocInvoke` → SPIR-V → `zeModuleCreate` |
@@ -487,6 +490,21 @@ example `function.body[0].body[2].value`.
 | `packed` | GPU `_build_variant`, `inspect` | no scalar parameter remains |
 | `typed` | every `_build_variant`, `inspect` | every scalar expression outside the host-evaluated loop end has a `ScalarType` `dtype`; comparisons, Boolean operations and `not` have `i32`; every assignment has a storage type or is a pointer copy |
 
+**Which stages run.** `lowered` checks each template once, and `typed`
+checks each variant's final IR before code generation. `typed` runs every
+check of the stages before it but `packed`'s, so a pass that breaks an
+invariant is still stopped before code generation. The stages between are
+called through `verify_stage`, which runs them only in debug mode
+(`tack.set_debug(True)`) or with `TACK_VERIFY_ALL` set (read at import, or
+`tack.lang.ir_verify.verify_all`). Those name the pass that broke the
+invariant rather than finding it at `typed`. The root `conftest.py` sets
+`TACK_VERIFY_ALL`, so the test suite checks every boundary. `packed`'s own
+check, that no scalar parameter is left, reads only the parameters and runs
+on every compile (`verify_packed`): `typed` does not repeat it, and a broken
+packing would otherwise reach the device compiler. On AhmedML's
+analysis sweep (244 kernels, 337 variants, cold, CPU) the five full checks a
+variant took 2.6 s of 15.5; with two, 1.1 s (#322).
+
 The verifier deliberately does **not** prove definite assignment: its
 binding check asks whether a name is bound anywhere in the function, not on
 every path. Nor does it prove bounds safety, race freedom, barrier
@@ -497,9 +515,8 @@ tests and hardware validation (see
 
 ### Why verification runs only on misses
 
-Verification walks the entire tree several times per variant, and for
-large kernels such as the path tracer it is a noticeable part of cold
-compilation. What it checks is a property of the IR, and a cached
+Verification walks the entire tree at each stage it runs, and for
+large kernels it is a noticeable part of cold compilation. What it checks is a property of the IR, and a cached
 variant's IR does not change, so re-verifying on a hit would re-prove a
 fact already established for the same tree. The warm path therefore
 performs no verification walks, and its cost does not grow with kernel
@@ -562,6 +579,10 @@ unregistered kind:
 - `transform_ir(root, rewrite, copy_nodes=False)` rewrites children in
   postorder, in place. With `copy_nodes=True` it shallow-copies each node
   first, which is how `rename_gpu_bindings` makes its codegen-only copy.
+- `substitute_ir(root, replace)` changes nothing in place: a node with no
+  replacement below it is returned as it is, one with a replacement below is
+  a shallow copy with new children. Copy propagation and the weak-literal
+  rewrite use it.
 
 ## Inspection
 

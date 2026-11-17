@@ -442,8 +442,9 @@ operand ranges. Equal signedness chooses the wider type. Mixed signedness
 chooses a signed type with sufficient width: i8 with u16 gives i32, and
 i16 with u32 gives i64. Mixing any signed type with u64 is rejected with
 an explicit-cast diagnostic. This applies to arithmetic, comparisons,
-conditional arms, and joining assignments to one local variable.
-An explicit cast can express intentional wrapping before promotion. True
+conditional arms, and joining assignments to one local variable (the
+assignments that are lowered: an arm that constants decide against is not;
+see "Branches that constants decide"). An explicit cast can express intentional wrapping before promotion. True
 division and integer power have the distinct result-type rules below.
 
 Integer-to-integer casts and integer array stores reduce the mathematical
@@ -605,7 +606,7 @@ function's literal results bound to the caller's names, such as a
 parametric center returned as a vector of literals. A conditional
 expression counts only when its condition reads nothing but constants. A
 local with more than one assignment has one type, the join of its
-assignments: when another assignment makes it f64, every literal assigned
+assignments (those lowered, not an arm that constants decide against): when another assignment makes it f64, every literal assigned
 to it converts exactly. A local every one of whose assignments is a weak
 expression -- a device function returning literals from several
 branches, say -- takes the kernel's float precision, as a float scalar
@@ -919,7 +920,9 @@ in its usual kernel `RuntimeError`; inspection and direct generation raise
 `NotImplementedError` directly.
 
 This is a structural requirement, including nested branches and inlined
-device functions, even if the primitive would be unreachable at runtime.
+device functions, even if the primitive would be unreachable at runtime;
+only an arm that constants decide against is not lowered, and so not
+required (see Specialization and compilation identity).
 CPU does not emulate workgroups. Use `local_array` or `local_array_like`
 for private scratch arrays; these remain supported on CPU, as do ordinary
 scalar kernels, host array reductions and supported atomic operations.
@@ -1014,7 +1017,8 @@ Private/shared arrays, textures, scalar arguments, and targets that cannot
 be traced uniquely to a global array parameter are rejected. Field-pointer
 copies introduced by device-function inlining are traced to that parameter.
 The checker runs before optimization, including structurally unreachable
-operations and empty grids. Public inspection in every mode enforces the
+operations (but not an arm that constants decide against, which is not
+lowered) and empty grids. Public inspection in every mode enforces the
 same target domain. Direct generators check mutable IR afresh and do not
 trust stale atomic dtype annotations. Unsupported operations/types/targets
 raise `TypeError` naming the kernel, target, operation and reason.
@@ -1114,6 +1118,30 @@ patterns, distinguishing signed zeros and making NaN cache keys stable.
 Different classes with identical names can have different methods, and
 adding a runtime attribute changes the parameter
 layout even when its value is not a compilation constant.
+
+**Branches that constants decide.** An `if` statement or a conditional
+expression whose condition is decided by integer and Boolean constants
+alone (literals, `tack.constant`s and a device class's constants, combined
+with comparisons, `not`, `&`, `|`, `^`, `and` and `or`; an `and` with a
+false operand or an `or` with a true one, whatever the others are) is
+resolved when the kernel is lowered: the arm it selects is lowered in its
+place, and the other is not lowered at all. The condition itself is still
+evaluated and typed as any condition is: an operand before the one that
+decides it is still evaluated (in debug mode, `data[i + 1] > 0 and False`
+still checks the load's bounds), and a literal outside 64 bits or a mix of
+`u64` and a signed type is still refused. The other arm's source is still
+validated (unsupported syntax is reported), but its device functions are
+not inlined, and the workgroup primitives and atomics in it are not required
+of the backend, as in C++'s `if constexpr`. A variable bound only in the
+arm not taken is unbound, and the error names the condition. The arm not
+taken has no part in the types either: a variable assigned in both arms has
+the type the arm taken gives it, not the join of the two that a branch
+decided as the kernel runs gives (`x = tack.i32(...)` in the arm taken and
+`x = tack.i64(...)` in the other make `x` an `i32`), so a kernel specialized
+on a class constant can type a variable differently per specialization. Floating-point conditions are decided as the
+kernel runs, since a literal's f32 value can compare differently from
+Python's. A large kernel specialized by its classes' constants (the
+streamlines kernel on AhmedML's mesh) had half its IR in such arms.
 
 Debug mode is part of the identity: a kernel lowered with bounds checks
 never shares IR or compiled code with the same kernel lowered without.

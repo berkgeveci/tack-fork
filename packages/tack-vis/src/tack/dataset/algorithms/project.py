@@ -444,7 +444,9 @@ def project(data, field, space, *, average="integral"):
     for group in groups:
         if group.count:
             kernel = _cell_nodes
-            if getattr(space, "tensor", False):
+            # An order per cell: each subgroup as the space of its order.
+            fixed = space.at_order(group.keys[space]) if space.varies else space
+            if getattr(fixed, "tensor", False):
                 kernel = (_tensor_cell_nodes if bases.tensor_shape(group.shape)
                           else _lattice_cell_nodes)
             kernel(data.domain_view("cells", group), field.view(group), target.view(group),

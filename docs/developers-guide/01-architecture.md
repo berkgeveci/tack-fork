@@ -34,7 +34,9 @@ When a `@tack.kernel` is called, every backend's `execute()` goes through
     → Debug mode: raise IndexError for an out-of-bounds access [debug_bounds.py]
 ```
 
-`verify_ir()` checks the IR after each of these stages. The IR template
+`verify_ir()` checks the IR after each of these stages in debug mode and in
+the test suite (`TACK_VERIFY_ALL`), and otherwise after lowering and at the
+end. The IR template
 cached on the `Kernel` is never mutated; each new variant clones it and the
 passes mutate the clone. Compiled variants are cached per backend and per
 kernel object, under a key built from argument dtypes and array/scalar/texture

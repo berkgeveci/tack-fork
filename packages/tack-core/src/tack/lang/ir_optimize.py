@@ -23,7 +23,14 @@ rounded value.
 """
 
 from tack.lang import ir
-from tack.lang.ir_traversal import clone_ir, transform_ir, walk_ir
+from tack.lang.ir_traversal import (
+    child_fields,
+    clone_ir,
+    shallow_copy,
+    substitute_ir,
+    transform_ir,
+    walk_ir,
+)
 
 _ARITHMETIC = {'+', '-', '*', '/', '//', '%', '**'}
 _CONSTANT_ONLY = (ir.IRConstant, ir.IRBinOp, ir.IRUnaryOp, ir.IRCompare, ir.IRBoolOp,
@@ -116,7 +123,7 @@ def _replace_locals(body: list, values: dict) -> list:
     def substitute(node):
         if isinstance(node, ir.IRName) and node.name in values:
             return clone_ir(values[node.name])
-        return node
+        return None
 
     def keep(stmts):
         kept = []
@@ -129,7 +136,7 @@ def _replace_locals(body: list, values: dict) -> list:
             kept.append(stmt)
         return kept
 
-    return keep(transform_ir(body, substitute, copy_nodes=True))
+    return keep(substitute_ir(body, substitute))
 
 
 def _count_assignments(body: list) -> dict[str, int]:
@@ -152,18 +159,23 @@ def _count_assignments(body: list) -> dict[str, int]:
 
 def _copy_prop_function(ir_func: ir.IRFunction):
     """Apply copy propagation to the function body."""
-    ir_func.body = _copy_prop_body(ir_func.body)
+    ir_func.body = _copy_prop_body(ir_func.body, _count_assignments(ir_func.body), {})
 
 
-def _copy_prop_body(body: list, assign_counts: dict[str, int] | None = None) -> list:
+def _copy_prop_body(body: list, assign_counts: dict[str, int] | None = None,
+                    inherited: dict | None = None) -> list:
     """Propagate copies: when x = y (simple name assignment), replace
-    subsequent uses of x with y (unless x or y is reassigned later)."""
+    subsequent uses of x with y (unless x or y is reassigned later).
+
+    One walk: each statement's own expressions take the copies known where
+    it stands (``inherited`` from the enclosing blocks, then this block's
+    before it), and its bodies inherit them. Rewriting each statement's
+    whole subtree at every enclosing block made a node nested in d blocks
+    d walks, and a copy of every node of a compound statement it changed."""
     # Counts are kernel-wide, not rebuilt for every subtree. Targets and
     # loop/allocation bindings are not renamed by this pass, so the same
     # summary remains valid after substituting name uses. This deliberately
     # leaves some block-local copies to LLVM/the vendor compiler.
-    if assign_counts is None:
-        assign_counts = _count_assignments(body)
 
     # A simple copy is x = y where x is assigned exactly once and y is
     # never assigned in the kernel (normally a parameter). That avoids
@@ -178,47 +190,49 @@ def _copy_prop_body(body: list, assign_counts: dict[str, int] | None = None) -> 
     # b = a reads b = p and is itself a copy of p. Nested device functions
     # pass an array down as exactly such a chain, and a link left behind is
     # a local holding an array, which no backend can compile.
-    resolved = {}
+    if assign_counts is None:
+        assign_counts = _count_assignments(body)
+    resolved = dict(inherited or {})
     result = []
     for stmt in body:
         stmt = _replace_names(stmt, resolved)
+        for name, role in child_fields(stmt):
+            if role == 'stmts' and getattr(stmt, name):
+                setattr(stmt, name, _copy_prop_body(getattr(stmt, name), assign_counts,
+                                                    resolved))
         result.append(stmt)
         if (isinstance(stmt, ir.IRAssign) and
                 isinstance(stmt.value, ir.IRName) and
                 assign_counts.get(stmt.target, 0) == 1 and
                 assign_counts.get(stmt.value.name, 0) == 0):
             resolved[stmt.target] = stmt.value.name
-
-    return _copy_prop_recurse(result, assign_counts)
-
-
-def _copy_prop_recurse(body: list, assign_counts: dict[str, int]) -> list:
-    """Recurse copy propagation into loops and conditionals."""
-    for stmt in body:
-        if isinstance(stmt, (ir.IRParallelFor, ir.IRSequentialFor, ir.IRWhile)):
-            stmt.body = _copy_prop_body(stmt.body, assign_counts)
-        elif isinstance(stmt, ir.IRIf):
-            stmt.then_body = _copy_prop_body(stmt.then_body, assign_counts)
-            if stmt.else_body:
-                stmt.else_body = _copy_prop_body(stmt.else_body, assign_counts)
-    return body
+    return result
 
 
-def _replace_names(node, mapping: dict):
-    """Replace name uses while preserving node annotations and metadata."""
-    if not mapping or not any(isinstance(n, ir.IRName) and n.name in mapping
-                              for n in walk_ir(node)):
-        # Nothing to replace: copying the statement anyway made a node nested
-        # in d blocks d copies, one at each block's propagation.
-        return node
+def _replace_names(stmt, mapping: dict):
+    """``stmt`` with name uses in its own expressions replaced (not in its
+    bodies, which the caller propagates into), preserving annotations; a
+    copy if any is replaced. A shared expression can occur before and after a
+    copy assignment: rewriting the later occurrence must not change the earlier
+    one, so nothing is changed in place."""
+    if not mapping:
+        return stmt
 
     def replace_name(node):
         if isinstance(node, ir.IRName) and node.name in mapping:
             replacement = ir.IRName(mapping[node.name])
             replacement.dtype = node.dtype
             return replacement
-        return node
+        return None
 
-    # A shared expression can occur before and after a copy assignment.
-    # Rewriting the later occurrence must not change the earlier one.
-    return transform_ir(node, replace_name, copy_nodes=True)
+    copied = None
+    for name, role in child_fields(stmt):
+        if role == 'stmts':
+            continue
+        child = getattr(stmt, name)
+        new = substitute_ir(child, replace_name)
+        if new is not child:
+            if copied is None:
+                copied = shallow_copy(stmt)
+            setattr(copied, name, new)
+    return stmt if copied is None else copied

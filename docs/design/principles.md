@@ -276,7 +276,8 @@ See [Conformance and Validation](../contracts/conformance.md).
 
 - **Specialization versus cold-start cost.** Baking facts in makes warm
   code faster but multiplies compiles. Verification at every pass boundary
-  (principle 2 applied to the compiler) adds to each one. Tack accepts a
+  (principle 2 applied to the compiler) adds to each one, so outside debug
+  mode and the test suite only the lowered and final IR are checked. Tack accepts a
   slower first call in exchange for a fast and correct warm path, and the
   disk cache pays it once per machine rather than once per process: its
   keys name what was baked in, as the variant key does, plus every name

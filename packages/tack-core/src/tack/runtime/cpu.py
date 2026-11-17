@@ -873,6 +873,8 @@ def _compile_kernel(ir_func: ir.IRFunction) -> CompiledKernel:
     """JIT-compile a Tack IR function to native code via llvmlite."""
     # Generate LLVM IR
     llvm_module = generate_llvm_ir(ir_func)
+    entry = kernel_entry_name(ir_func.name)
+    cpu_pool.add_chunk_wrapper(llvm_module, entry)
     llvm_ir_str = str(llvm_module)
 
     # Parse and verify
@@ -884,10 +886,12 @@ def _compile_kernel(ir_func: ir.IRFunction) -> CompiledKernel:
 
     # Its code joins a shared engine (cpu_pool.shared_jit) under a name no other
     # module there has: kernels of one name would otherwise share an address.
-    name = cpu_pool.unique_name(kernel_entry_name(ir_func.name))
-    mod.get_function(kernel_entry_name(ir_func.name)).name = name
-    engine, address, code = cpu_pool.shared_jit.add_module(mod, name)
+    name = cpu_pool.unique_name(entry)
+    mod.get_function(entry).name = name
+    mod.get_function(entry + cpu_pool.CHUNK_SUFFIX).name = name + cpu_pool.CHUNK_SUFFIX
+    engine, address, code, chunk = cpu_pool.shared_jit.add_module(mod, name)
     compiled = _load_kernel(engine, address, ir_func)
+    compiled._chunk = chunk or None
     # The object code with its entry's name, for the disk cache.
     compiled.object_code = None if code is None else _STORED + name.encode() + b"\0" + code
     return compiled
@@ -1197,8 +1201,9 @@ class CPUBackend(Backend):
         if not object_code.startswith(_STORED):
             raise ValueError("not a stored CPU kernel")
         name, _, code = object_code[len(_STORED):].partition(b"\0")
-        engine, address = cpu_pool.shared_jit.add_object(code, name.decode())
+        engine, address, chunk = cpu_pool.shared_jit.add_object(code, name.decode())
         compiled = _load_kernel(engine, address, ir_func)
+        compiled._chunk = chunk or None     # 0: stored before kernels held their wrapper
         compiled.object_code = object_code
         return compiled
 

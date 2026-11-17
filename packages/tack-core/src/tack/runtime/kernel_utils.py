@@ -680,19 +680,19 @@ def _resolve_variant(backend, kernel, args, kwargs, build, store_texture_shapes,
     if variant is None:
         from tack.lang.ir_optimize import optimize_ir
         from tack.lang.ir_resolve import resolve_ir
-        from tack.lang.ir_verify import verify_ir
+        from tack.lang.ir_verify import verify_stage
 
         ir_func = clone_ir(template)
         resolve_ir(ir_func, name_to_array)
-        verify_ir(ir_func, 'resolved')
+        verify_stage(ir_func, 'resolved')
         infer_param_types(ir_func, effective_args)
         store_texture_shapes(ir_func, effective_args)
-        verify_ir(ir_func, 'inferred')
+        verify_stage(ir_func, 'inferred')
         check_dispatch_types(ir_func, effective_args,
                              supported_dtypes=backend.supported_dtypes,
                              backend_name=backend.label)
         _localize_outer_scalars(ir_func)
-        verify_ir(ir_func, 'localized')
+        verify_stage(ir_func, 'localized')
         atomic_targets = check_atomic_support(
             ir_func, backend_name=backend.name,
             supported_dtypes=backend.supported_atomic_dtypes,
@@ -704,7 +704,7 @@ def _resolve_variant(backend, kernel, args, kwargs, build, store_texture_shapes,
             check_workgroup_launch(ir_func.name, _get_loop_range(ir_func, effective_args),
                                    backend_label=backend.label)
         optimize_ir(ir_func)
-        verify_ir(ir_func, 'optimized')
+        verify_stage(ir_func, 'optimized')
         ir_func.disjoint_arrays = disjoint
         variant = KernelVariant(ir_func, build(ir_func, effective_args),
                                 requires_full_workgroups=full_groups,

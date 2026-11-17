@@ -28,6 +28,7 @@ belong on the host or in a kernel, use the [quick reference](../core/how-program
 | Reshape without copying | `a.reshape(rows, -1)` | Shares storage; one dimension may be `-1` |
 | Wait for device work | `tack.sync()` | Waits for queued launches on every device; returns `None` |
 | Inspect a kernel | `tack.inspect(kernel, *args, mode="source")` | Generated source as a string; does not execute the kernel |
+| Inspect a device-class object | `tack.inspect_template(obj, name=None)` | What it brings to a kernel, and where each method is defined, as a string; runs nothing |
 
 Without a `dtype`, an allocation is f32 (the default float type,
 `tack.set_default_float`); values from Python make it from
@@ -252,6 +253,11 @@ shape up to 4×4. See [Vectors and Matrices](../core/vectors-and-matrices.md).
 ## Inspection
 
 ::: tack.inspect
+    options:
+      docstring_options:
+        warn_missing_types: false
+
+::: tack.inspect_template
     options:
       docstring_options:
         warn_missing_types: false

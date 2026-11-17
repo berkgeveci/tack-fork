@@ -705,6 +705,8 @@ def _order(space):
         return int(space.integration_order)
     if isinstance(space, (Constant, Values)):
         return 0 if isinstance(space, Constant) or space.on == "cells" else 1
+    if getattr(space, "varies", False):
+        return space.max_order                  # an order per cell: the highest
     return max(int(getattr(space, "order", 1)), 0)
 
 

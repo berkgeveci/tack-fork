@@ -481,7 +481,9 @@ jobs:
   # area of the code), on four workers, without VTK and MFEM, so the paths a
   # test takes without them are checked too. What differs between versions is
   # mostly the language and the standard library, which every area reaches;
-  # the full suite runs on them on every push to main.
+  # the full suite runs on them on every push to main. 3.12's compiles verify
+  # the IR as users' do, the lowered and final stages only (TACK_VERIFY_ALL=0),
+  # where the rest of CI verifies every stage (the root conftest's default).
   tests-quick:
     name: quick tests (py${{ matrix.python-version }})
     needs: changes
@@ -490,6 +492,7 @@ jobs:
     timeout-minutes: 20
     env:
       TACK_REQUIRE_CLANG: "1"
+      TACK_VERIFY_ALL: ${{ matrix.python-version == '3.12' && '0' || '1' }}
     strategy:
       fail-fast: false
       matrix:

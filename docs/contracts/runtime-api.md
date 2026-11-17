@@ -578,6 +578,56 @@ doesn't wrap errors. For example, a workgroup primitive on CPU raises
 `NotImplementedError` directly, and an unsupported array dtype raises the
 dtype check's `TypeError`.
 
+### `tack.inspect_template(obj, name=None)`
+
+Defined in `packages/tack-core/src/tack/lang/inspect_template.py`
+([#324](https://github.com/Kitware/tack/issues/324)). Describes an object of a `@tack.device_class` class that exists already (a
+user's object, an implicit array of `tack.arrays`, a dataset view) and
+returns a string.
+
+- **Without `name`:** the class, its bases and method resolution order (and a
+  dataset view's parts); the class constants compiled in, each with the class
+  that defines it, an instance number over one marked as still compiled in;
+  the instance numbers and tuples passed at run time; each array's shape,
+  element type, layout and the device recorded on it; the device functions
+  and objects it holds, each object described the same way under its path;
+  attributes that reach no kernel; and every `@tack.func` method with its
+  defining class and the file and line of its `def`.
+- **With `name`**, a method of the object's class or a device function it
+  holds: its defining class, source location and signature, then the calls in
+  its source that reach another method or device function, in source order,
+  each with what it resolves to: `self.m(...)` and `self.a.m(...)`, a held
+  device function, `self[i]`, `self[i] = v`, `self[i] += v` (both protocol
+  methods) and `len(self)`, and a free `@tack.func` given `self`. As in
+  lowering, a device function the object holds shadows a method of the same
+  name, and `len(self)` is `__len__` whatever `len` is bound to. The calls
+  are read from the source text, not from what a kernel inlines: a call in a
+  branch that constants decide against is listed, and a call through a local
+  name is "unresolved".
+
+**Guarantees:** it classifies attributes by the compiler's rules
+(`template_rewrite`), reading instance attributes from the instance's
+dictionary, so no property runs (an attribute a class property hides is "not
+read"), and class values from the classes' dictionaries, so no metaclass code
+runs (a value only such code gives is "not read"; a metaclass's own
+`__getattribute__`, through which lowering reads, is named). It keeps none of the per-class state lowering keeps, enters no
+template scope and reports to no disk-cache recorder. It reads no device
+memory, launches nothing, compiles nothing, looks nothing up in the disk
+cache and makes no backend. A tree lowering would refuse (an object that
+holds itself, two attributes flattening to one name) is described, with
+lowering's message, rather than raised. Output is bounded: a tuple shows
+eight entries and a count, and held objects deeper than eight levels are
+counted, not described. The text's layout and the internal class names in
+it are not a stable interface.
+
+**Errors:** `TypeError` for a class rather than an object ("inspect_template
+takes an object, not the class `C`: what is compiled depends on its
+attributes"), for an object of a class that
+is not a device class, and for a `name` that is not a device function
+(naming what it is: a compiled-in constant, an array, a value passed at run
+time, a held object, a Python method). `AttributeError` for a `name` the
+object does not have.
+
 ## Decorators
 
 ### `@tack.kernel`

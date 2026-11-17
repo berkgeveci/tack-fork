@@ -10,7 +10,7 @@ other names use UTF-8 hex in a separate namespace. Both encodings are injective,
 including user names that already resemble an encoded name.
 """
 
-from tack.lang.ir_names import NAME_ARRAYS, NAME_LIST_ARRAYS, ir_names
+from tack.lang.ir_names import NAME_ARRAYS, NAME_LIST_ARRAYS
 from tack.lang.ir_traversal import transform_ir
 
 
@@ -43,16 +43,24 @@ def rename_gpu_bindings(ir_func):
     call kernel_entry_name on that spelling. Parameter order and binding indices
     are unchanged. Intrinsics, attributes, types and metadata are not bindings.
     """
-    names = {name: gpu_variable_name(name) for name in ir_names(ir_func)}
+    # The encoding is injective, so each name is encoded where it is first met
+    # rather than after a walk collecting them all.
+    names = {}
+
+    def encoded(name):
+        found = names.get(name)
+        if found is None:
+            found = names[name] = gpu_variable_name(name)
+        return found
 
     def rename(node):
         for attr in NAME_ARRAYS.get(type(node), ()):
             name = getattr(node, attr)
             if name is not None:
-                setattr(node, attr, names[name])
+                setattr(node, attr, encoded(name))
         for attr in NAME_LIST_ARRAYS.get(type(node), ()):
             if getattr(node, attr):
-                setattr(node, attr, [names[name] for name in getattr(node, attr)])
+                setattr(node, attr, [encoded(name) for name in getattr(node, attr)])
         return node
 
     return transform_ir(ir_func, rename, copy_nodes=True)

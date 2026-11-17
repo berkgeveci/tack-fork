@@ -863,7 +863,9 @@ def _family(shape):
 
 def _order(field):
     space = field.space
-    if isinstance(space, (H1, L2)) and not space.varies:
+    if isinstance(space, L2) and space.varies:
+        return space.max_order                  # an order per cell: the highest
+    if isinstance(space, (H1, L2)):
         return space.order
     return space.default_subdivision
 
@@ -1029,7 +1031,7 @@ def _refined_family(data, flags, level, fields, elsewhere, cut, dimension, cell_
     linear = UnstructuredTopology(types, offsets, conn, num_points=points, id_dtype=idt)
     point_fields = {}
     for name, field in fields.items():
-        if not (isinstance(field.space, (H1, L2)) or field.space.evaluated) or field.space.varies:
+        if not (isinstance(field.space, (H1, L2)) or field.space.evaluated):
             continue
         out = tack.empty((points,), _element(field.values))
         if count:
@@ -1376,8 +1378,9 @@ def subdivides(data, field):
     voxels)."""
     space = field.space
     nonlinear = (_order(data.geometry) > 1
-                 or (isinstance(space, (H1, L2)) and not space.varies
-                     and (space.order > 1 or getattr(space, "tensor", False)))
+                 or (isinstance(space, (H1, L2)) and (_order(field) > 1 or getattr(
+                     space, "tensor", False) or (space.varies and space.basis == "gauss_legendre"
+                                                 and space.max_order >= 1)))
                  or space.default_subdivision > 1)
     groups = [g for g in data.topology.groups() if g.count]
     dims = {g.shape.DIMENSION for g in groups}

@@ -194,7 +194,7 @@ array accesses.
 | Space | Values | Interpolated | Topologies |
 |---|---|---|---|
 | `H1(data, order=1)` | one per point, shared by the cells around it; order 2 adds one per edge and quad face; order `p` (`basis=`) `p - 1` per edge, `(p - 1)^2` per quad face, `(p - 1)^d` per cell | yes, continuous | order 1 on all; order 2 on tetrahedra, hexahedra, voxels, wedges, triangles, quads and pixels; any order on segments, quads, pixels, hexahedra and voxels, and on triangles, tetrahedra and wedges with `nodes="equispaced"` (`(p - 1)(p - 2)/2` per triangle face, `(p - 1)(p - 2)(p - 3)/6` per tetrahedron, `(p - 1)^2 (p - 2)/2` per wedge) |
-| `L2(data, order=1)` | each cell's own copies: order 1 one per corner, order 0 one per cell; `order` may be an array, one order per cell; a tensor basis' values in blocks or cell-fastest (`layout=`, by device by default) | yes, discontinuous | shape-based |
+| `L2(data, order=1)` | each cell's own copies: order 1 one per corner, order 0 one per cell; `order` may be an array, one order per cell (0 to 15, in one `basis`, values in blocks); a tensor basis' values in blocks or cell-fastest (`layout=`, by device by default) | yes, discontinuous | shape-based |
 | `Constant(data)` | one per cell | yes, constant in the cell | all |
 | `Values(data, on, oriented=False)` | one per point, edge, face or cell: data about the entity, with no basis | no | all |
 | `SideTraces(data)` | per face, per side, per face point; made by `project` into it | through the face's shape | shape-based, 3D |
@@ -242,7 +242,8 @@ and `Constant`, as source and as target.
 |---|---|---|
 | `H1` (order 1 or 2) | the mean, over the cells around the node, of the source evaluated there | the source is continuous: a lower order comes across exactly |
 | `Constant`, order-0 `L2` | the source's average over the cell: its integral over the measure (`average="nodes"`: the mean of its nodes, as vtkPointDataToCellData) | the source is constant in the cell |
-| order-1 `L2` (or an order per cell) | the source's value at each corner (the cell's average at order 0) | the source's order is at most 1 |
+| order-1 `L2` | the source's value at each corner | the source's order is at most 1 |
+| `L2` of an order per cell | the source's value at each cell's nodes of its order (its average at order 0) | the source's order in the cell is at most the cell's |
 | `SideTraces` | each side's value from its cell | always |
 
 Where cells disagree -- cell data, DG data -- the `H1` mean is VTK's

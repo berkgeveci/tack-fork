@@ -329,7 +329,11 @@ def _default_basis(cls, topology, args, kwargs):
         return kwargs
     order = args[0] if args else kwargs.get("order", 1)
     if _is_array(order):
-        return kwargs
+        # An order per cell: the mesh's family whatever the orders, as at a fixed
+        # order above 2 (closed families agree at orders 0 to 2).
+        simplicial = any(g.count and (bases.simplex_shape(g.shape) or bases.wedge_shape(g.shape))
+                         for g in topology.groups())
+        return {**kwargs, "basis": "equispaced" if simplicial else "gauss_lobatto"}
     simplicial = any(g.count and (bases.simplex_shape(g.shape) or bases.wedge_shape(g.shape))
                      for g in topology.groups()) if int(order) > 2 else False
     return {**kwargs, "basis": "equispaced" if simplicial else "gauss_lobatto"}
@@ -743,10 +747,25 @@ class H1(Space):
 
 
 @tack.kernel
-def _l2_counts(cells, orders, counts):
+def _l2_counts(cells, orders, gauss_legendre, counts):
+    # An order per cell: 1 value at order 0, the corners at order 1 (a closed basis),
+    # else the cell's nodes at its order, as _tensor_counts counts them.
     for c in cells:
         e = cells.entity_id(c)
-        counts[e] = 1 if orders[e] == 0 else cells.NUM_POINTS
+        order = orders[e]
+        n = 1
+        if order == 1 and gauss_legendre == 0:
+            n = cells.NUM_POINTS
+        elif order >= 1:
+            if cells.NUM_POINTS == 6:
+                n = (order + 1) * (order + 2) // 2 * (order + 1)       # a wedge
+            elif cells.NUM_POINTS == cells.DIMENSION + 1 and cells.DIMENSION >= 2:
+                for k in range(cells.DIMENSION):
+                    n = n * (order + 1 + k) // (k + 1)
+            else:
+                for _ in range(cells.DIMENSION):
+                    n *= order + 1
+        counts[e] = n
 
 
 @tack.kernel
@@ -775,7 +794,9 @@ class L2(Space):
     """Discontinuous: each cell's own values, at ``offsets[cell]``. Order 1 holds a
     value at each of the cell's corners -- a linear DG field -- and order 0 one
     value per cell. ``order`` is one order for every cell, or an array of one per
-    cell (p-adaptive, orders 0 and 1), read when the space is made. Order 2 and
+    cell (p-adaptive, orders 0 to 15), read when the space is made: each cell is
+    then read as the space of its order is (``at_order``), in the one ``basis``,
+    its values in blocks at ``offsets[c]``. Order 2 and
     up, or ``basis="gauss_legendre"`` at any order from 1, are on segments, quads,
     pixels, hexahedra and voxels (``tack.dataset.bases``): ``(order + 1)^d`` values
     a cell in node order, the first axis fastest, in the ``basis``
@@ -810,13 +831,13 @@ class L2(Space):
         if layout not in cls.LAYOUTS:
             raise ValueError(f"L2's layout is one of {', '.join(cls.LAYOUTS)}, not {layout!r}")
         if _is_array(order):
-            if basis != "gauss_lobatto":
-                raise NotImplementedError("an order per cell is on corner values, the "
-                                          "default basis")
+            if basis not in bases.FAMILIES or basis == bases.SERENDIPITY:
+                raise ValueError(f"L2's basis is one of gauss_lobatto, equispaced, "
+                                 f"gauss_legendre or bernstein, not {basis!r}")
             if layout == "cells":
                 raise ValueError("an order per cell has no common stride: its layout is "
                                  "blocks")
-            return {"order": order}
+            return {"order": order, "basis": basis}
         order = int(order)
         if order < 0:
             raise ValueError(f"L2's order is at least 0, not {order}")
@@ -919,7 +940,31 @@ class L2(Space):
                                   self.order, self.basis == bases.BERNSTEIN)
         return views._L2Field
 
+    def at_order(self, order):
+        """The space of one order this one reads its cells of ``order`` as (one with
+        an order per cell): the same basis, in blocks. Its views and tables read
+        those cells; their values are at this space's ``offsets``."""
+        return L2(self.topology, order=int(order), basis=self.basis or "gauss_lobatto",
+                  layout="blocks")
+
+    def orders(self):
+        """The orders its cells have, sorted: the one order, or each present."""
+        if not self.varies:
+            return [self.order]
+        if "_present" not in self.__dict__:
+            self._present = sorted(set(np.asarray(arrays.to_host(self.cell_keys()))
+                                       .reshape(-1).tolist()))
+        return self._present
+
+    @property
+    def max_order(self):
+        """The highest order of its cells (0 for a mesh without cells)."""
+        present = self.orders()
+        return max(present) if present else 0
+
     def mixin_for(self, key, shape=None):
+        if self.varies:
+            return self.at_order(key).mixin_for(None, shape)
         _refuse_bernstein(self, shape)
         bernstein = self.basis == bases.BERNSTEIN
         if self.tensor and bases.simplex_shape(shape):
@@ -943,10 +988,16 @@ class L2(Space):
             if host.shape[0] != self.topology.num_cells:
                 raise ValueError(f"an order per cell: {self.topology.num_cells} orders, "
                                  f"not {host.shape[0]}")
-            if not np.isin(host, (0, 1)).all():
-                bad = sorted(set(host.tolist()) - {0, 1})
-                raise NotImplementedError(f"orders {bad} are not supported yet: L2 "
-                                          "has orders 0 and 1")
+            if host.size and not np.issubdtype(host.dtype, np.integer):
+                # A fraction (or NaN) would pass the range check and be cast away.
+                whole = np.asarray(host, np.float64)
+                bad = whole[whole != np.trunc(whole)]
+                if bad.size:
+                    raise ValueError(f"an order per cell is a whole number from 0 to 15, "
+                                     f"not {sorted(set(bad.tolist()))[:5]}")
+            if host.size and (host.min() < 0 or host.max() > 15):
+                bad = sorted(set(host.tolist()) - set(range(16)))
+                raise ValueError(f"an order per cell is 0 to 15, not {bad}")
             orders = tack.empty(host.shape, tack.i32)
             if host.size:
                 tack.copyto(orders, host.astype(np.int32))
@@ -962,11 +1013,14 @@ class L2(Space):
             n = topology.num_cells
             if self.varies:
                 orders = self.cell_keys()
+                self._check_orders()
                 counts = tack.empty((n,), tack.i32)
+                legendre = int(self.basis == "gauss_legendre")
                 for group in topology.groups():
                     if group.count:
-                        _l2_counts(group.view(), orders, counts)
-                offsets = tack.empty((n + 1,), ids.at_least(topology.id_dtype, 8 * n))
+                        _l2_counts(group.view(), orders, legendre, counts)
+                most = self.max_order + 1
+                offsets = tack.empty((n + 1,), ids.at_least(topology.id_dtype, most ** 3 * n))
                 size = exclusive_scan(counts, offsets, n) if n else 0
                 _set_last(offsets, n, size)
                 self._offsets, self._size = offsets, int(size)
@@ -1004,6 +1058,28 @@ class L2(Space):
                 self._size = n * k
         return self._offsets, self._size
 
+    def _check_orders(self):
+        """An order per cell: each shape's orders as the space of that order takes
+        them, refused as it refuses them."""
+        from tack.dataset.dataset import _subgroups
+
+        for group in self.topology.groups():
+            if not group.count:
+                continue
+            for sub in _subgroups(group, (self,)):
+                fixed = self.at_order(sub.keys[self])
+                if not fixed.tensor:
+                    continue
+                shape = group.shape
+                if not (bases.tensor_shape(shape) or (
+                        (bases.simplex_shape(shape) or bases.wedge_shape(shape))
+                        and fixed.order >= 2)):
+                    raise NotImplementedError(
+                        f"{fixed!r} on {shape.__name__} cells (an order per cell) is not "
+                        "supported yet; it is on segments, quads, pixels, hexahedra and "
+                        "voxels, and from order 2 on triangles, tetrahedra and wedges")
+                _refuse_simplex_nodes(fixed, shape)
+
     @property
     def offsets(self):
         """Where each cell's values start: value ``j`` of cell ``c`` is value
@@ -1016,19 +1092,23 @@ class L2(Space):
 
     def attributes(self, group=None, dtype=None):
         attributes = {"offsets": self.offsets}
-        if self.tensor and group is not None and bases.simplex_shape(group.shape):
-            attributes.update(_simplex_tables(self, group, dtype or tack.f32))
-        elif self.tensor and group is not None and bases.wedge_shape(group.shape):
-            attributes.update(_wedge_tables(self, group, dtype or tack.f32))
-        elif self.tensor and group is not None:
-            attributes.update(_basis_tables(self, group, dtype or tack.f32))
+        space = self
+        if self.varies and group is not None and self in group.keys:
+            space = self.at_order(group.keys[self])   # its tables, these offsets
+        if space.tensor and group is not None and bases.simplex_shape(group.shape):
+            attributes.update(_simplex_tables(space, group, dtype or tack.f32))
+        elif space.tensor and group is not None and bases.wedge_shape(group.shape):
+            attributes.update(_wedge_tables(space, group, dtype or tack.f32))
+        elif space.tensor and group is not None:
+            attributes.update(_basis_tables(space, group, dtype or tack.f32))
         if self.layout == "cells":
             attributes["layout_cells"] = self.topology.num_cells
         return attributes
 
     def __repr__(self):
         if self.varies:
-            return "L2(order=per cell)"
+            closed = self.basis in (None, "gauss_lobatto")
+            return "L2(order=per cell)" if closed else f"L2(order=per cell, basis={self.basis!r})"
         return super().__repr__()
 
 

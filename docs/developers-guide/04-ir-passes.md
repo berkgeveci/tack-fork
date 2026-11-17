@@ -55,7 +55,13 @@ measures copying cost, not total cold compilation or GPU performance.
 
 ## Verification (`ir_verify.py`)
 
-The production pipeline calls `verify_ir()` at these boundaries:
+The pipeline verifies the IR at these boundaries. Outside debug mode only
+`lowered` and `typed` run (`typed` repeats every earlier stage's checks but
+`packed`'s); the others go through `verify_stage`, which runs them in debug
+mode or with `TACK_VERIFY_ALL` set, as the test suite sets it, so a failure
+names the pass that broke the invariant. `packed` goes through
+`verify_packed`, whose own check (no scalar parameter left) reads only the
+parameters and runs on every compile:
 
 | Stage | Checks added to structural and loop checks |
 |-------|--------------------------------------------|
@@ -149,7 +155,10 @@ its source when the source is never rebound in the containing block.
 Assignment counts include nested control flow, loop-variable bindings, and
 local/shared array bindings.
 Assignments remain in place, reads before the assignment are unchanged,
-and rewritten sequential loops retain their step.
+and rewritten sequential loops retain their step. It is one walk: each
+statement's own expressions take the copies known where it stands, from the
+enclosing blocks and its own block's earlier statements, and its bodies
+inherit them.
 
 This is useful after `@tack.func` inlining, which creates assignments such
 as `__func_x_0__ = x`. Array aliases can then use the original parameter:

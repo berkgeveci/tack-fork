@@ -727,3 +727,65 @@ def test_the_context_is_the_devices_primary_context():
 def _scale_for_primary(x, out, a):
     for i in range(x.shape[0]):
         out[i] = x[i] * a
+
+
+def _plus_one(kernel):
+    x = tack.array(np.arange(8, dtype=np.float32))
+    out = tack.zeros((8,))
+    kernel(x, out)
+    np.testing.assert_array_equal(out.numpy(), np.arange(8, dtype=np.float32) + 1)
+
+
+def test_a_refused_cubin_falls_back_to_ptx_once(monkeypatch):
+    """A driver older than the NVRTC that made a CUBIN refuses it: the kernel is
+    compiled again as PTX, which the driver compiles for itself, and the device
+    takes PTX from then on, the disk cache's target saying so."""
+    from tack.runtime import cuda_backend as cb
+    from tack.runtime.dispatch import get_backend
+
+    backend = get_backend()
+    if backend._arch() is None:
+        pytest.skip("NVRTC makes PTX for this device already")
+    monkeypatch.setattr(backend, "_arch_value", backend._arch())
+    monkeypatch.setattr(backend, "_target", None)
+    real, refused = cb._load_module, []
+
+    def refuse_cubins(image):
+        if not cb._is_ptx(image):
+            refused.append(image)
+            raise cb._RefusedImage("refused for the test")
+        return real(image)
+
+    monkeypatch.setattr(cb, "_load_module", refuse_cubins)
+
+    @tack.kernel
+    def first(x, out):
+        for i in range(x.shape[0]):
+            out[i] = x[i] + 1.0
+
+    @tack.kernel
+    def second(x, out):
+        for i in range(x.shape[0]):
+            out[i] = 1.0 + x[i]
+
+    _plus_one(first)
+    assert len(refused) == 1
+    assert backend._arch() is None
+    assert backend.cache_target().endswith("ptx")
+    _plus_one(second)                       # straight to PTX: no second refusal
+    assert len(refused) == 1
+
+
+def test_a_refused_cubin_is_told_from_other_load_errors():
+    """The fallback is for a CUBIN the driver cannot use, not for PTX or any
+    other error."""
+    from tack.runtime import cuda_backend as cb
+    from tack.runtime.dispatch import get_backend
+
+    backend = get_backend()
+    with cb._in_context(backend._token_or_none):
+        with pytest.raises(cb._RefusedImage):
+            cb._load_module(b"\x7fELF" + bytes(60))
+        with pytest.raises(RuntimeError) as error:
+            cb._load_module(b"not PTX at all\0")
+    assert not isinstance(error.value, cb._RefusedImage)

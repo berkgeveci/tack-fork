@@ -233,6 +233,35 @@ class of methods:
 The parts share one namespace. A view refuses to build if two of them define
 the same name differently, so every method has one meaning.
 
+`tack.inspect_template` shows a view's parts, and which part defines each
+method:
+
+<!-- tack-check: views-inspect -->
+```python
+import numpy as np
+
+import tack
+import tack.dataset as td
+
+tack.set_default_device("cpu")
+
+data = td.uniform_grid((3, 3, 3))
+data.fields["T"] = td.Field(td.H1(data), tack.zeros((data.num_points,)))
+temperature = data.fields["T"]
+group = next(g for g in data.launch_groups("cells", [temperature]) if g.count)
+u = temperature.view(group)
+
+print(tack.inspect_template(u))                    # its parts, constants, arrays, methods
+text = tack.inspect_template(u, "corner_value")
+print(text)
+assert text.splitlines()[0] == "corner_value: defined by _Interpolated"
+assert "self.dof(i, j)  -> _H1Field.dof" in text
+```
+
+`corner_value` comes from the part shared by every interpolated field, and
+reads the value through `dof`, which the space's part (`_H1Field` here)
+defines. Inspection describes the view it is given and runs nothing.
+
 A group keeps what its views read. On a mixed unstructured mesh, that is a
 copy of each shape's connectivity as rows. On a mesh of one shape whose
 offsets step evenly, the rows are the connectivity itself, reshaped. Each

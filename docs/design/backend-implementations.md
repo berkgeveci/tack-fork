@@ -69,7 +69,7 @@ Capabilities](../contracts/backend-capabilities.md).
 | | CPU | Metal | CUDA | HIP | Level Zero |
 |---|---|---|---|---|---|
 | Codegen | `llvm_gen.py` → LLVM IR | `msl_gen.py` → MSL | `cuda_gen.py` → CUDA C | `hip_gen.py` → HIP C | `opencl_gen.py` → OpenCL C |
-| Compiler | llvmlite, O3 pipeline, MCJIT | `newLibraryWithSource` | NVRTC → PTX | hipRTC → code object | `libocloc` → SPIR-V → `zeModuleCreate` |
+| Compiler | llvmlite, O3 pipeline, MCJIT | `newLibraryWithSource` | NVRTC → CUBIN (or PTX) | hipRTC → code object | `libocloc` → SPIR-V → `zeModuleCreate` |
 | Loaded with | `create_mcjit_compiler` | `newComputePipelineState` | `cuModuleLoadData` | `hipModuleLoadData` | `zeModuleCreate` + `zeKernelCreate` |
 | Launch | ctypes call over `[start, end)` chunks | `dispatchThreads` | `cuLaunchKernel` | `hipModuleLaunchKernel` | `zeCommandListAppendLaunchKernel` |
 | Group size | — (thread pool) | `min(pipeline max, 256)` | 256 | 256 | `min(256, maxGroupSizeX, maxTotalGroupSize)` |
@@ -77,7 +77,7 @@ Capabilities](../contracts/backend-capabilities.md).
 | Scalar binding | by value | packed, into a new buffer per launch | packed into the variant's pack arrays | as CUDA | as CUDA |
 | Launch returns | after the range has run | once encoded into the open command buffer | once queued on the context's stream | once queued on the device's stream | once appended to the asynchronous immediate command list |
 | Host waits with | — | `waitUntilCompleted` on each committed command buffer | `cuStreamSynchronize` | `hipStreamSynchronize` | `zeCommandListHostSynchronize` |
-| Disk-cache artifact | object code | MSL source | PTX | code object | native binary and SPIR-V |
+| Disk-cache artifact | object code | MSL source | CUBIN (or PTX) | code object | native binary and SPIR-V |
 | 3D textures | software, in LLVM | hardware | hardware | hardware, software without image support | hardware, software without samplers |
 | `Array.sum/min/max` | NumPy | device kernel for `f32` | device kernel for `f32` | device kernel for `f32` | device kernel for `f32` |
 
@@ -130,10 +130,15 @@ over `[__loop_start__, __loop_end__)`. `CompiledKernel` builds a
 `bind()` marshals the array addresses (`NumpyBuffer.address`, computed once
 per array) and scalars once per dispatch; `call_range()` then runs each
 chunk with its own bounds, because chunks run concurrently. The JIT'd pool
-does not call through ctypes at all: `cpu_pool.chunk_wrapper` JITs, once per
-compiled kernel and under a lock, a `__tack_chunk(pack, start, end)` that
-loads the arguments from 8-byte slots (`pack_args`) and calls the kernel at
-its address.
+does not call through ctypes at all: it runs the kernel's
+`<entry>__chunk(pack, start, end)`, which loads the arguments from 8-byte
+slots (`pack_args`) and calls the kernel. `cpu_pool.add_chunk_wrapper` puts it
+in the kernel's own module, the kernel kept out of line (`noinline`), so it is
+compiled with the kernel and stored with its object code. Each wrapper had been
+a JIT module of its own, made at the kernel's first fan-out in every process:
+2-3 ms each, about 0.7 s over AhmedML's analysis sweep, which the disk cache
+did not hold. `chunk_wrapper` still builds one apart, once and under a lock,
+for object code stored without it.
 
 **Disk cache.** `set_object_cache` captures the object code MCJIT emits, and
 `variant_artifact` stores it after a header and the entry's unique name
@@ -238,9 +243,13 @@ target also names:
 | `--fmad=false` | NVRTC fuses nothing; the generator writes the contractions the contract permits as `__fmaf_rn`/`__fma_rn` (a sum or difference with a product operand) and every other product as `__fmul_rn`/`__dmul_rn`, so an expression rounds the same in every kernel |
 | `--extra-device-vectorization` | let NVRTC vectorize more aggressively |
 
-`--use_fast_math` is never passed. No target architecture is given, so
-NVRTC emits PTX for its default virtual architecture and the driver
-JIT-compiles that PTX in `cuModuleLoadData`. A compile failure raises
+`--use_fast_math` is never passed. Where NVRTC supports the device's
+architecture (`nvrtcGetSupportedArchs`, `_cubin_arch`) it compiles for it
+(`-arch=sm_XY`) and returns the device's code (CUBIN), which
+`cuModuleLoadData` loads as it is. Otherwise, as on a device newer than the
+NVRTC, it emits PTX for its default virtual architecture and the driver
+JIT-compiles that in `cuModuleLoadData`. Cold, the two cost the same, since
+NVRTC then does the driver's work; but a stored CUBIN loads with no compile. A compile failure raises
 `RuntimeError` with the NVRTC log and the source; the program is destroyed
 on both paths.
 
@@ -284,7 +293,7 @@ context and freed once the stream is idle, at the next allocation or sync
 allocation's zeroing are queued in order with the launches; `to_numpy` and
 `read_range` queue their copy and wait with `cuStreamSynchronize`.
 
-**Disk cache.** The PTX NVRTC made is stored with the entry name, the
+**Disk cache.** The CUBIN or PTX NVRTC made is stored with the entry name, the
 parameter layout and the scalar pack layout, and loaded with
 `cuModuleLoadData`; `load_variant` makes the pack arrays anew from the
 call's arguments, since they are device memory of the process.

@@ -76,8 +76,19 @@ import pytest
 # hide a test that patches the compiler. test_disk_cache.py turns the cache
 # on for itself; `TACK_CACHE=write pytest` runs the suite through it.
 os.environ.setdefault("TACK_CACHE", "off")
+# Verify the IR at every stage of the pipeline, not only the lowered and the
+# final one as compiles outside debug mode do: a pass that breaks an
+# invariant is then named in the failure (lang/ir_verify.py).
+os.environ.setdefault("TACK_VERIFY_ALL", "1")
 
 import tack
+import tack.lang.ir_verify as _ir_verify
+from tack.runtime.dispatch import env_flag as _env_flag
+
+# The module reads TACK_VERIFY_ALL when it is first imported, which may be
+# before this file runs (CI's Metal job imports tack, then calls pytest.main):
+# take the setting again here.
+_ir_verify.verify_all = _env_flag("TACK_VERIFY_ALL")
 
 _ALL_ARCHES = ["cpu", "metal", "cuda", "hip", "level_zero"]
 

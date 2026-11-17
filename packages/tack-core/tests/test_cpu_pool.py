@@ -441,3 +441,32 @@ def test_a_run_uses_only_the_first_k_workers(monkeypatch):
         # Which of the k claim is the scheduler's (a posted worker that is
         # descheduled, as under a loaded test run, may claim nothing).
     np.testing.assert_array_equal(out.numpy(), len(ks) * np.arange(n))
+
+
+@pytest.mark.parametrize("kernel, args", [
+    (_number, lambda: [tack.zeros((1000,), tack.i64)]),
+    (_grid, lambda: [tack.zeros((300 * 257,), tack.i32), 3]),
+])
+def test_a_kernel_compiles_its_chunk_wrapper_with_it(kernel, args, monkeypatch):
+    """The wrapper the pool runs is in the kernel's own module and its stored
+    object code (cpu_pool.add_chunk_wrapper): no JIT module of its own, compiled
+    or loaded from the disk cache, and it runs the kernel's chunks."""
+    built = []
+    monkeypatch.setattr(cpu_pool, "_build_chunk_wrapper", lambda c: built.append(c))
+    backend = _fresh_backend(4, monkeypatch)
+    arguments = args()
+    compiled, prefix, n = _compiled(backend, kernel, arguments)
+    assert compiled._chunk
+    name, _, code = compiled.object_code[len(cpu_mod._STORED):].partition(b"\0")
+    engine, address, chunk = cpu_pool.shared_jit.add_object(code, name.decode())
+    assert address and chunk
+    backend._parallel_execute(compiled, prefix, 0, n, whole_range=True)    # makes the pool
+    pool = backend._cpool
+    assert pool is not None, backend.pool_kind
+    for wrapper in (cpu_pool.chunk_wrapper(compiled), chunk):
+        arguments[0].fill(0)
+        pool.run(wrapper, cpu_pool.pack_args(compiled, prefix), 0, n, backend.num_threads)
+        expected = (np.arange(n) if kernel is _number else
+                    (np.arange(300)[:, None] * 3 + np.arange(257)).ravel())
+        np.testing.assert_array_equal(arguments[0].numpy(), expected)
+    assert built == []

@@ -333,7 +333,7 @@ are dictionary reads.
 | build the key, look up the variant | ✓ | ✓ |
 | look up the variant in the disk cache, and load it on a disk hit | | ✓ |
 | `clone_ir`, resolve, infer, check, localize, atomic/workgroup analysis, optimize (on a disk miss) | | ✓ |
-| `verify_ir` at each boundary | | ✓ |
+| `verify_ir` on the final IR (every boundary in debug mode or with `TACK_VERIFY_ALL`) | | ✓ |
 | GPU clone and scalar packing, `annotate_types`, codegen, native compile | | ✓ |
 | `check_workgroup_launch` (collective kernels), `check_atomic_alignment`, `check_writable_arrays` | ✓ | ✓ |
 | evaluate the launch range, `check_launch_size` (GPU), update pack buffers and queue the launch under the variant's lock (CUDA, HIP) | ✓ | ✓ |
@@ -512,7 +512,7 @@ anew from the call's scalars, as `_build_variant` does.
 |---|---|---|
 | CPU | the object code MCJIT emitted (`set_object_cache`), after its entry's unique name | `add_object_file` into the shared engine: about 0.4 ms, no LLVM optimization or code generation |
 | Metal | MSL source, entry name, parameter layout, scalar pack layout | `newLibraryWithSource`, which macOS's own shader cache makes fast for source it has compiled before |
-| CUDA | PTX from NVRTC, entry name, parameter layout, scalar pack layout | `cuModuleLoadData`: the driver compiles the PTX for the device, so the target names the device and compute capability, the driver version, NVRTC's version and its options |
+| CUDA | CUBIN from NVRTC (PTX where NVRTC does not know the device's architecture), entry name, parameter layout, scalar pack layout | `cuModuleLoadData`: a CUBIN loads as it is, PTX the driver compiles for the device; the target names the device and compute capability, the driver version, NVRTC's version and its options, and which of the two is stored |
 | HIP | the code object from hipRTC, entry name, parameter layout, scalar pack layout | `hipModuleLoadData`: machine code for one architecture, so the target names the device and `gcnArchName` with its feature flags (which also separates devices with and without texture hardware), the ROCm runtime and driver, hipRTC, hip-python and the hipRTC options |
 | Level Zero | the native binary IGC made (`zeModuleGetNativeBinary`), the SPIR-V from ocloc, entry name, parameter layout, workgroup size, scalar pack layout | `zeModuleCreate` in the backend's context (its own or the adopted one) as `ZE_MODULE_FORMAT_NATIVE`: about 0.2 ms a kernel. A binary the driver refuses loads from the SPIR-V, which IGC finalizes, about 50 ms a kernel without the driver's own cache. The target names the device and its IP version (stepping), the driver version, ocloc's version, the ocloc and module options, and f64 support |
 

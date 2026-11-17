@@ -107,6 +107,16 @@ def clone_ir(root):
         clone = None
 
 
+def shallow_copy(node):
+    """A new node of ``node``'s kind with the same attributes, as ``copy.copy``
+    makes it: IR nodes are plain attribute containers (``clone_ir`` relies on it
+    too), so this skips the generic copy protocol, which cost a third of
+    renaming a kernel's bindings for a GPU."""
+    new = object.__new__(type(node))
+    new.__dict__.update(node.__dict__)
+    return new
+
+
 def child_fields(node):
     """Return the declared structural fields, rejecting unregistered nodes."""
     try:
@@ -157,6 +167,55 @@ class _Leave:
         self.identity = identity
 
 
+def substitute_ir(root, replace):
+    """``root`` with nodes replaced, copying only the nodes above a replacement.
+
+    ``replace(node)`` returns a replacement, or None to keep the node and look
+    inside it. A node with no replacement below it is returned as it is (the
+    same object); one with a replacement below is a shallow copy with the new
+    children. Nothing is changed in place, so a shared node is rewritten only
+    where it is reached, as ``transform_ir(..., copy_nodes=True)`` does, without
+    copying the subtrees that do not change.
+    """
+    active = set()
+
+    def visit(node):
+        if node is None:
+            return None
+        if isinstance(node, list):
+            out = None
+            for k, item in enumerate(node):
+                new = visit(item)
+                if new is not item:
+                    if out is None:
+                        out = node[:k]
+                    out.append(new)
+                elif out is not None:
+                    out.append(item)
+            return node if out is None else out
+        replacement = replace(node)
+        if replacement is not None:
+            return replacement
+        identity = id(node)
+        if identity in active:
+            raise ValueError('Cycle in IR tree')
+        active.add(identity)
+        try:
+            copied = None
+            for name, _ in child_fields(node):
+                child = getattr(node, name)
+                new = visit(child)
+                if new is not child:
+                    if copied is None:
+                        copied = shallow_copy(node)
+                    setattr(copied, name, new)
+            return node if copied is None else copied
+        finally:
+            active.remove(identity)
+
+    return visit(root)
+
+
 def transform_ir(root, rewrite, *, copy_nodes=False):
     """Rewrite nodes in postorder, mutating structural children in place.
 
@@ -179,7 +238,7 @@ def transform_ir(root, rewrite, *, copy_nodes=False):
                 return [visit(item) for item in node]
             fields = child_fields(node)
             if copy_nodes:
-                node = copy.copy(node)
+                node = shallow_copy(node)
             for name, _ in fields:
                 setattr(node, name, visit(getattr(node, name)))
             return rewrite(node)

@@ -40,15 +40,30 @@ class CallBindings:
                            and isinstance(n.ctx, ast.Store))
         self.template_funcs = template_funcs or {}
 
+    def copy(self):
+        """These bindings with a set of locals of their own, for one inlined call."""
+        other = object.__new__(CallBindings)
+        other.__dict__.update(self.__dict__)
+        other.locals = set(self.locals)
+        return other
+
     def resolve(self, node):
-        value = self._resolve(node)
+        value = self._resolve(node, self.resolve)
         from tack.runtime.disk_cache import recorder
         rec = recorder()
         if rec is not None:
             rec.note(self.owner, node, value)
         return value
 
-    def _resolve(self, node):
+    def lookup(self, node):
+        """What ``node`` names, by `resolve`'s rules, reporting to no recorder:
+        for `tack.inspect_template`, which must leave no trace in the disk
+        cache's record of what lowering resolved."""
+        return self._resolve(node, self.lookup)
+
+    def _resolve(self, node, recurse):
+        """One step of resolving ``node``; ``recurse`` resolves its parts, so
+        `resolve` records each part and `lookup` none."""
         if isinstance(node, ast.Name):
             if getattr(node, '_tack_template_call', False):
                 return self.template_funcs.get(node.id, _UNBOUND)
@@ -56,7 +71,7 @@ class CallBindings:
                 return _DYNAMIC
             return self.nonlocals.get(node.id, self.globals.get(node.id, _UNBOUND))
         if isinstance(node, ast.Attribute):
-            parent = self.resolve(node.value)
+            parent = recurse(node.value)
             if isinstance(parent, ModuleType):
                 return vars(parent).get(node.attr, _UNBOUND)
         return _DYNAMIC

@@ -50,26 +50,44 @@ def _method_call_name(name):
 _CONSTANT_NAMES = weakref.WeakKeyDictionary()
 
 
-def _class_constants(cls):
-    """A class's compile-time constants, by name, with their current values."""
+def _scan_constant_names(cls):
+    """The names of a class's numeric class attributes, found along its method
+    resolution order without running anything (``vars`` of each class)."""
+    found = {}
+    # Base classes before the classes derived from them, so a subclass
+    # inherits its bases' constants and may override them.
+    for klass in reversed(cls.__mro__):
+        for name, val in vars(klass).items():
+            if name.startswith('_'):
+                continue
+            if isinstance(val, (int, float)) or _number_tuple(val):
+                found[name] = val
+            else:
+                found.pop(name, None)   # replaced by something that is not a constant
+    return tuple(found)
+
+
+def _class_constants(cls, inspecting=False):
+    """A class's compile-time constants, by name, with their current values.
+
+    The names are found once per class and kept. ``inspecting`` (for
+    `tack.inspect_template`) uses the kept names if there are any and
+    otherwise finds them without keeping them, so asking changes nothing
+    lowering will see, and reads each value from the classes' dictionaries
+    (`_static`), so no metaclass code runs; a value it cannot read so is
+    `UNREAD`.
+    """
     names = _CONSTANT_NAMES.get(cls)
     if names is None:
-        found = {}
-        # Base classes before the classes derived from them, so a subclass
-        # inherits its bases' constants and may override them.
-        for klass in reversed(cls.__mro__):
-            for name, val in vars(klass).items():
-                if name.startswith('_'):
-                    continue
-                if isinstance(val, (int, float)) or _number_tuple(val):
-                    found[name] = val
-                else:
-                    found.pop(name, None)   # replaced by something that is not a constant
-        names = _CONSTANT_NAMES[cls] = tuple(found)
+        names = _scan_constant_names(cls)
+        if not inspecting:
+            _CONSTANT_NAMES[cls] = names
     constants = {}
     for name in names:
-        val = getattr(cls, name)
-        if isinstance(val, (int, float)):
+        val = _static(cls, name) if inspecting else getattr(cls, name)
+        if val is UNREAD:
+            constants[name] = UNREAD
+        elif isinstance(val, (int, float)):
             constants[name] = val
         elif _number_tuple(val):
             # A class tuple of numbers: one constant per entry, read as
@@ -142,10 +160,46 @@ def _is_template(value):
     return getattr(type(value), "_device_class", False) is True
 
 
-def template_children(obj) -> dict:
+def _is_template_static(value):
+    """`_is_template`, reading the mark ``device_class`` writes from the classes'
+    dictionaries, so no metaclass code runs (for `tack.inspect_template`)."""
+    for klass in type(value).__mro__:
+        if "_device_class" in vars(klass):
+            return vars(klass)["_device_class"] is True
+    return False
+
+
+def _static(cls, name, default=None):
+    """``cls.name`` as its classes' dictionaries hold it, running no code (for
+    `tack.inspect_template`): ``default`` where none holds it, `UNREAD` where
+    Python would run code for it -- the metaclass holds the name, or the value
+    is a descriptor. A metaclass's own ``__getattribute__`` is not run either
+    (`_meta_lookup` says when there is one)."""
+    for meta in type(cls).__mro__:
+        if meta is not type and meta is not object and name in vars(meta):
+            return UNREAD
+    for klass in cls.__mro__:
+        if name in vars(klass):
+            value = vars(klass)[name]
+            if any("__get__" in vars(k) for k in type(value).__mro__):
+                return UNREAD
+            return value
+    return default
+
+
+def _meta_lookup(cls):
+    """The metaclass of ``cls`` that defines its own ``__getattribute__``, or None:
+    lowering reads class attributes through it, which inspection does not run."""
+    for meta in type(cls).__mro__:
+        if meta is not type and meta is not object and "__getattribute__" in vars(meta):
+            return meta
+    return None
+
+
+def template_children(obj, is_template=_is_template) -> dict:
     """The templates an object holds as instance attributes, by name."""
     return {name: value for name, value in sorted(vars(obj).items())
-            if not name.startswith('_') and _is_template(value)}
+            if not name.startswith('_') and is_template(value)}
 
 
 def template_tree(obj, path=(), _seen=None) -> list:
@@ -156,15 +210,15 @@ def template_tree(obj, path=(), _seen=None) -> list:
     return _template_tree(obj, path, _seen)
 
 
-def _template_tree(obj, path, _seen):
+def _template_tree(obj, path, _seen, is_template=_is_template):
     seen = set() if _seen is None else _seen
     if id(obj) in seen:
         raise TypeError(f"a {type(obj).__name__} holds itself, through "
                         f"{'.'.join(path) or 'itself'}: a template is a tree")
     seen.add(id(obj))
     nodes = [(path, obj)]
-    for name, child in template_children(obj).items():
-        nodes.extend(_template_tree(child, (*path, name), seen))
+    for name, child in template_children(obj, is_template).items():
+        nodes.extend(_template_tree(child, (*path, name), seen, is_template))
     seen.discard(id(obj))
     return nodes
 
@@ -173,9 +227,19 @@ def _prefix(path):
     return _NESTED.join(path) + _NESTED if path else ""
 
 
-def _classify_own(obj):
-    """One object's own constants, arrays and runtime scalars (not its children's)."""
-    scalars = _class_constants(type(obj))
+# What an inspection's reader returns for an attribute it does not read.
+UNREAD = object()
+
+
+def _classify_own(obj, read=getattr, inspecting=False):
+    """One object's own constants, arrays and runtime scalars (not its children's).
+
+    ``read(obj, name)`` gives an instance attribute's value: ``getattr`` when
+    lowering, a reader that runs nothing when inspecting, which returns
+    `UNREAD` for an attribute it will not read (one a class property hides);
+    such an attribute is left out. ``inspecting`` as for `_class_constants`.
+    """
+    scalars = _class_constants(type(obj), inspecting)
     arrays = {}
     runtime_scalars = {}
 
@@ -183,7 +247,9 @@ def _classify_own(obj):
     for name in vars(obj):
         if name.startswith('_'):
             continue
-        val = getattr(obj, name)
+        val = read(obj, name)
+        if val is UNREAD:
+            continue
         if _TUPLE_ENTRY.match(name):
             raise TypeError(f"{type(obj).__name__}.{name}: an attribute name ending in "
                             "'__' and digits is how a tuple's entries are named; rename it")
@@ -239,11 +305,13 @@ def classify_template_attrs(obj):
     return _memo("classes", obj, lambda: _classify_tree(obj))
 
 
-def _classify_tree(obj):
+def _classify_tree(obj, read=getattr, inspecting=False):
     flat = ({}, {}, {})
-    for path, node in template_tree(obj):
+    tree = (_template_tree(obj, (), None, _is_template_static) if inspecting
+            else template_tree(obj))
+    for path, node in tree:
         prefix = _prefix(path)
-        for out, own in zip(flat, _classify_own(node)):
+        for out, own in zip(flat, _classify_own(node, read, inspecting)):
             for name, value in own.items():
                 key = prefix + name
                 if any(key in d for d in flat):
@@ -262,13 +330,21 @@ def template_func_methods(cls) -> dict:
     treated the same. A device function under ``@staticmethod`` is one of
     them: it is called as ``self.name(...)`` and has no ``self`` to resolve.
     """
+    return {name: found[0] for name, found in template_func_owners(cls).items()}
+
+
+def template_func_owners(cls) -> dict:
+    """``{name: (func, defining class, static)}`` for `template_func_methods`' methods,
+    found the same way: the class is the one along the method resolution order
+    whose definition is used."""
     methods = {}
     for klass in reversed(cls.__mro__):
         for name, value in vars(klass).items():
-            if isinstance(value, staticmethod):
+            static = isinstance(value, staticmethod)
+            if static:
                 value = value.__func__
             if isinstance(value, Func):
-                methods[name] = value
+                methods[name] = (value, klass, static)
             else:
                 methods.pop(name, None)
     return methods
@@ -313,7 +389,7 @@ def template_structure(obj) -> tuple:
         (path, type(node)) for path, node in template_tree(obj)[1:]))
 
 
-def iteration_space(cls) -> tuple:
+def iteration_space(cls, read=getattr) -> tuple:
     """The attributes a ``for c in obj`` loop runs over, fastest first.
 
     A device class declares them as ``__tack_iterate__``: one to
@@ -324,9 +400,10 @@ def iteration_space(cls) -> tuple:
     running fastest; at the top of a kernel that loop is launched in its
     own shape, so nothing divides to recover the indices. The object's
     methods take ``c`` as it comes, so a kernel written ``for c in obj:``
-    runs unchanged over objects that iterate differently.
+    runs unchanged over objects that iterate differently. ``read`` reads the
+    declaration (`_static` when inspecting).
     """
-    names = getattr(cls, '__tack_iterate__', None)
+    names = read(cls, '__tack_iterate__', None)
     if names is None:
         raise TypeError(
             f"a {cls.__name__} cannot be iterated in a kernel: its class declares no "
@@ -369,15 +446,12 @@ def rewrite_templates(kernel_ast, template_args, python_func=None):
     # Reserve source names in both the caller and template methods before
     # allocating synthetic parameters. Attribute expansion must not merge a
     # user's binding with an array/scalar reference in the rewritten AST.
-    sources = [funcdef]
+    used_names = {n.id if isinstance(n, ast.Name) else n.arg for n in ast.walk(funcdef)
+                  if isinstance(n, (ast.Name, ast.arg))}
     for _, obj in template_args.values():
         for _, node in template_tree(obj):
-            sources.extend(method._funcdef for method in
-                           template_func_methods(type(node)).values())
-    used_names = {n.id for source in sources for n in ast.walk(source)
-                  if isinstance(n, ast.Name)}
-    used_names.update(n.arg for source in sources for n in ast.walk(source)
-                      if isinstance(n, ast.arg))
+            for method in template_func_methods(type(node)).values():
+                used_names.update(method.source_names())
 
     # The source spelling of each held array's synthetic parameter, for
     # diagnostics; lowering keeps it on the IR (`IRFunction.held_arrays`).
@@ -449,9 +523,17 @@ def _prune_synthetic(kernel_def, resolved_funcs, synthetic):
     if not defs:
         return
 
-    def calls(funcdef):
-        return [n for n in ast.walk(funcdef) if isinstance(n, ast.Call)
-                and getattr(n.func, '_tack_template_call', False) and n.func.id in defs]
+    def scan(funcdef):
+        """The calls of resolved methods in ``funcdef``, and the synthetic names it
+        reads, from one walk."""
+        found, names = [], []
+        for n in ast.walk(funcdef):
+            if isinstance(n, ast.Call):
+                if getattr(n.func, '_tack_template_call', False) and n.func.id in defs:
+                    found.append(n)
+            elif isinstance(n, ast.Name) and n.id in synthetic:
+                names.append(n)
+        return found, names
 
     def passed(call):
         """``(position, name)`` of the synthetic names a call passes as they are."""
@@ -459,12 +541,11 @@ def _prune_synthetic(kernel_def, resolved_funcs, synthetic):
                 if isinstance(a, ast.Name) and a.id in synthetic]
 
     params = {name: [a.arg for a in d.args.args] for name, d in defs.items()}
-    sites = {name: calls(d) for name, d in defs.items()}
-    direct = {}
+    sites, direct = {}, {}
     for name, funcdef in defs.items():
+        sites[name], names = scan(funcdef)
         through = {id(call.args[k]) for call in sites[name] for k, _ in passed(call)}
-        direct[name] = {n.id for n in ast.walk(funcdef) if isinstance(n, ast.Name)
-                        and n.id in synthetic and id(n) not in through}
+        direct[name] = {n.id for n in names if id(n) not in through}
     need = {name: set(direct[name]) for name in defs}
     changed = True
     while changed:
@@ -483,9 +564,8 @@ def _prune_synthetic(kernel_def, resolved_funcs, synthetic):
         names = params[callee]
         return k >= len(names) or names[k] not in synthetic or names[k] in need[callee]
 
-    for funcdef in [kernel_def, *defs.values()]:
-        for call in calls(funcdef):
-            call.args = [a for k, a in enumerate(call.args) if keep(call.func.id, k)]
+    for call in [*scan(kernel_def)[0], *(c for found in sites.values() for c in found)]:
+        call.args = [a for k, a in enumerate(call.args) if keep(call.func.id, k)]
     for name, funcdef in defs.items():
         funcdef.args.args = [a for a in funcdef.args.args
                              if a.arg not in synthetic or a.arg in need[name]]

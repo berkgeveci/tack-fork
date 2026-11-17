@@ -23,9 +23,13 @@ from tack.codegen.reductions import f32_reduction_helpers
 from tack.codegen.tables import Tables
 from tack.lang import ir
 from tack.lang.atomic_support import check_atomic_support
-from tack.lang.ir_traversal import walk_ir
+from tack.lang.ir_traversal import child_fields, walk_ir
 from tack.lang.types import ScalarType, f32, f64, i8, i16, i32, i64, u8, u16, u32, u64
-from tack.lang.workgroup_participation import WORKGROUP_SIZE, check_workgroup_participation
+from tack.lang.workgroup_participation import (
+    WORKGROUP_SIZE,
+    check_workgroup_participation,
+    requires_full_workgroups,
+)
 from tack.lang.workgroup_support import workgroup_features
 
 _MSL_TYPE_MAP = {
@@ -107,11 +111,20 @@ def _stores_inside_sequential_loop(body) -> bool:
 
     A debug mode bounds check counts: it can store its record.
     """
-    for node in walk_ir(body):
-        if isinstance(node, (ir.IRSequentialFor, ir.IRWhile)):
-            if any(isinstance(inner, (ir.IRArrayStore, ir.IRAtomicOp, ir.IRBoundsCheck))
-                   for inner in walk_ir(node)):
-                return True
+    # One walk, each node carrying whether a sequential loop encloses it (looking
+    # into every loop's subtree again made nested loops quadratic).
+    pending = [(body, False)]
+    while pending:
+        node, inside = pending.pop()
+        if node is None:
+            continue
+        if isinstance(node, list):
+            pending.extend((item, inside) for item in node)
+            continue
+        if inside and isinstance(node, (ir.IRArrayStore, ir.IRAtomicOp, ir.IRBoundsCheck)):
+            return True
+        inside = inside or isinstance(node, (ir.IRSequentialFor, ir.IRWhile))
+        pending.extend((getattr(node, name), inside) for name, _ in child_fields(node))
     return False
 
 
@@ -146,8 +159,11 @@ class MSLCodeGen(CFamilyCodeGen):
         """Generate MSL source for the kernel."""
         func = self.ir_func
         check_atomic_support(func, backend_name='metal')
-        check_workgroup_participation(func)
-        self._needs_local_tid = bool(workgroup_features(func))
+        features = workgroup_features(func)
+        # Only a kernel with a collective needs the participation check's walks.
+        if requires_full_workgroups(func, features):
+            check_workgroup_participation(func)
+        self._needs_local_tid = bool(features)
 
         # Build parameter info
         for param in func.params:

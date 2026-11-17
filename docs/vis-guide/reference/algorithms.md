@@ -92,9 +92,9 @@ New datasets of pieces of cells, with points made on their edges.
 
 | Algorithm | Gives | Takes | VTK | Viskores |
 |---|---|---|---|---|
-| [`contour`](#tack.dataset.algorithms.contour.contour) | isosurfaces, isolines or points of a field, one level or several | dataset | vtkContourFilter | Contour |
+| [`contour`](#tack.dataset.algorithms.contour.contour) | isosurfaces, isolines or points of a field, one level or several | dataset | vtkContourFilter, vtkFlyingEdges3D | Contour, ContourFlyingEdges |
 | [`slice`](#tack.dataset.algorithms.slice.slice) | where an implicit function is zero (or a level) | dataset | vtkCutter | Slice |
-| [`slice_plane`](#tack.dataset.algorithms.slice.slice_plane) | a plane's cut, or parallel planes | dataset | vtkCutter | Slice |
+| [`slice_plane`](#tack.dataset.algorithms.slice.slice_plane) | a plane's cut, or parallel planes | dataset | vtkCutter, vtkFlyingEdgesPlaneCutter | Slice |
 | [`clip`](#tack.dataset.algorithms.clip.clip) | the part above (or below) a field's level or inside an implicit function | dataset | vtkTableBasedClipDataSet | ClipWithField, ClipWithImplicitFunction |
 
 ::: tack.dataset.algorithms.contour.contour

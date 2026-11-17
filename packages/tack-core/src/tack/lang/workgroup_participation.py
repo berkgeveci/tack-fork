@@ -14,10 +14,21 @@ from tack.lang import ir
 from tack.lang.ir_traversal import child_fields, walk_ir
 
 WORKGROUP_SIZE = 256
-_COLLECTIVES = (ir.IRBarrier, ir.IRBlockReduce)
+# Each collective, and the name (or the prefix of the names) that
+# `workgroup_support.workgroup_features` gives it, so a collective added here
+# needs its feature too, and a caller holding the features need not walk.
+_COLLECTIVE_FEATURES = {ir.IRBarrier: 'barrier', ir.IRBlockReduce: 'block_'}
+_COLLECTIVES = tuple(_COLLECTIVE_FEATURES)
 
 
-def requires_full_workgroups(ir_func):
+def requires_full_workgroups(ir_func, features=None):
+    """Whether the kernel has a collective (a barrier or a block reduction), which
+    needs full workgroups and the participation check. With ``features``,
+    ``workgroup_features``' answer for the kernel, decided from them, without
+    a walk."""
+    if features is not None:
+        return any(feature.startswith(name) for feature in features
+                   for name in _COLLECTIVE_FEATURES.values())
     return any(isinstance(node, _COLLECTIVES) for node in walk_ir(ir_func.body))
 
 

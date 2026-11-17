@@ -78,7 +78,8 @@ def jump(data, field):
         # every face, polygons of five or more points too, agree.
         if faces.num_faces:
             out.fill(0)
-    elif getattr(field.space, "order", 1) <= 1 or getattr(field.space, "varies", False):
+    elif (field.space.max_order if getattr(field.space, "varies", False)
+          else getattr(field.space, "order", 1)) <= 1:
         # Up to order 1 a side is linear over the face, so its corner values
         # (traces) give the center exactly -- on a pyramid's triangles too, whose
         # map from the reference is not affine.

@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | **CPU** | `llvm_gen.py` → LLVM IR | llvmlite JIT | ctypes call, thread pool | `NumpyBuffer` |
 | **Metal** | `msl_gen.py` → MSL | Metal API (pyobjc) | compute pipeline | `MetalBuffer` |
-| **CUDA** | `cuda_gen.py` → CUDA C | NVRTC → PTX | `cuLaunchKernel` | `CUDABuffer` |
+| **CUDA** | `cuda_gen.py` → CUDA C | NVRTC → CUBIN (or PTX) | `cuLaunchKernel` | `CUDABuffer` |
 | **HIP** | `hip_gen.py` → HIP C | hipRTC | `hipModuleLaunchKernel` | `HIPBuffer` |
 | **Level Zero** | `opencl_gen.py` → OpenCL C | `libocloc` → SPIR-V | `zeCommandListAppendLaunchKernel` | `L0Buffer` |
 | **Warp** (prototype) | `warp_gen.py` → `@wp.kernel` Python | Warp | `wp.launch` on Warp's current stream | `WarpBuffer` (`wp.array`) |
@@ -31,7 +31,7 @@ wrong spelling still compiles as C.
 |---|---|---|
 | **CPU** | when the kernel has finished | object code |
 | **Metal** | once queued in a command buffer, committed every 64 launches | MSL source |
-| **CUDA** | once queued on a stream | PTX, compiled by the driver at load |
+| **CUDA** | once queued on a stream | the device's code (CUBIN) from NVRTC, or PTX the driver compiles at load where NVRTC does not know the device |
 | **HIP** | once queued on a stream | the code object |
 | **Level Zero** | once queued on an asynchronous immediate command list | the native binary, and the SPIR-V to fall back on |
 | **Warp** (prototype) | once queued on Warp's current stream | nothing: Warp's own kernel cache keeps the compiled code |

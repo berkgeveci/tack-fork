@@ -4022,8 +4022,10 @@ def view_class(kind, shape, *mixins):
     if key not in _view_classes:
         _check_names(*mixins, kind, shape)
         name = "".join(m.__name__.strip("_") for m in mixins) + kind.__name__ + shape.__name__
+        # The key, on the class (not its views), for tack.inspect_template.
+        attributes = {**_node_count(mixins, shape), "_tack_composition": key}
         _view_classes[key] = tack.device_class(type(name, (*mixins, kind, shape),
-                                                    _node_count(mixins, shape)))
+                                                    attributes))
     return _view_classes[key]
 
 

@@ -216,6 +216,13 @@ def _simplex_h1_coefficients(cells, w, matrix, face_matrix, cell_matrix, q, coun
                 out[w.dof_index(c, n)] = total
 
 
+@tack.kernel
+def _copy_dofs(cells, w, out):
+    for c in cells:
+        for n in range(w.NODES):
+            out[w.dof_index(c, n)] = w.dof(c, n)
+
+
 def _matrices(shape, order, forward):
     """The 1D, triangle and cell matrices taking a ``shape`` cell's values at its
     equispaced nodes to Bernstein coefficients (``forward``), or back."""
@@ -272,7 +279,7 @@ def _converted(data, values, space, forward):
     staged = Field(space, values)                  # the values, read through space's view
     out = tack.empty_like(values)
     order = space.order
-    q = order + 1
+    q = None if space.varies else order + 1   # an order per cell: set per group
     like = tack.empty((1,), arrays.dtype_of(values))
 
     def typed(m):
@@ -282,6 +289,14 @@ def _converted(data, values, space, forward):
         if not group.count:
             continue
         cells, w = data.domain_view("cells", group), staged.view(group)
+        if space.varies:
+            # An order per cell: this subgroup's order. At orders 0 and 1 the
+            # coefficients are the values (the centre's, the corners').
+            order = int(group.keys[space])
+            q = order + 1
+            if order <= 1:
+                _copy_dofs(cells, w, out)
+                continue
         one, tri, cell = _matrices(group.shape, order, forward)
         if cell is not None:
             count = cell.shape[0]

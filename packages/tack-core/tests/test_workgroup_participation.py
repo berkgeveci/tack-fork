@@ -444,3 +444,25 @@ def test_level_zero_checks_both_device_limits_before_driver(x_limit, total_limit
         monkeypatch.undo()
     finally:
         gc.enable()
+
+
+@pytest.mark.parametrize("node", [tack.lang.ir.IRBarrier(),
+                                  tack.lang.ir.IRBlockReduce(
+                                      'sum', tack.lang.ir.IRConstant(1.0))],
+                         ids=["barrier", "block reduction"])
+def test_every_collective_is_found_from_the_features_too(node):
+    """The Metal generator decides from the features it found already; every
+    collective must have one, or a new collective would skip the check."""
+    from tack.lang import ir
+    from tack.lang.workgroup_participation import _COLLECTIVES, requires_full_workgroups
+    from tack.lang.workgroup_support import workgroup_features
+
+    assert type(node) in _COLLECTIVES
+    body = [ir.IRAssign('x', node)] if isinstance(node, ir.IRBlockReduce) else [node]
+    func = ir.IRFunction('k', [], [ir.IRParallelFor('i', ir.IRConstant(0),
+                                                    ir.IRConstant(256), body)])
+    assert requires_full_workgroups(func)
+    assert requires_full_workgroups(func, workgroup_features(func))
+    plain = ir.IRFunction('k', [], [ir.IRParallelFor('i', ir.IRConstant(0),
+                                                     ir.IRConstant(256), [])])
+    assert not requires_full_workgroups(plain, workgroup_features(plain))

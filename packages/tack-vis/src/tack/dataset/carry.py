@@ -227,7 +227,8 @@ def _carry_l2(field, out, cells):
     count = sources.shape[0]
     if space.varies:
         orders = np.asarray(arrays.to_host(space.cell_keys()))
-        out_space = L2(out, order=orders[sources.numpy()] if count else np.zeros(0, int))
+        out_space = L2(out, order=orders[sources.numpy()] if count else np.zeros(0, int),
+                       basis=space.basis or "gauss_lobatto")
     else:
         # The same basis: order, nodes and the layout asked for ("auto" resolves on
         # the output's device).

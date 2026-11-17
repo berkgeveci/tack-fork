@@ -26,7 +26,7 @@ from tack.dataset.algorithms.implicit_values import implicit_values
 from tack.dataset.buckets import key_order, run_offsets
 from tack.dataset.carry import Interpolate, Pieces, _point_values, carry
 from tack.dataset.dataset import Field
-from tack.dataset.spaces import H1, Values
+from tack.dataset.spaces import H1, L2, Values
 from tack.dataset.topology import UnstructuredTopology
 from tack.runtime.dispatch import on_inputs_device
 
@@ -291,8 +291,9 @@ def clip(data, by, value=0.0, inside=False, fields=None, subdivision=None, toler
     (and VTK's) keep a piece of it of no volume, so a clip through a plane of mesh
     points has fewer cells than VTK's, all of its volume.
 
-    A curved geometry or a field above order 1 (or ``subdivision`` above 1, or a
-    ``tolerance``) is clipped through subdivision, as ``contour`` cuts it, and the
+    A curved geometry, a field above order 1 or any ``L2`` field (or ``subdivision``
+    above 1, or a ``tolerance``) is clipped through subdivision, as ``contour`` cuts it,
+    and the
     result is ``PartitionedDataSet([whole, part])``: ``whole`` the cells the field's
     Bernstein bound keeps entirely, as they are (curved, their fields of any order),
     and ``part`` the clip of the others that the bound does not drop, cut into
@@ -328,7 +329,9 @@ def clip(data, by, value=0.0, inside=False, fields=None, subdivision=None, toler
         raise TypeError("clip needs a scalar field")
     from tack.dataset.algorithms.subdivide import split_by_range, subdivides
 
+    # An L2 field, of any order, is read cell by cell: through subdivision too.
     if not polyhedral and (subdivides(data, field) or tolerance is not None
+                           or isinstance(field.space, L2)
                            or (subdivision is not None and subdivision > 1)):
         if tolerance is not None:
             tolerance = _in_unit_of(field, tolerance, "clip's tolerance")

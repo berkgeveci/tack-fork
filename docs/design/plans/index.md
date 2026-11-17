@@ -26,5 +26,5 @@ recommendation, so a review can answer "yes", "no" or "other" per decision.
 
 | Plan | Issue | Status |
 |---|---|---|
-| [Cut filters' memory](cut-filters-memory.md) | [#318](https://github.com/Kitware/tack/issues/318) | Proposed |
-| [Inspecting device-class objects](inspect-template.md) | [#324](https://github.com/Kitware/tack/issues/324) | Proposed |
+| [Cut filters' memory](cut-filters-memory.md) | [#318](https://github.com/Kitware/tack/issues/318) | Accepted |
+| [Inspecting device-class objects](inspect-template.md) | [#324](https://github.com/Kitware/tack/issues/324) | Done |

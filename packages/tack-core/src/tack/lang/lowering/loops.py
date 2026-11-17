@@ -33,19 +33,7 @@ def _launch_bounds_from_arguments(params: list, body: list) -> list:
     if loop is None:
         return body
     names = {p.name for p in params}
-    bindings: dict = {}
-    for node in walk_ir(body):
-        if isinstance(node, ir.IRAssign):
-            bindings[node.target] = bindings.get(node.target, 0) + 1
-        elif isinstance(node, (ir.IRSequentialFor, ir.IRParallelFor)):
-            for var in [node.var, *(getattr(node, 'dims', None) or ())]:
-                bindings[var] = 2
     outer = {}
-    for stmt in body:
-        if stmt is loop:
-            break
-        if isinstance(stmt, ir.IRAssign) and bindings[stmt.target] == 1:
-            outer[stmt.target] = stmt.value
     followed = set()
 
     def array(name):
@@ -89,6 +77,26 @@ def _launch_bounds_from_arguments(params: list, body: list) -> list:
         found = host(bound)
         return bound if found is None else found
 
+    # Most bounds read the parameters alone (`range(x.shape[0])`): then nothing
+    # before the loop is followed, and the body need not be walked.
+    bounds = [loop.end, *(loop.extents if getattr(loop, 'dims', None) else ())]
+    if all(isinstance(b, ir.IRConstant) or host(b) is not None for b in bounds):
+        loop.end = rewrite(loop.end)
+        if getattr(loop, 'dims', None):
+            loop.extents = [rewrite(e) for e in loop.extents]
+        return body
+    bindings: dict = {}
+    for node in walk_ir(body):
+        if isinstance(node, ir.IRAssign):
+            bindings[node.target] = bindings.get(node.target, 0) + 1
+        elif isinstance(node, (ir.IRSequentialFor, ir.IRParallelFor)):
+            for var in [node.var, *(getattr(node, 'dims', None) or ())]:
+                bindings[var] = 2
+    for stmt in body:
+        if stmt is loop:
+            break
+        if isinstance(stmt, ir.IRAssign) and bindings[stmt.target] == 1:
+            outer[stmt.target] = stmt.value
     loop.end = rewrite(loop.end)
     if getattr(loop, 'dims', None):
         loop.extents = [rewrite(e) for e in loop.extents]

@@ -72,7 +72,8 @@ pieces ([Polyhedra and Polygons](../data/polyhedra.md)).
 | PolyLine, Polygon, Polyhedron | yes (linear on pieces) | — | — | `Constant` | — | — | — |
 
 There is no fixed upper order (the tests go to order 6). An `L2` order may
-also vary per cell (orders 0 and 1, `L2(data, order=array)`).
+also vary per cell (orders 0 to 15 in one basis, `L2(data, order=array)`), each
+cell read as the space of its order, where that space exists for its shape.
 
 A **curved geometry** is a geometry field above order 1, in `H1`, or in `L2` for
 cells that do not meet (a mesh displaced by a DG field, a periodic mesh). Cells

@@ -19,6 +19,7 @@ from tack.lang.ir_names import fresh_name
 from tack.lang.lowering.arrays import ArrayAccess
 from tack.lang.lowering.bounds import BoundsChecks
 from tack.lang.lowering.checks import LoweringChecks
+from tack.lang.lowering.constant_conditions import constant_truth
 from tack.lang.lowering.inlining import Inlining
 from tack.lang.lowering.local_arrays import LocalArrays
 from tack.lang.lowering.loops import Loops, _launch_bounds_from_arguments, _mark_outermost_continues
@@ -147,7 +148,10 @@ class KernelTransformer(
         function.held_arrays = dict(getattr(node, '_tack_held_arrays', {}))
         if self._debug:
             function.bounds_sites = tuple(self._bounds_sites)
-        if workgroup_features(function):
+        # Kept on the template, so dispatch's check of it walks the tree no
+        # more (check_workgroup_support's cache_features).
+        function._workgroup_features = workgroup_features(function)
+        if function._workgroup_features:
             # Workgroup collectives assume one-dimensional groups.
             parallel_dims.flatten(parallel_dims.parallel_loop(function))
         self._check_names_bound(function)
@@ -239,12 +243,38 @@ class KernelTransformer(
 
     def visit_If(self, node: ast.If) -> ir.IRIf:
         condition = self._scalar_condition(node, "if", self.visit(node.test))
+        decided = constant_truth(condition)
+        if decided is not None:
+            # Constants decide it: the arm they pick, in place, and the other
+            # never lowered (constant_conditions). The condition stays, in an
+            # `if` with empty arms, so it is evaluated and typed as before.
+            self._note_decided_away(node, node.orelse if decided else node.body)
+            return [ir.IRIf(condition=condition, then_body=[], else_body=[]),
+                    *self._visit_body(node.body if decided else node.orelse)]
         then_body = self._visit_body(node.body)
         else_body = self._visit_body(node.orelse)
         return ir.IRIf(condition=condition, then_body=then_body, else_body=else_body)
 
+    def _note_decided_away(self, node: ast.If, stmts: list):
+        """Record the names ``stmts``, an arm not lowered, assign, for the error a
+        read of one gives (``_check_names_bound``)."""
+        condition = None
+        for stmt in stmts:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                    if condition is None:
+                        condition = ast.unparse(node.test)
+                    self._decided_away.setdefault(sub.id, (condition, node.lineno))
+
     def visit_IfExp(self, node: ast.IfExp) -> ir.IRIfExp:
         condition, before = self._visit_expression(node.test)
+        decided = constant_truth(condition)
+        if decided is not None:
+            self._pre_stmts.extend(before)
+            self._pre_stmts.append(ir.IRIf(condition=condition, then_body=[], else_body=[]))
+            value, stmts = self._visit_expression(node.body if decided else node.orelse)
+            self._pre_stmts.extend(stmts)
+            return value
         then_value, then_stmts = self._visit_expression(node.body)
         else_value, else_stmts = self._visit_expression(node.orelse)
         self._pre_stmts.extend(before)

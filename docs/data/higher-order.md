@@ -122,8 +122,17 @@ An `L2` field gives every cell its own values, so it may jump between
 cells. This is how DG solutions are stored. `L2` of order 0 is one value per
 cell, which means the same as cell data (`Constant`). `L2` of order 1 has a
 value at each corner of each cell, so a point shared by four cells has four
-values. Higher orders have a cell's full lattice of nodes. The order may
-also differ per cell, given as an array, for orders 0 and 1.
+values. Higher orders have a cell's full lattice of nodes.
+
+The order may also differ per cell, as a p-adaptive DG solver's does:
+`L2(data, order=orders, basis=...)` with an array of one order per cell, 0 to
+15, in one basis. Each cell is read as the space of its order reads it: order
+0 its one value, order 1 its corners (Gauss-Legendre's 2^d interior nodes),
+higher orders their lattice. Its values are each cell's in blocks, at
+`space.offsets[c]`. Every algorithm takes such a field. The cutting filters
+cut at the highest order present; `integrate` takes points enough for it.
+`space.at_order(p)` is the space of one order that reads the cells of order
+`p`, and `space.orders()` lists the orders present.
 
 ### What the names mean
 
@@ -476,7 +485,8 @@ Bézier cells with weights other than 1, which are refused when read);
 Gauss-point bases on triangles, tetrahedra and wedges, which are resampled
 into equispaced ones when read; an order per axis, as VTK's
 quadratic-linear cells have, which are embedded in the full order; and
-serendipity for `L2`. An `L2` order per cell is limited to 0 and 1.
+serendipity for `L2`. An `L2` order per cell does not go to VTK cell grids
+or MFEM yet (VTK's unstructured grids take no `L2` field at any order).
 
 ## Where to go next
 

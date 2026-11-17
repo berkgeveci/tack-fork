@@ -604,7 +604,7 @@ class _Located:
             return
         data = self.crossings.data
         space = source.space
-        if not isinstance(space, (H1, L2)) or space.varies:
+        if not isinstance(space, (H1, L2)):
             return
         is_geometry = source is data.geometry
         if is_geometry and not isinstance(space, H1):

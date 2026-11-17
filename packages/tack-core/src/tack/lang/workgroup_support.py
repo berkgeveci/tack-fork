@@ -11,7 +11,8 @@ def workgroup_features(ir_func):
     """Return required primitives, including those in nested or inlined bodies.
 
     This is structural discovery, not control-flow or participation analysis:
-    even a primitive in an unreachable branch requires target support.
+    even a primitive in an unreachable branch requires target support. (An
+    arm that constants decide against is not lowered, so is not there.)
     """
     features = set()
     for node in walk_ir(ir_func.body):
@@ -37,7 +38,7 @@ def check_workgroup_support(ir_func, *, supports_workgroups, backend_label,
     """
     if supports_workgroups:
         return
-    features = getattr(ir_func, '_workgroup_features', None) if cache_features else None
+    features = ir_func._workgroup_features if cache_features else None
     if features is None:
         features = workgroup_features(ir_func)
         if cache_features:

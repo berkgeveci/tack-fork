@@ -813,8 +813,14 @@ def test_variable_order_spaces(backend):
     assert td.L2(data, order=orders).varies and not td.L2(data).varies
     np.testing.assert_array_equal(td.L2(data, order=orders).offsets.numpy(), [0, 8, 9, 14])
     np.testing.assert_array_equal(td.L2(data, order=0).offsets.numpy(), [0, 1, 2, 3])
-    with pytest.raises(NotImplementedError, match=r"orders \[2\]"):
-        td.L2(data, order=np.array([1, 2, 1])).cell_keys()
+    # Orders 0 to 15 per cell, each where the space of that order is (#423): order 2
+    # on a hexahedron, not on the pyramid.
+    np.testing.assert_array_equal(td.L2(data, order=np.array([1, 2, 1])).offsets.numpy(),
+                                  [0, 8, 35, 40])
+    with pytest.raises(NotImplementedError, match="on Pyramid cells"):
+        _ = td.L2(data, order=np.array([1, 1, 2])).size
+    with pytest.raises(ValueError, match="0 to 15"):
+        td.L2(data, order=np.array([1, 16, 1])).cell_keys()
     with pytest.raises(ValueError, match="3 orders, not 2"):
         td.L2(data, order=np.array([1, 0])).cell_keys()
     u = td.Field(td.L2(data, order=orders), _scalars(np.zeros(14)))

@@ -694,8 +694,9 @@ class _SharedJIT:
         return self._engine
 
     def add_module(self, module, name):
-        """``(engine, address of name, object code)`` for a parsed, optimized module
-        (renamed ``name`` too, to find its object code)."""
+        """``(engine, address of name, object code, address of its chunk wrapper)``
+        for a parsed, optimized module (renamed ``name`` too, to find its object
+        code); the wrapper's address is 0 where the module has none."""
         with self._lock:
             engine = self._current()
             self._emitted.clear()
@@ -703,19 +704,22 @@ class _SharedJIT:
             engine.add_module(module)
             engine.finalize_object()
             address = engine.get_function_address(name)
+            chunk = engine.get_function_address(name + CHUNK_SUFFIX)
             code = next((buffer for owner, buffer in self._emitted if owner == name), None)
             # The code stays in the engine's memory; the module's IR (large for
             # unrolled high-order kernels) is no longer needed.
             engine.remove_module(module)
-            return engine, address, code
+            return engine, address, code, chunk
 
     def add_object(self, data, name):
-        """``(engine, address of name)`` for stored object code."""
+        """``(engine, address of name, address of its chunk wrapper or 0)`` for
+        stored object code."""
         with self._lock:
             engine = self._current()
             engine.add_object_file(llvm.ObjectFileRef.from_data(data))
             engine.finalize_object()
-            return engine, engine.get_function_address(name)
+            return (engine, engine.get_function_address(name),
+                    engine.get_function_address(name + CHUNK_SUFFIX))
 
 
 shared_jit = _SharedJIT()
@@ -733,6 +737,28 @@ def _jit_target_machine():
 # ── Per-kernel wrappers and argument packs ──────────────────────────
 
 _wrapper_lock = threading.Lock()
+
+#: A kernel's chunk wrapper is its entry's name with this after it.
+CHUNK_SUFFIX = "__chunk"
+
+
+def add_chunk_wrapper(module, entry: str):
+    """Put ``void <entry>__chunk(pack, start, end)`` into the kernel's own
+    ``llvmlite.ir`` module: it loads the arguments from the pack's 8-byte slots
+    (the kernel's parameters, then its extents) and calls the kernel. Compiled
+    with the kernel, it costs no module of its own and is in the stored object
+    code; a wrapper made apart (``chunk_wrapper``) took a JIT module each,
+    2-3 ms, for every kernel that fanned out in a process. The kernel is kept
+    out of line, so O3 does not compile a second copy of it into the wrapper."""
+    kernel = module.get_global(entry)
+    kernel.attributes.add("noinline")
+    wrapper = ir.Function(module, _chunk_fn_type, name=entry + CHUNK_SUFFIX)
+    b = ir.IRBuilder(wrapper.append_basic_block("entry"))
+    pack, start, end = wrapper.args
+    args = [b.load(b.bitcast(b.gep(pack, [_i64(8 * i)]), t.as_pointer()))
+            for i, t in enumerate(kernel.function_type.args[:-2])]
+    b.call(kernel, [*args, start, end])
+    b.ret_void()
 
 
 def chunk_wrapper(compiled) -> int:
@@ -772,7 +798,7 @@ def _build_chunk_wrapper(compiled) -> int:
     b.ret_void()
     mod = llvm.parse_assembly(str(module))
     mod.verify()
-    engine, address, _ = shared_jit.add_module(mod, name)
+    engine, address, _, _ = shared_jit.add_module(mod, name)
     compiled._chunk_engine = engine
     compiled._chunk = address
     return compiled._chunk

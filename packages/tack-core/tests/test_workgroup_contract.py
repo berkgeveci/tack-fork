@@ -116,6 +116,31 @@ def test_direct_llvm_checks_mutable_ir_despite_cached_features():
         generator.generate()
 
 
+def test_lowering_records_the_features_dispatch_checks(monkeypatch):
+    import tack.lang.workgroup_support as support
+
+    @tack.kernel
+    def plain(out):
+        for i in range(out.shape[0]):
+            out[i] = i
+
+    template = plain.get_ir().functions[0]
+    assert template._workgroup_features == ()
+    assert barrier_kernel.get_ir().functions[0]._workgroup_features == ('barrier',)
+
+    def walked(ir_func):
+        raise AssertionError("dispatch walked the template for its features again")
+
+    monkeypatch.setattr(support, 'workgroup_features', walked)
+    tack.set_default_device("cpu")
+    out = tack.empty((4,), tack.i32)
+    with monkeypatch.context() as m:
+        # The CPU generator still checks the variant's IR it is given, afresh.
+        m.setattr('tack.codegen.llvm_gen.check_workgroup_support', lambda *a, **k: None)
+        plain(out)
+    np.testing.assert_array_equal(out.numpy(), np.arange(4))
+
+
 @tack.kernel
 def private_scratch(data, out, total):
     for i in range(data.shape[0]):

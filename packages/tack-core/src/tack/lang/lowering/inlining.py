@@ -121,6 +121,10 @@ class Inlining:
         self._active_funcs = set()      # device functions being inlined, against recursion
         self._inline_counter = 0  # unique suffix for inlined variables
         self._inline_stack: list[str] = []   # names of the device functions being inlined
+        # What each callee's source gives, found at its first inlined call of this
+        # lowering, by id: (funcdef, bindings, return count, assigned names).
+        # A large kernel inlines a few hundred calls of far fewer functions.
+        self._callees = {}
 
     def _inline_func_call(self, func_obj, call_node: ast.Call):
         """Inline a @tack.func call, tracking it for diagnostics."""
@@ -146,12 +150,10 @@ class Inlining:
         Produces a list of IR statements (parameter assignments + body),
         and returns the result variable name as an IRName.
         """
-        from tack.lang.call_bindings import CallBindings
         func_name = func_obj.name
         funcdef = func_obj._funcdef
-        callee_bindings = CallBindings(funcdef, func_obj.func,
-                                      template_funcs=self._template_funcs)
-        validate_source(funcdef, kind='Device function', call_bindings=callee_bindings)
+        _, bindings, n_returns, assigned_names = self._callee(func_obj)
+        callee_bindings = bindings.copy()       # takes this call's renamed locals
 
         # Save and reset _pre_stmts so nested inlining doesn't interfere
         saved_pre_stmts = self._pre_stmts
@@ -174,8 +176,7 @@ class Inlining:
         for param_name in callee_params:
             rename_map[param_name] = self._fresh_name(f"__{func_name}_{param_name}_{suffix}__")
 
-        # Detect return count: 0=void, 1=scalar, >1=tuple
-        n_returns = self._detect_return_count(funcdef)
+        # Return count: 0=void, 1=scalar, >1=tuple
         if n_returns == 0:
             result_var = None
         elif n_returns > 1:
@@ -186,7 +187,6 @@ class Inlining:
 
         # Rename all local variables in the callee body to avoid collisions
         # We collect all assigned names and create renames for them
-        assigned_names = self._collect_assigned_names(funcdef.body)
         for name in sorted(assigned_names):
             if name not in rename_map:
                 rename_map[name] = self._fresh_name(f"__{func_name}_{name}_{suffix}__")
@@ -290,6 +290,20 @@ class Inlining:
             return TupleValue(self._result_value(v) for v in result_var)
 
         return self._result_value(result_var)
+
+    def _callee(self, func_obj):
+        """``(funcdef, bindings, return count, assigned names)`` of a device
+        function, its source validated, once a lowering."""
+        funcdef = func_obj._funcdef
+        facts = self._callees.get(id(funcdef))
+        if facts is None:
+            from tack.lang.call_bindings import CallBindings
+            bindings = CallBindings(funcdef, func_obj.func, template_funcs=self._template_funcs)
+            validate_source(funcdef, kind='Device function', call_bindings=bindings)
+            facts = self._callees[id(funcdef)] = (
+                funcdef, bindings, self._detect_return_count(funcdef),
+                self._collect_assigned_names(funcdef.body))
+        return facts
 
     def _result_value(self, result_var: str):
         """An inlined call's result: a name, a vector's component names, or the items

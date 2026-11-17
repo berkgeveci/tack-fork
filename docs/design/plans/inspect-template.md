@@ -1,7 +1,8 @@
 # Inspecting device-class objects
 
-**Status: proposed.** Issue [#324](https://github.com/Kitware/tack/issues/324),
-2026-11-14.
+**Status: done.** Issue [#324](https://github.com/Kitware/tack/issues/324),
+2026-11-14. Carried out in [#457](https://github.com/Kitware/tack/pull/457),
+merged 2026-11-15; see [How it came out](#how-it-came-out).
 
 ## Summary
 
@@ -290,6 +291,47 @@ methods asked about are ones each view has, not one list for all.
 All CPU: inspection touches no device, which the patched device reads
 check. A view of GPU arrays is shown the same way, and needs no hardware run
 of its own.
+
+## How it came out
+
+[#457](https://github.com/Kitware/tack/pull/457) carried out D1 to D5 as
+recommended: `tack.inspect_template` in `lang/inspect_template.py`, the
+classification shared with lowering, `template_func_owners`,
+`CallBindings.lookup`, and `_tack_composition` on view classes. The tests
+are 29 in tack-core and 18 in tack-vis, all in the quick tier.
+
+**Where it departs from the plan:**
+
+- **D6:** two commits for the work, not three. The one-method query shares the
+  report's module and helpers, so it was not split out. Two more commits came
+  from review (below).
+- **Tests, D2:** the equivalence with `classify_template_attrs` is checked on
+  six fixed objects (a user template with nested objects, a leaf,
+  `CountingArray`, `Permutation`, `Concatenate`, `ConstantArray`), not on
+  every device class the template test modules define.
+- **Tests, views:** there is no points domain, so face and edge domain views
+  stand in for the "node view". A table-backed H1 field view is covered.
+- **D4's example:** a source location is given from the top-level package
+  (`tack/dataset/views.py:1400`), not from the repository root.
+
+**What review added.** The review of #457 found three places where inspection
+could disagree with lowering, or run code. Each is fixed, with a test that
+runs the kernel or the compiler's classification first:
+
+- **A held device function shadows a method of its name,** as lowering's
+  `_template_nodes` has it. D4's call targets and the method query follow
+  that, and the methods list marks a shadowed method "not used".
+- **`len(obj)` is `obj.__len__()` whatever `len` is bound to,** since
+  `_Indexing` rewrites it from the syntax alone.
+- **No metaclass code runs (D2, extended).** Class values (the constants,
+  `__tack_iterate__`, the `_device_class` mark, the property checks) are read
+  from the classes' dictionaries (`_static`, `_is_template_static`,
+  `iteration_space(cls, read)`), never with `getattr`. A value Python would
+  run code for is "not read", and a metaclass that defines
+  `__getattribute__` is named in the report, since lowering reads class values
+  through it. Class metadata (`__qualname__`, `__mro__`) is still read through
+  Python's attribute lookup. The flag that asks for all this is
+  `inspecting=True` (D2's "scan without storing").
 
 ## Not in this plan
 

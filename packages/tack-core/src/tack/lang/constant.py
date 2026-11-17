@@ -217,11 +217,8 @@ def constant_table(value):
 
 def constant_ir(value):
     """The IR for reading a scalar ``value``, or None when it is not a tack.constant."""
+    if not isinstance(value, (IntConstant, FloatConstant)):
+        return None             # most names lowering asks about: no import on this path
     from tack.lang import ir
-    if isinstance(value, IntConstant):
-        literal = ir.IRConstant(int(value))
-    elif isinstance(value, FloatConstant):
-        literal = ir.IRConstant(float(value))
-    else:
-        return None
+    literal = ir.IRConstant(int(value) if isinstance(value, IntConstant) else float(value))
     return literal if value.dtype is None else ir.IRCast(value=literal, dtype=value.dtype)

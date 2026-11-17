@@ -330,8 +330,11 @@ b = make_backend()
 for _ in range(5):
     b.execute(elementwise, (x, out, 64), {})
 verifier.verify_ir = real_verify
+# Every stage with TACK_VERIFY_ALL (the suite's setting) or in debug mode;
+# otherwise only the final one, as users compile.
 check("GPU boundaries verified once", verified ==
-      ["resolved", "inferred", "localized", "optimized", "packed", "typed"])
+      (["resolved", "inferred", "localized", "optimized", "packed", "typed"]
+       if verifier.verify_all else ["typed"]))
 
 # --- bad packing cannot reach device compilation or the cache -------
 import tack.lang.ir_pack_scalars as packing

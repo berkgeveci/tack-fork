@@ -38,6 +38,11 @@ class IRFunction(IRNode):
     #: ``dst.base.values``), for diagnostics. Set by lowering from the
     #: template rewrite; kept in the disk cache with the IR.
     held_arrays = {}
+    #: The workgroup primitives a lowered template requires
+    #: (``workgroup_support.workgroup_features``), recorded by lowering and
+    #: read by ``check_workgroup_support(cache_features=True)``; None until
+    #: found. Only immutable templates carry it.
+    _workgroup_features = None
 
     def __init__(self, name: str, params: list, body: list):
         self.name = name

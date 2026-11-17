@@ -238,8 +238,9 @@ CPU, blocks read 1.5 to 1.8 times and write about twice as fast. So the
 default, `layout="auto"`, is `"cells"` for order 3 and up on a GPU and
 `"blocks"` everywhere else. Moving a dataset to another device may change an
 `"auto"` layout, and `to_device` then reorders the values. Corner values
-(orders 0 and 1), an order per cell, and `L2` on triangles, tetrahedra and
-wedges are always blocks.
+(orders 0 and 1), an order per cell (any orders, each cell's values together
+at `offsets[c]`), and `L2` on triangles, tetrahedra and wedges are always
+blocks.
 
 Every operation gives the same answer in either layout; only the order of
 `field.values` differs. `space.blocks(values)` reads them per cell, an array

@@ -475,6 +475,54 @@ reading an explicit connectivity array, would run the same `cell_average`
 kernel on an unstructured mesh. See also
 [Data](../data/index.md), whose mesh views follow this pattern.
 
+## See what an object brings
+
+`tack.inspect_template` describes an object as a kernel will see it: what is
+compiled in and what is passed at each call, the arrays and objects it holds,
+and which class defines each method. Given a method's name, it shows where
+that method is and what it calls. It runs nothing, so it is safe on any
+object, however large its arrays.
+
+<!-- tack-check: device-classes-inspect -->
+```python
+import tack
+
+tack.set_default_device("cpu")
+
+@tack.device_class
+class Scaled:
+    FACTOR = 2.0                        # compiled in
+
+    def __init__(self, values, offset):
+        self.values = values            # an array
+        self.offset = offset            # passed at each call
+
+    @tack.func
+    def get(self, i):
+        return self.values[i] * self.FACTOR + self.offset
+
+    @tack.func
+    def __getitem__(self, i):
+        return self.get(i)
+
+s = Scaled(tack.arange(4, dtype=tack.f32), 1.0)
+text = tack.inspect_template(s)
+print(text)
+assert "FACTOR = 2.0" in text.split("compiled in:")[1]
+assert "offset = 1.0" in text.split("passed at run time:")[1]
+
+method = tack.inspect_template(s, "__getitem__")
+print(method)
+assert "self.get(i)  -> Scaled.get" in method
+```
+
+The first call prints the class, `FACTOR` under "compiled in", `offset`
+under "passed at run time", the array's shape, element type and device, and
+both methods with the file and line of each. The second names the class
+that defines `__getitem__` and the calls in its source: here `self.get(i)`,
+resolved to `Scaled.get`. Those calls are read from the source, so a call in
+a branch that is never taken is listed too.
+
 ## Details
 
 **Instance numbers that shadow class constants.** A number set on the

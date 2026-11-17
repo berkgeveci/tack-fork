@@ -27,12 +27,14 @@ NAME_LIST_ARRAYS = {
 
 def ir_names(root):
     """Return all variable spellings, including allocation/texture references."""
-    names = {name for node in walk_ir(root)
-             for attr in NAME_ARRAYS.get(type(node), ())
-             if (name := getattr(node, attr)) is not None}
-    names.update(name for node in walk_ir(root)
-                 for attr in NAME_LIST_ARRAYS.get(type(node), ())
-                 for name in getattr(node, attr) or ())
+    names = set()
+    for node in walk_ir(root):          # one walk: a large kernel's tree is 30K nodes
+        kind = type(node)
+        for attr in NAME_ARRAYS.get(kind, ()):
+            if (name := getattr(node, attr)) is not None:
+                names.add(name)
+        for attr in NAME_LIST_ARRAYS.get(kind, ()):
+            names.update(getattr(node, attr) or ())
     return names
 
 

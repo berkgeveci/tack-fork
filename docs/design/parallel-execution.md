@@ -247,7 +247,8 @@ provides that; a CPU thread pool does not.
 `workgroup_features` (`lang/workgroup_support.py`) walks the IR and collects
 every primitive that needs the model: `shared`, `shared_like`, `barrier`,
 `thread_id` and `block_<op>`. The walk is structural, so a primitive in an
-unreachable branch or an inlined device function still counts.
+unreachable branch or an inlined device function still counts, except in an
+arm that constants decide against, which lowering drops.
 `check_workgroup_support` raises `NotImplementedError` naming the kernel,
 the backend and the primitives when the backend lacks the capability. It
 runs at three points:
@@ -549,7 +550,8 @@ dtype from the parameter rather than trusting an earlier annotation.
 
 It runs before optimization in `resolve_variant`, in every inspection mode,
 and in every generator. The check is structural: an atomic in unreachable
-code, or in a kernel launched with an empty range, is still checked.
+code, or in a kernel launched with an empty range, is still checked (an arm
+that constants decide against is not lowered, so not checked).
 `Kernel.__call__` re-raises `TypeError` with the kernel name prefixed.
 
 ### Alignment

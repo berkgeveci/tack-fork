@@ -137,3 +137,25 @@ def test_copy_substitution_does_not_change_an_earlier_shared_expression():
     assert changed[2].value.left.name == 'parameter'
     assert changed[0].value is not changed[2].value
     assert shared.left.name == 'alias'
+
+
+def test_substitute_copies_only_the_nodes_above_a_replacement():
+    from tack.lang.ir_traversal import substitute_ir
+
+    shared = ir.IRBinOp('+', ir.IRName('a'), ir.IRConstant(1))
+    kept = ir.IRBinOp('*', ir.IRName('b'), ir.IRConstant(2))
+    first = ir.IRAssign('x', shared)
+    second = ir.IRAssign('y', ir.IRBinOp('-', shared, kept))
+    body = [first, second]
+
+    def replace(node):
+        return ir.IRName('p') if isinstance(node, ir.IRName) and node.name == 'a' else None
+
+    assert substitute_ir(kept, replace) is kept
+    out = substitute_ir(body, replace)
+    assert out is not body and out[0] is not first and out[1] is not second
+    assert out[1].value.right is kept                  # unchanged subtree, not copied
+    assert out[0].value.left.name == 'p' and out[1].value.left.left.name == 'p'
+    # Nothing changed in place: the shared node and the input still read `a`.
+    assert shared.left.name == 'a' and first.value is shared
+    assert substitute_ir([kept], replace)[0] is kept

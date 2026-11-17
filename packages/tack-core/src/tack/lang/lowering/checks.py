@@ -42,6 +42,10 @@ class LoweringChecks:
         # Where each name is first read: name -> (line, column, device
         # function it was inlined from or None). Only for diagnostics.
         self._name_reads: dict[str, tuple] = {}
+        # Names assigned in an arm that constants decided against, which is
+        # not lowered: name -> (the condition's source, its line). Only for
+        # the error a read of one gives.
+        self._decided_away: dict[str, tuple] = {}
 
     def _check_outside_parallel_loop(self, stmt, lowered: list):
         """Reject an observable effect lowered outside the parallel loop.
@@ -122,6 +126,14 @@ class LoweringChecks:
                 if inlined_from is not None:
                     where = (f"Device function '{inlined_from}' "
                              f"(inlined into kernel '{function.name}')")
+            decided = self._decided_away.get(name)
+            if decided is not None:
+                condition, line = decided
+                raise NameError(
+                    f"{where}: name '{name}'{at} is assigned only in the arm of "
+                    f"`if {condition}` (line {line}) that constants decide against, "
+                    f"and that arm is not lowered: assign it before the `if`, or "
+                    f"in the arm taken too.")
             raise NameError(
                 f"{where}: name '{name}'{at} is not a parameter and is never "
                 f"assigned. Kernels do not capture Python variables from the "
@@ -144,6 +156,8 @@ class LoweringChecks:
         path, so `assign it before the loop` is always a valid fix.
         """
         def read(expr, stale):
+            if not stale:           # no loop has ended yet here: nothing to look for
+                return
             for n in walk_ir(expr):
                 if isinstance(n, ir.IRName) and n.name in stale:
                     raise self._loop_variable_error(function, n)
