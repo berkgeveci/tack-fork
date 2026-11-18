@@ -52,6 +52,8 @@ CHILD_FIELDS = {
                        ('errors', 'expr')),
     ir.IRTextureSample: (('coords', 'exprs'),),
     ir.IRTableLoad: (('index', 'expr'),),
+    ir.IRIndirectLoad: (('table', 'expr'), ('box', 'expr'), ('index', 'expr'),
+                        ('like', 'expr')),
 }
 
 LIST_ROLES = {'functions', 'params', 'stmts', 'exprs'}

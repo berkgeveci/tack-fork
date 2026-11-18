@@ -922,6 +922,14 @@ class KernelTransformer(
         if func_name == "thread_id":
             return ir.IRThreadId()
 
+        # A load through a table of addresses: tack.indirect_load(table, box, index, like)
+        if func_name == "indirect_load":
+            if len(node.args) != 4:
+                raise NotImplementedError(
+                    "indirect_load() takes exactly 4 arguments (table, box, index, like)")
+            table, box, index, like = self._visit_ordered(node.args)
+            return ir.IRIndirectLoad(table, box, index, like)
+
         # Atomic operations: atomic_add, atomic_min, atomic_max
         if func_name in ("atomic_add", "atomic_min", "atomic_max"):
             if len(node.args) != 3:

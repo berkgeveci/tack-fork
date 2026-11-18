@@ -283,6 +283,16 @@ def _annotate_expr(node, env, array_params) -> ScalarType | None:
         _annotate_expr(node.index, env, array_params)
         return node.dtype
 
+    if isinstance(node, ir.IRIndirectLoad):
+        _annotate_expr(node.box, env, array_params)
+        _annotate_expr(node.index, env, array_params)
+        like = _get_array_name(node.like)
+        if like is None or like not in env:
+            raise TypeError("tack.indirect_load(table, box, index, like): 'like' must be "
+                            "an array argument of the element type")
+        node.dtype = env[like]
+        return node.dtype
+
     if isinstance(node, ir.IRTextureSample):
         for c in node.coords:
             _annotate_expr(c, env, array_params)

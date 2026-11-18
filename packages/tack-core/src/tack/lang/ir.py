@@ -408,6 +408,23 @@ class IRTableLoad(IRNode):
         self.index = index
 
 
+class IRIndirectLoad(IRNode):
+    """``table[box][index]``: a load through a table of addresses.
+
+    ``table`` is an i64 array holding one address per box (the start of
+    that box's own array); ``like`` is an array of the element type, which
+    gives the load its dtype. Lets one launch read many separately
+    allocated arrays (CPU only, prototype).
+    """
+
+    def __init__(self, table, box, index, like):
+        self.table = table
+        self.box = box
+        self.index = index
+        self.like = like
+        self.dtype = None
+
+
 class IRTextureSample(IRNode):
     """Sample a 3D texture at normalized coordinates (u, v, w) in [0, 1].
 

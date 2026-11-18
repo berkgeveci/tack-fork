@@ -206,6 +206,8 @@ class LLVMCodeGen:
         """Emit an expression and return its LLVM value."""
         if isinstance(node, ir.IRTableLoad):
             return self._emit_table_load(node)
+        if isinstance(node, ir.IRIndirectLoad):
+            return self._emit_indirect_load(node)
         if isinstance(node, ir.IRConstant):
             return self._emit_constant(node)
         if isinstance(node, ir.IRName):
@@ -1124,6 +1126,24 @@ class LLVMCodeGen:
         # Track unsigned values for correct coercion (uitofp vs sitofp)
         dtype = getattr(node, 'dtype', None)
         if dtype in (u8, u16, u32, u64):
+            self._unsigned_vals.add(id(val))
+        return val
+
+    def _emit_indirect_load(self, node: ir.IRIndirectLoad) -> llvm_ir.Value:
+        """``table[box][index]``: the box's address from the table, then the element."""
+        i64_type = llvm_ir.IntType(64)
+        table = self._emit_expr(node.table)
+        like = self._emit_expr(node.like)
+        box = self._to_i64(self._emit_expr(node.box))
+        index = self._to_i64(self._emit_expr(node.index))
+        slot = self.builder.gep(table, [box], inbounds=True, name="indirect.slot")
+        address = self.builder.load(slot, name="indirect.address", align=8)
+        if address.type != i64_type:
+            address = self.builder.bitcast(address, i64_type)
+        base = self.builder.inttoptr(address, like.type, name="indirect.base")
+        elem_ptr = self.builder.gep(base, [index], inbounds=True, name="indirect.ptr")
+        val = self.builder.load(elem_ptr, name="indirect.val", align=1)
+        if node.dtype in (u8, u16, u32, u64):
             self._unsigned_vals.add(id(val))
         return val
 

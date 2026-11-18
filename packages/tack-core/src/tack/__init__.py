@@ -118,6 +118,12 @@ def thread_id():
     """Thread index within workgroup. Only usable inside a @tack.kernel."""
     raise RuntimeError("thread_id() can only be used inside a @tack.kernel")
 
+def indirect_load(table, box, index, like):
+    """``table[box][index]``, ``table`` an i64 array of addresses, one per box, and
+    ``like`` an array of the element type. CPU only (prototype). Only usable inside
+    a @tack.kernel."""
+    raise RuntimeError("indirect_load() can only be used inside a @tack.kernel")
+
 # Atomic operations — only usable inside @tack.kernel
 def atomic_add(array, index, value):
     """Atomic add: array[index] += value. Only usable inside a @tack.kernel."""
@@ -240,6 +246,7 @@ __all__ = [
     "block_max",
     "block_min",
     "block_sum",
+    "indirect_load",
     "concat",
     "constant",
     "copyto",
