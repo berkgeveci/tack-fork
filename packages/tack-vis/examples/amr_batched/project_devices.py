@@ -2,6 +2,7 @@
 an iteration a point (box search + div/mod), a box, or a point row (box, k, j) from a
 precomputed table. Kernel time only (warm, synchronized, best of 5); every result
 compared with the CPU's per-box one."""
+import os
 import time
 
 import numpy as np
@@ -208,7 +209,7 @@ def rows_rest(cells, cell_start, point_start, dims, row_box, row_j, row_k, lanes
 
 
 tack.set_default_device("cpu")
-amr = read_plotfile("/Users/berk.geveci/Data/amrwind/plt255900", fields=["mag_vorticity"],
+amr = read_plotfile(os.environ.get("AMRWIND_PLOTFILE", os.path.expanduser("~/Data/amrwind/plt255900")), fields=["mag_vorticity"],
                     blank=False)
 data = ta._as_dataset(amr)
 boxes = [box for _, box in data]

@@ -18,7 +18,6 @@ import numpy as np
 
 import tack
 
-sys.path.insert(0, os.path.expanduser("~/Work/amrex-reader"))
 from amrex_reader import read_plotfile  # noqa: E402
 
 parser = argparse.ArgumentParser()
@@ -47,7 +46,7 @@ def stage(label, seconds):
 
 
 t = T()
-amr = read_plotfile(os.path.expanduser("~/Data/amrwind/plt255900"), fields=[FIELD],
+amr = read_plotfile(os.environ.get("AMRWIND_PLOTFILE", os.path.expanduser("~/Data/amrwind/plt255900")), fields=[FIELD],
                     max_level=args.max_level, blank=False)
 stage("read", T() - t)
 

@@ -17,10 +17,9 @@ import numpy as np
 
 import tack
 
-sys.path.insert(0, os.path.expanduser("~/Work/amrex-reader"))
 from amrex_reader import read_plotfile  # noqa: E402
 
-PLOTFILE = os.path.expanduser("~/Data/amrwind/plt255900")
+PLOTFILE = os.environ.get("AMRWIND_PLOTFILE", os.path.expanduser("~/Data/amrwind/plt255900"))
 
 
 def timed(label, fn):

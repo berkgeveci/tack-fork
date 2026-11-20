@@ -19,7 +19,6 @@ import numpy as np
 
 import tack
 
-sys.path.insert(0, os.path.expanduser("~/Work/amrex-reader"))
 from amrex_reader import read_plotfile  # noqa: E402
 
 parser = argparse.ArgumentParser()
@@ -41,7 +40,7 @@ from tack.interop.vtk import algorithms as ta  # noqa: E402
 
 T = time.perf_counter
 t = T()
-amr = read_plotfile(os.path.expanduser("~/Data/amrwind/plt255900"), fields=["mag_vorticity"],
+amr = read_plotfile(os.environ.get("AMRWIND_PLOTFILE", os.path.expanduser("~/Data/amrwind/plt255900")), fields=["mag_vorticity"],
                     max_level=args.max_level, blank=False)
 print(f"read: {T() - t:.1f} s", flush=True)
 t = T()

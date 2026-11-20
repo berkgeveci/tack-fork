@@ -1,4 +1,5 @@
 """Where amr_project's 1.4 s goes: setup, allocation, the kernel, and variants."""
+import os
 import time
 
 import numpy as np
@@ -58,7 +59,7 @@ def _by_box(cells, cell_start, point_start, dims, out):
                     p = p + 1
 
 
-amr = read_plotfile("/Users/berk.geveci/Data/amrwind/plt255900", fields=["mag_vorticity"],
+amr = read_plotfile(os.environ.get("AMRWIND_PLOTFILE", os.path.expanduser("~/Data/amrwind/plt255900")), fields=["mag_vorticity"],
                     blank=False)
 data = ta._as_dataset(amr)
 print("fields per box:", list(next(iter(data))[1].fields.keys()))
