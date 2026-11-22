@@ -53,7 +53,7 @@ def test_over_limit_launch_is_refused_before_dispatch(workgroup_backend, monkeyp
     _fill_ones(at_limit)
     assert at_limit.numpy().min() == 1.0
 
-    over = tack.empty((1025,))
+    over = tack.zeros((1025,))      # a new array's contents are unspecified
     with pytest.raises(ValueError, match="Kernel '_fill_ones': 1025 iterations exceed the 1024"):
         _fill_ones(over)
     assert over.numpy().max() == 0.0
