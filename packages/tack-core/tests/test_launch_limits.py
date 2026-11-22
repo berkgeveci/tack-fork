@@ -53,7 +53,7 @@ def test_over_limit_launch_is_refused_before_dispatch(workgroup_backend, monkeyp
     _fill_ones(at_limit)
     assert at_limit.numpy().min() == 1.0
 
-    over = tack.empty((1025,))
+    over = tack.zeros((1025,))         # zeros: a new array's contents are unspecified
     with pytest.raises(ValueError, match="Kernel '_fill_ones': 1025 iterations exceed the 1024"):
         _fill_ones(over)
     assert over.numpy().max() == 0.0
@@ -81,9 +81,9 @@ def test_native_reduction_counts_every_element(reduction_backend, n):
 
 def test_launch_past_2_32_iterations_reaches_every_index(workgroup_backend):
     # Only the last 256 of 2^32 + 256 iterations store, so the array stays
-    # tiny. A 32-bit index never reaches them, and they stayed zero.
+    # tiny. A 32-bit index never reaches them, and they stay zero.
     base = 2**32
-    out = tack.empty((256,), tack.i32)
+    out = tack.zeros((256,), tack.i32)
     if get_backend().name in ('hip', 'metal'):
         # One launch there indexes at most 2^32 threads: refuse, not wrap.
         with pytest.raises(ValueError, match="iterations exceed"):
