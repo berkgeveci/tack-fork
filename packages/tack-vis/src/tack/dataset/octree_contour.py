@@ -10,7 +10,8 @@ needed.
    subtree, a level at a time from the finest (each refined node over its
    children). They depend on the field alone, so every contour value shares
    them.
-2. **Descent.** From the roots, a level at a time: a node is kept when the
+2. **Descent.** From the roots, a level at a time (on a GPU a thread a
+   neighbour's search, on the CPU a thread a node: ``_split_searches``): a node is kept when the
    range over it and its 26 neighbours at its level holds the value (a
    neighbour is the node at that level, or the coarser leaf holding the
    place). A kept refined node's children are the next level's nodes; a kept
@@ -150,6 +151,55 @@ def _kept_codes(frontier, nlo, nhi, marks, refined, value, span, packed):
 
 
 @tack.kernel
+def _kept_codes_chained(frontier, tree, carried, level, key, count, nx, ny, nz, finest,
+                        dimension, marks, refined, lo, hi, value, packed):
+    # The CPU's form of _neighbour_ranges and _kept_codes in one: each thread
+    # searches its node's 26 neighbours in turn, the ranges kept in registers.
+    for k in range(packed.shape[0]):
+        n = frontier[k]
+        lv = level[n]
+        t = tree[n]
+        i, j, m = _unkey(key[n], lv, dimension)
+        gi = ((t % nx) << tack.i64(lv)) + tack.i64(i)
+        gj = (((t // nx) % ny) << tack.i64(lv)) + tack.i64(j)
+        gk = ((t // (nx * ny)) << tack.i64(lv)) + tack.i64(m)
+        side = tack.i64(1) << tack.i64(lv)
+        mask = side - 1
+        a = lo[n]
+        b = hi[n]
+        zs = 3 if dimension == 3 else 1
+        for dz in range(zs):
+            for dy in range(3):
+                for dx in range(3):
+                    qi = gi + dx - 1
+                    qj = gj + dy - 1
+                    qk = gk + dz - 1 if dimension == 3 else gk
+                    if qi >= 0 and qj >= 0 and qk >= 0 and qi < nx * side and \
+                            qj < ny * side and qk < nz * side:
+                        t2 = (qi >> tack.i64(lv)) + nx * ((qj >> tack.i64(lv)) +
+                                                          ny * (qk >> tack.i64(lv)))
+                        code = _interleave(tack.u64(qi & mask), tack.u64(qj & mask),
+                                           tack.u64(qk & mask), lv, dimension)
+                        c = code << tack.u64(dimension * (finest - lv))
+                        q = _lower_bound(tree, carried, level, count, t2, c, lv + 1) - 1
+                        a = min(a, lo[q])
+                        b = max(b, hi[q])
+        packed[k] = tack.i64(0)
+        if a <= value and value <= b:
+            packed[k] = tack.i64(1) << tack.i64(32) if (marks[n] & refined) != 0 \
+                else tack.i64(1)
+
+
+def _split_searches(device):
+    """Whether the descent and the cells take a thread a search (GPUs: a chain of
+    26 or 8 dependent searches a thread left the early, small levels bound by
+    memory latency) or a thread a node or corner, the searches in turn (the
+    CPU: the split form writes and reads back 27 ranges a node and 64 holders a
+    leaf that the chains keep in registers, 15-20% of one thread)."""
+    return device.type != "cpu"
+
+
+@tack.kernel
 def _split(frontier, packed, numbers, leaves, refined):
     # Kept leaves and kept refined nodes, each in frontier order, from one scan
     # of the packed counts (leaves in the low 32 bits, refined nodes above).
@@ -181,6 +231,7 @@ def _active_leaves(octree, r, value):
 
     d = octree.dimension
     span = 27 if d == 3 else 9
+    split = _split_searches(octree.device)
     nx, ny, nz = ([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3]
     tree, carried, level, count = _search_arrays(octree)
     with octree.device:
@@ -188,12 +239,18 @@ def _active_leaves(octree, r, value):
         active = []
         while len(frontier):
             f = len(frontier)
-            nlo, nhi = tack.empty((f * span,), r.lo.dtype), tack.empty((f * span,), r.lo.dtype)
-            _neighbour_ranges(frontier, tree, carried, level, octree.key, count, nx, ny, nz,
-                              octree.finest, d, r.lo, r.hi, nlo, nhi)
             packed = tack.empty((f,), tack.i64)
-            _kept_codes(frontier, nlo, nhi, octree.marks, int(Ghosts.REFINEDCELL),
-                        float(value), span, packed)
+            if split:
+                nlo = tack.empty((f * span,), r.lo.dtype)
+                nhi = tack.empty((f * span,), r.lo.dtype)
+                _neighbour_ranges(frontier, tree, carried, level, octree.key, count, nx, ny,
+                                  nz, octree.finest, d, r.lo, r.hi, nlo, nhi)
+                _kept_codes(frontier, nlo, nhi, octree.marks, int(Ghosts.REFINEDCELL),
+                            float(value), span, packed)
+            else:
+                _kept_codes_chained(frontier, tree, carried, level, octree.key, count, nx, ny,
+                                    nz, octree.finest, d, octree.marks,
+                                    int(Ghosts.REFINEDCELL), r.lo, r.hi, float(value), packed)
             numbers = tack.empty((f,), tack.i64)
             total = int(inclusive_scan(packed, numbers, f))
             kept_leaves, kept_refined = total & 0xFFFFFFFF, total >> 32
@@ -266,6 +323,50 @@ def _owned_cells(active, cells, level, marks, hidden, values, value, corners, ke
 
 
 @tack.kernel
+def _owned_cells_chained(active, tree, carried, level, key, count, nx, ny, nz, finest,
+                         dimension, marks, hidden, values, value, cells, keep):
+    # The CPU's form of _corner_holders and _owned_cells in one: a thread a
+    # corner, its 8 slots searched in turn.
+    for e in range(keep.shape[0]):
+        corners = 1 << dimension
+        n = active[e // corners]
+        v = e % corners
+        lv = level[n]
+        t = tree[n]
+        i, j, m = _unkey(key[n], lv, dimension)
+        step = tack.i64(1) << tack.i64(finest - lv)
+        px = ((t % nx) << tack.i64(finest)) + (tack.i64(i) + tack.i64(v & 1)) * step
+        py = (((t // nx) % ny) << tack.i64(finest)) + (tack.i64(j) + tack.i64((v >> 1) & 1)) * step
+        pz = ((t // (nx * ny)) << tack.i64(finest)) + tack.i64(m) * step
+        if dimension == 3:
+            pz = pz + tack.i64((v >> 2) & 1) * step
+        ok = 1
+        owner = tack.i64(-1)
+        deepest = -1
+        a_min = values[n]
+        a_max = values[n]
+        for s in range(corners):
+            gi = px + tack.i64((s ^ (s >> 1)) & 1) - 1
+            gj = py + tack.i64((s >> 1) & 1) - 1
+            gk = pz
+            if dimension == 3:
+                gk = pz + tack.i64((s >> 2) & 1) - 1
+            q = _holder(gi, gj, gk, nx, ny, nz, finest, dimension, tree, carried, level, count)
+            cells[e * corners + s] = q
+            if q < 0:
+                ok = 0
+            elif (marks[q] & hidden) != 0:
+                ok = 0
+            else:
+                if level[q] > deepest:
+                    deepest = level[q]
+                    owner = q
+                a_min = min(a_min, values[q])
+                a_max = max(a_max, values[q])
+        keep[e] = 1 if ok == 1 and owner == n and a_min <= value and value <= a_max else 0
+
+
+@tack.kernel
 def _cell_rows(cells, keep, numbers, corners, out):
     for e in range(keep.shape[0]):
         if keep[e] == 1:
@@ -314,11 +415,16 @@ def crossing_cells(octree, r, value):
         cells = tack.empty((entries * corners,), tack.i64)
         keep = tack.empty((entries,), tack.i32)
         kept = 0
-        if entries:
+        if entries and _split_searches(octree.device):
             _corner_holders(active, tree, carried, level, octree.key, count, nx, ny, nz,
                             octree.finest, d, cells)
             _owned_cells(active, cells, level, octree.marks, int(Ghosts.HIDDENCELL), r.values,
                          float(value), corners, keep)
+        elif entries:
+            _owned_cells_chained(active, tree, carried, level, octree.key, count, nx, ny, nz,
+                                 octree.finest, d, octree.marks, int(Ghosts.HIDDENCELL),
+                                 r.values, float(value), cells, keep)
+        if entries:
             numbers = tack.empty((entries,), tack.i64)
             kept = int(inclusive_scan(keep, numbers, entries))
         rows = tack.empty((kept * corners,), tack.i64)

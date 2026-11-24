@@ -24,8 +24,11 @@ except ImportError:
     pass
 
 
-@pytest.fixture(autouse=True)
-def cpu():
+@pytest.fixture(autouse=True, params=["chained", "split"])
+def cpu(request, monkeypatch):
+    # The CPU's searches in turn, and the GPUs' a thread each, forced here.
+    if request.param == "split":
+        monkeypatch.setattr(oc, "_split_searches", lambda device: True)
     tack.set_default_device("cpu")
     yield
     tack.set_default_device("cpu")
