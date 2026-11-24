@@ -28,7 +28,8 @@ import numpy as np
 import tack
 from tack.dataset.octree import _unkey
 
-__all__ = ["OctreeFaces", "faces", "lattice_boxes", "parents", "subtree_ends"]
+__all__ = ["OctreeFaces", "faces", "lattice_boxes", "parents", "refined_by_level",
+           "subtree_ends"]
 
 #: Above every level, for the last node at a carried key.
 _DEEPEST = tack.constant(127, tack.i32)
@@ -193,13 +194,25 @@ def subtree_ends(octree):
         end = tack.empty((octree.num_nodes,), tack.i64)
         if octree.num_nodes:
             _next_nodes(end)
-            refined = ~octree.is_leaf
-            for level in range(octree.finest - 1, -1, -1):
-                nodes = np.flatnonzero(refined & (octree._level == level))
-                if len(nodes):
-                    _last_child_ends(tack.array(nodes.astype(np.int64)), d, end)
+            for nodes in refined_by_level(octree):
+                _last_child_ends(nodes, d, end)
     octree._subtree_ends = end
     return end
+
+
+def refined_by_level(octree):
+    """The refined nodes of each level, finest level first, as device i64 arrays
+    (empty levels left out), made once an octree: the order bottom-up passes
+    take them in."""
+    cached = getattr(octree, "_refined_levels", None)
+    if cached is None:
+        refined = ~octree.is_leaf
+        with octree.device:
+            cached = [tack.array(nodes.astype(np.int64)) for nodes in
+                      (np.flatnonzero(refined & (octree._level == level))
+                       for level in range(octree.finest - 1, -1, -1)) if len(nodes)]
+        octree._refined_levels = cached
+    return cached
 
 
 @tack.kernel
