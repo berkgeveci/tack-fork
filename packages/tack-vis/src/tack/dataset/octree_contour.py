@@ -32,7 +32,7 @@ import numpy as np
 
 import tack
 from tack.dataset.ghosts import Ghosts
-from tack.dataset.octree import _unkey
+from tack.dataset.octree import _compute_type, _unkey
 from tack.dataset.octree_topology import (
     _holder,
     _interleave,
@@ -79,12 +79,14 @@ class OctreeRanges:
         self.octree, self.name = octree, name
         n = octree.num_nodes
         self.ends = subtree_ends(octree)
+        # f64 where the device has it, else f32 (Metal).
+        dtype = _compute_type(octree.device, tack.f32)
         with octree.device:
-            values = octree._field(name).astype(tack.f64)
-            self.lo, self.hi = tack.empty((n,), tack.f64), tack.empty((n,), tack.f64)
+            values = octree._field(name).astype(dtype)
+            self.lo, self.hi = tack.empty((n,), dtype), tack.empty((n,), dtype)
             if n:
                 _leaf_ranges(values, octree.marks, int(Ghosts.REFINEDCELL | Ghosts.HIDDENCELL),
-                             float(np.finfo(np.float64).max), self.lo, self.hi)
+                             float(np.finfo(dtype.numpy_dtype).max), self.lo, self.hi)
                 refined = ~octree.is_leaf
                 for level in range(octree.finest - 1, -1, -1):
                     nodes = np.flatnonzero(refined & (octree._level == level))
