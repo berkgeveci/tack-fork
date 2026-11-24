@@ -179,7 +179,48 @@ def parents(octree):
 
 def subtree_ends(octree):
     """Where each node's subtree ends: its descendants are the nodes
-    ``[n + 1, end[n])``. A device i64 array."""
+    ``[n + 1, end[n])``. A device i64 array, made once an octree (it depends on
+    the tree alone). Bottom-up, a level at a time from the finest: a leaf's
+    subtree ends at the next node, and a refined node's where its last child's
+    does, its children found by hopping from the first (the next node) over
+    each child's subtree -- 2^d reads, no search. (A binary search for each
+    node's end, the first form, took 53 ms of one thread at 1.2M nodes.)"""
+    cached = getattr(octree, "_subtree_ends", None)
+    if cached is not None:
+        return cached
+    d = octree.dimension
+    with octree.device:
+        end = tack.empty((octree.num_nodes,), tack.i64)
+        if octree.num_nodes:
+            _next_nodes(end)
+            refined = ~octree.is_leaf
+            for level in range(octree.finest - 1, -1, -1):
+                nodes = np.flatnonzero(refined & (octree._level == level))
+                if len(nodes):
+                    _last_child_ends(tack.array(nodes.astype(np.int64)), d, end)
+    octree._subtree_ends = end
+    return end
+
+
+@tack.kernel
+def _next_nodes(end):
+    for n in range(end.shape[0]):
+        end[n] = n + 1
+
+
+@tack.kernel
+def _last_child_ends(nodes, dimension, end):
+    for k in range(nodes.shape[0]):
+        n = nodes[k]
+        c = n + 1
+        for j in range(1 << dimension):
+            c = end[c]
+        end[n] = c
+
+
+def _searched_subtree_ends(octree):
+    """``subtree_ends`` by a binary search for each node (the first form, kept to
+    check the bottom-up one)."""
     with octree.device:
         end = tack.empty((octree.num_nodes,), tack.i64)
         if octree.num_nodes:

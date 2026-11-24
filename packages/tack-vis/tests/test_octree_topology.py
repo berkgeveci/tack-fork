@@ -66,6 +66,7 @@ def test_parents_and_subtrees_are_the_keys(name, make):
     np.testing.assert_array_equal(ot.parents(octree).numpy(), expected)
 
     end = ot.subtree_ends(octree).numpy()
+    np.testing.assert_array_equal(end, ot._searched_subtree_ends(octree).numpy())
     lo, hi = _boxes(octree)
     for n in range(octree.num_nodes):
         inside = (tree == tree[n]) & (level > level[n]) & (lo >= lo[n]).all(axis=1) & \
