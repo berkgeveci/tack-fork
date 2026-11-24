@@ -100,3 +100,23 @@ def test_a_contour_of_the_dual_grid_is_vtks_and_closed(depth):
     assert np.isclose(mine[1], theirs[1], rtol=1e-7)
     assert mine[2] == 0                                   # no open edge: no crack
     assert mine[3] == theirs[3]
+
+
+@needs_vtk
+@pytest.mark.parametrize("dims", [(5, 4, 4), (5, 4, 1)])
+def test_the_device_build_is_the_hosts(dims):
+    from tack.dataset import octree_filters as of
+    from tack.dataset.octree_dual import _dual_grid_host
+
+    octree = _octree(dims)
+    s = octree.fields["phi"].numpy()
+    octree = of.threshold(octree, "phi", -np.inf, np.percentile(s, 80))   # some hidden
+    mine, theirs = dual_grid(octree), _dual_grid_host(octree)
+    corners = 8 if dims[2] > 1 else 4
+    a = np.asarray(mine.topology.connectivity.numpy()).reshape(-1, corners)
+    b = np.asarray(theirs.topology.connectivity.numpy()).reshape(-1, corners)
+    assert len(a) == len(b) > 0
+    np.testing.assert_array_equal(a[np.lexsort(a.T[::-1])], b[np.lexsort(b.T[::-1])])
+    np.testing.assert_array_equal(mine.geometry.values.numpy(), theirs.geometry.values.numpy())
+    np.testing.assert_array_equal(mine.fields["phi"].values.numpy(),
+                                  theirs.fields["phi"].values.numpy())
