@@ -52,21 +52,7 @@ CASES = _octrees()
 
 
 def _boxes(octree):
-    """Each node's box on the finest lattice over every root: lo, hi ``(n, 3)``."""
-    d, finest = octree.dimension, octree.finest
-    nx, ny, _ = ([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3]
-    tree, level, key = octree._tree, octree._level, octree._key
-    index = np.zeros((len(key), 3), np.int64)
-    for b in range(int(level.max()) + 1 if len(level) else 0):
-        for a in range(d):
-            index[:, a] |= ((key >> np.uint64(d * b + a)) & np.uint64(1)).astype(np.int64) << b
-    root = np.stack([tree % nx, (tree // nx) % ny, tree // (nx * ny)], axis=1)
-    step = (np.int64(1) << (finest - level)).astype(np.int64)
-    lo = (root << finest) + index * step[:, None]
-    hi = lo + step[:, None]
-    if d == 2:
-        lo[:, 2], hi[:, 2] = 0, 1
-    return lo, hi
+    return ot.lattice_boxes(octree)
 
 
 @pytest.mark.parametrize("name,make", CASES, ids=[c[0] for c in CASES])
