@@ -115,3 +115,13 @@ def test_an_axis_slice_is_the_octree_on_the_plane(name, make, axis):
         # The 2D leaves tile the plane.
         area = (axes[u][-1] - axes[u][0]) * (axes[v][-1] - axes[v][0])
         assert np.isclose(cut.measures()[cut.is_leaf].sum(), area)
+
+
+@pytest.mark.parametrize("name,make", [c for c in CASES if "3D" in c[0]],
+                         ids=[c[0] for c in CASES if "3D" in c[0]])
+def test_cell_gradients_are_exact_for_a_linear_field(name, make):
+    octree = make()
+    slope = np.array([0.7, -1.3, 2.1])
+    octree.fields["lin"] = tack.array(octree.centers() @ slope + 0.25, tack.f64)
+    got = of.cell_gradients(octree, "lin").numpy()
+    np.testing.assert_allclose(got, np.broadcast_to(slope, got.shape), atol=1e-9)

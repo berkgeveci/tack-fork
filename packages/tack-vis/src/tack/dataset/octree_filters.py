@@ -27,7 +27,7 @@ from tack.dataset.ghosts import Ghosts
 from tack.dataset.octree import OctreeDataSet, _root_axes
 from tack.dataset.octree_topology import subtree_ends
 
-__all__ = ["average_up", "axis_slice", "limit_depth", "threshold"]
+__all__ = ["average_up", "axis_slice", "cell_gradients", "limit_depth", "threshold"]
 
 
 @tack.kernel
@@ -204,3 +204,77 @@ def axis_slice(octree, axis, position):
     hidden = (octree.marks.numpy()[keep] & Ghosts.HIDDENCELL) != 0
     return OctreeDataSet(roots2, tree2, level[keep], key2, fields=fields, mask=hidden,
                          world=octree.world, units=octree.units)
+
+
+@tack.kernel
+def _lsq_gradients(leaf, offsets, neighbours, centers, values, nan, out):
+    # Least squares over the leaves across each leaf's faces, by inverse squared
+    # distance: the gradient a linear field has, exactly.
+    for c in range(leaf.shape[0]):
+        n = leaf[c]
+        x = centers[n]
+        v = values[n]
+        a00 = 0.0 * v
+        a01 = a00
+        a02 = a00
+        a11 = a00
+        a12 = a00
+        a22 = a00
+        b = tack.vec3(a00)
+        for k in range(offsets[c], offsets[c + 1]):
+            m = neighbours[k]
+            dx = centers[m] - x
+            w = 1.0 / dx.dot(dx)
+            dv = (values[m] - v) * w
+            a00 = a00 + w * dx[0] * dx[0]
+            a01 = a01 + w * dx[0] * dx[1]
+            a02 = a02 + w * dx[0] * dx[2]
+            a11 = a11 + w * dx[1] * dx[1]
+            a12 = a12 + w * dx[1] * dx[2]
+            a22 = a22 + w * dx[2] * dx[2]
+            b = b + dx * dv
+        a = tack.mat3(a00, a01, a02, a01, a11, a12, a02, a12, a22)
+        det = a.determinant()
+        if det > 0.0:
+            out[c] = a.inverse() @ b
+        else:
+            out[c] = tack.vec3(nan)
+
+
+def cell_gradients(octree, name):
+    """The gradient of cell field ``name`` at each visible leaf's centre, by least
+    squares over the visible leaves across its faces (``octree_topology.faces``),
+    weighted by inverse squared distance: exact for a linear field. A device
+    ``vec3`` array, one per leaf in the nodes' order (as ``leaves()``); NaN on a
+    hidden leaf, or one whose neighbours do not span the space."""
+    from tack.dataset.octree_topology import faces
+
+    if octree.dimension != 3:
+        raise ValueError("cell_gradients takes a 3D octree (a study)")
+    found = faces(octree)
+    small, large = (np.asarray(a.numpy()) for a in (found.small, found.large))
+    visible = (octree.marks.numpy() & Ghosts.HIDDENCELL) == 0
+    pair = (large >= 0) & visible[small] & visible[np.maximum(large, 0)]
+    a, b = small[pair], large[pair]
+    number = np.cumsum(octree.is_leaf) - 1
+    owner = np.concatenate([number[a], number[b]])
+    other = np.concatenate([b, a])
+    order = np.argsort(owner, kind="stable")
+    count = int(octree.is_leaf.sum())
+    offsets = np.concatenate([[0], np.cumsum(np.bincount(owner, minlength=count))])
+    leaf = np.flatnonzero(octree.is_leaf)
+    dtype = _compute_type(octree)
+    with octree.device:
+        out = tack.empty((count,), tack.vec3(dtype))
+        if count:
+            centers = tack.array(octree.centers().astype(dtype.numpy_dtype), tack.vec3(dtype))
+            _lsq_gradients(tack.array(leaf.astype(np.int64)), tack.array(offsets.astype(np.int64)),
+                           tack.array(other[order].astype(np.int64)), centers,
+                           octree._field(name).astype(dtype), float("nan"), out)
+    hidden = ~visible[leaf]
+    if hidden.any():
+        values = np.asarray(out.numpy())
+        values[hidden] = np.nan
+        with octree.device:
+            out = tack.array(values, tack.vec3(dtype))
+    return out
