@@ -215,9 +215,11 @@ _READ_ABOVE = 1 << 22
 #: On a GPU the descent starts at the first level of at least this many nodes,
 #: with every leaf above it: whether a node is kept depends on its own
 #: neighbourhood alone (its ancestors' test only saves work), and each level
-#: costs a GPU some launches (1-2 ms on an M1 Max) whatever its size. The CPU
-#: starts at the roots.
-_START_NODES = 1 << 14
+#: costs a GPU some launches whatever its size. But every node of the first
+#: level pays its 27 searches, which a GPU emulating 64-bit integers makes
+#: dear: on an M1 Max 4k saved 1-2 ms against the roots, 16k lost 1-5 and 64k
+#: 12-23 (28k to 1M leaves). The CPU starts at the roots.
+_START_NODES = 1 << 12
 
 
 @tack.kernel

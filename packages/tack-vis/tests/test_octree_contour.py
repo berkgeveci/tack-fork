@@ -27,9 +27,8 @@ except ImportError:
 @pytest.fixture(autouse=True, params=["chained", "split", "split from the roots"])
 def cpu(request, monkeypatch):
     # The CPU's searches in turn, and the GPUs' a thread each, forced here:
-    # starting deep as GPUs do (these trees reach 16k nodes at their finest
-    # level or none, so the descent starts there), and at the roots, reading no
-    # counts.
+    # starting deep as GPUs do (at the first level of 4k nodes), and at the
+    # roots, reading no counts.
     if request.param != "chained":
         monkeypatch.setattr(oc, "_split_searches", lambda device: True)
     if request.param == "split from the roots":
