@@ -212,6 +212,13 @@ def _split_searches(device):
 #: idle threads. The CPU reads every count (a read costs it nothing).
 _READ_ABOVE = 1 << 22
 
+#: On a GPU the descent starts at the first level of at least this many nodes,
+#: with every leaf above it: whether a node is kept depends on its own
+#: neighbourhood alone (its ancestors' test only saves work), and each level
+#: costs a GPU some launches (1-2 ms on an M1 Max) whatever its size. The CPU
+#: starts at the roots.
+_START_NODES = 1 << 14
+
 
 @tack.kernel
 def _advance(frontier, fcount, bound, packed, numbers, end, dimension, state, active,
@@ -263,14 +270,19 @@ def _active_leaves(octree, r, value):
     tree, carried, level, count = _search_arrays(octree)
     finest = octree.finest
     per_level = np.bincount(octree._level, minlength=finest + 2)
+    start = 0
+    if split:
+        deep = np.flatnonzero(per_level[:finest + 1] >= _START_NODES)
+        start = int(deep[0]) if len(deep) else finest
     with octree.device:
-        roots = np.flatnonzero(octree._level == 0).astype(np.int64)
-        frontier = tack.array(roots)
-        fcount = tack.array(np.array([len(roots)], np.int64))
-        bound = len(roots)
+        first = np.flatnonzero((octree._level == start) |
+                               (octree.is_leaf & (octree._level < start))).astype(np.int64)
+        frontier = tack.array(first)
+        fcount = tack.array(np.array([len(first)], np.int64))
+        bound = len(first)
         state = tack.zeros((1,), tack.i64)
         active = tack.empty((max(int(octree.is_leaf.sum()), 1),), tack.i64)
-        for lv in range(finest + 1):
+        for lv in range(start, finest + 1):
             if bound == 0:
                 break
             packed = tack.empty((bound,), tack.i64)
