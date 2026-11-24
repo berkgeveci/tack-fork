@@ -7,7 +7,7 @@ finest lattice."""
 
 import numpy as np
 import pytest
-from test_octrees import needs_vtk, ramses_like
+from test_octrees import ramses_like
 
 import tack
 import tack.dataset as td
