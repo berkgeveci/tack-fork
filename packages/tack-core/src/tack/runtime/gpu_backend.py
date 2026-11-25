@@ -110,6 +110,11 @@ class GPUBackend(Backend):
         verify_ir(packed, 'typed')
         if not self.supports_f64:
             refuse_f64(packed, self.label)
+        import sys
+        if "tack.cpp" in sys.modules and sys.modules["tack.cpp"].uses(packed):
+            raise NotImplementedError(
+                f"Kernel '{ir_func.name}' calls a C++ function (tack.cpp), which only "
+                f"the CPU backend compiles so far, not {self.label}")
         table = None
         limit = self._max_argument_bytes
         if limit is not None and argument_bytes(packed) > limit:

@@ -807,6 +807,15 @@ class KernelTransformer(
         func_obj = self._call_bindings.device_func(node.func)
         if func_obj is not None:
             return self._inline_func_call(func_obj, node)
+        extern = self._call_bindings.extern_func(node.func)
+        if extern is not None:
+            # A C++ function (tack.cpp) on scalars; a vector passes its components.
+            args = []
+            for arg in self._visit_ordered(node.args):
+                args.extend(arg) if isinstance(arg, list) else args.append(arg)
+            call = ir.IRCall(func_name=extern.name, args=args)
+            call.extern = extern
+            return call
         func_name = self._resolve_call_name(node)
 
         # A refusal the template rewrite left in a method body: raised only when

@@ -201,7 +201,7 @@ _TACK_VIS_INSTALL = (
     + ("" if "+" in __version__ or "dev" in __version__ else f"@v{__version__}")
     + "#subdirectory=packages/tack-vis'")
 
-_SUBMODULES = frozenset({"algorithms", "arrays", "cache", "communication", "math", "random",
+_SUBMODULES = frozenset({"algorithms", "arrays", "cache", "communication", "cpp", "math", "random",
                          "dataset", "interop"})
 
 

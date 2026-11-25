@@ -54,6 +54,7 @@ import itertools
 import math
 import os
 import platform
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -869,6 +870,15 @@ def _optimize_module(mod, target_machine):
     pm.run(mod, pb)
 
 
+def _link_cpp(mod, ir_func):
+    """Link the C++ a kernel calls (tack.cpp) into its parsed module, before the
+    optimizer, which inlines it. Nothing to do unless tack.cpp was imported."""
+    cpp = sys.modules.get("tack.cpp")
+    calls = cpp.uses(ir_func) if cpp is not None else ()
+    if calls:
+        cpp.link(mod, calls)
+
+
 def _compile_kernel(ir_func: ir.IRFunction) -> CompiledKernel:
     """JIT-compile a Tack IR function to native code via llvmlite."""
     # Generate LLVM IR
@@ -880,6 +890,8 @@ def _compile_kernel(ir_func: ir.IRFunction) -> CompiledKernel:
     # Parse and verify
     mod = llvm.parse_assembly(llvm_ir_str)
     mod.verify()
+
+    _link_cpp(mod, ir_func)
 
     # Run optimization passes (loop vectorization, unrolling, etc.)
     _optimize_module(mod, _create_target_machine())

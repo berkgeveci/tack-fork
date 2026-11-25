@@ -257,6 +257,11 @@ class IRAttribute(IRNode):
 class IRCall(IRNode):
     """Function/builtin call: func(args...)."""
 
+    #: The C++ function called (a `tack.cpp.ExternFunc`), or None for a builtin.
+    extern = None
+    #: An extern call's ``(result type, argument types)``, set by type annotation.
+    extern_types = None
+
     def __init__(self, func_name: str, args: list):
         self.func_name = func_name
         self.args = args

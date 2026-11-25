@@ -91,9 +91,18 @@ class CallBindings:
         value = self.resolve(node)
         return value if isinstance(value, Func) else None
 
+    def extern_func(self, node):
+        """The `tack.cpp.ExternFunc` ``node`` names, else None."""
+        import sys
+        cpp = sys.modules.get('tack.cpp')    # none exists unless it was imported
+        if cpp is None:
+            return None
+        value = self.resolve(node)
+        return value if isinstance(value, cpp.ExternFunc) else None
+
     def call_name(self, node):
         value = self.resolve(node)
-        if isinstance(value, Func):
+        if isinstance(value, Func) or self.extern_func(node) is not None:
             return ''  # not an intrinsic, including allocation/loop syntax
         name = node.id if isinstance(node, ast.Name) else getattr(node, 'attr', '')
         if isinstance(node, ast.Name) and value is _UNBOUND:

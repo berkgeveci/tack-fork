@@ -284,6 +284,8 @@ def fingerprint(value) -> tuple:
         return ("dynamic",)
     if isinstance(value, Func):
         return func_fingerprint(value)
+    if type(value).__module__ == "tack.cpp" and type(value).__name__ == "ExternFunc":
+        return value.fingerprint()
     if isinstance(value, Kernel):
         return ("kernel", *_function_name(value.func), _digest(value._source))
     if isinstance(value, IntConstant):

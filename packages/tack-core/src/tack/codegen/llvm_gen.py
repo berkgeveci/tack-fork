@@ -1232,8 +1232,22 @@ class LLVMCodeGen:
         )
 
     def _emit_call(self, node: ir.IRCall) -> llvm_ir.Value:
-        """Emit a math builtin call."""
+        """Emit a math builtin call, or a call of a C++ function (tack.cpp)."""
         args = [self._emit_expr(a) for a in node.args]
+        if node.extern is not None:
+            result, declared = node.extern_types
+            args = [self._coerce_to(a, _llvm_type(t), target_unsigned=t in UNSIGNED_TYPES)
+                    for a, t in zip(args, declared)]
+            symbol = node.extern.symbol(result, declared)
+            try:
+                fn = self.module.get_global(symbol)
+            except KeyError:
+                fn = llvm_ir.Function(self.module, llvm_ir.FunctionType(
+                    _llvm_type(result), [_llvm_type(t) for t in declared]), name=symbol)
+            value = self.builder.call(fn, args, name="cpp")
+            if result in UNSIGNED_TYPES:
+                self._unsigned_vals.add(id(value))
+            return value
         dtype = getattr(node, 'dtype', None)
         if dtype in (f32, f64):
             args = [self._coerce_to(a, _llvm_type(dtype)) for a in args]

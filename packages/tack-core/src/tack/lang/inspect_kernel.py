@@ -206,8 +206,9 @@ def _generate_source(kernel, args, optimize=False):
         if optimize:
             from llvmlite import binding as llvm
 
-            from tack.runtime.cpu import _create_target_machine, _optimize_module
+            from tack.runtime.cpu import _create_target_machine, _link_cpp, _optimize_module
             mod = llvm.parse_assembly(llvm_ir_str)
+            _link_cpp(mod, ir_func)
             mod.verify()
             tm = _create_target_machine()
             _optimize_module(mod, tm)
