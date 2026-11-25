@@ -24,11 +24,21 @@ except ImportError:
     pass
 
 
-@pytest.fixture(autouse=True, params=["counts read", "counts on device"])
+@pytest.fixture(autouse=True, params=["folded", "a kept kernel a level", "two levels a step",
+                                      "counts on device", "two levels, counts on device",
+                                      "a thread a child", "a thread a child, a kept kernel"])
 def cpu(request, monkeypatch):
-    # The CPU reads each level's count; a GPU leaves the small levels' on the
-    # device, launching over the level's node count: forced here.
-    if request.param == "counts on device":
+    # The descent's forms: the child rows tested as written (the default), or by
+    # a kernel a level; two levels a step; and the counts left on the device
+    # (as a GPU leaves the small levels'), launching over the level's node
+    # count: forced here.
+    if "kernel" in request.param:
+        monkeypatch.setattr(oc, "_FOLD_TEST", False)
+    if "two levels" in request.param:
+        monkeypatch.setattr(oc, "_LEVELS_PER_STEP", 2)
+    if "thread a child" in request.param:
+        monkeypatch.setattr(oc, "_split_children", lambda device: True)
+    if "on device" in request.param:
         monkeypatch.setattr(oc, "_reads_counts", lambda device, bound: False)
     tack.set_default_device("cpu")
     yield

@@ -33,6 +33,12 @@ the tree from its parent's, as VTK's Moore supercursor carries it.
    so every cell meeting it writes the same point to the same slot. In 2D,
    ``contour`` of the crossing cells.
 
+On Metal (f32): 8.8 ms at 1M leaves given the ranges, the descent 6.5 of it,
+with a thread a child row (``_advance_split``; a thread a node, its eight rows
+in turn, was 10.8: a GPU thread's serial chain is the cost at the small
+levels, not the launches -- folding the kept test into the advance saved one
+launch a level and 0.5 ms, leaving the counts on the device saved nothing).
+
 The first form searched the keys for each neighbour (27 a kept node, 64 an
 active leaf, each a binary search of 20 dependent reads): 13 ms of 8 threads
 for the descent at 1M leaves, 5 ms more for the cells, 4 ms for the general
@@ -119,23 +125,40 @@ def ranges(octree, name):
 
 
 @tack.func
-def _child_entry(rows, base, j, o, dimension, marks, refined, number, table):
-    # Child j's (its octant's bits, x lowest) neighbour at offset o, from its
-    # parent's row at rows[base:]: the child lattice position (u) of the
-    # neighbour is -1..2 along each axis, in the parent's neighbour at its half
-    # (-1, 0, 0, 1), at the octant of its parity.
+def _parent_offset(j, o, dimension):
+    # Child j's (its octant's bits, x lowest) neighbour at offset o is in its
+    # parent's neighbour at this offset of the parent's row: the child lattice
+    # position (u) of the neighbour is -1..2 along each axis, in the parent's
+    # neighbour at its half (-1, 0, 0, 1).
     ux = (j & 1) + o % 3 - 1
     uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
-    uz = 0
     po = (ux + 2) // 2 + 3 * ((uy + 2) // 2)
     if dimension == 3:
         uz = ((j >> 2) & 1) + o // 9 - 1
         po = po + 9 * ((uz + 2) // 2)
-    p = rows[base + po]
+    return po
+
+
+@tack.func
+def _octant(j, o, dimension):
+    # ...and, when that neighbour is refined, at this octant of it: the child
+    # lattice position's parity.
+    ux = (j & 1) + o % 3 - 1
+    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
+    c = ((ux + 2) & 1) + 2 * ((uy + 2) & 1)
+    if dimension == 3:
+        uz = ((j >> 2) & 1) + o // 9 - 1
+        c = c + 4 * ((uz + 2) & 1)
+    return c
+
+
+@tack.func
+def _descend(p, c, dimension, marks, refined, number, table):
+    # Entry p of a parent's row, at a child's: p itself (a leaf, or -1), or its
+    # child at octant c.
     if p >= 0:
         if (marks[p] & refined) != 0:
-            p = table[(number[p] - 1) * (1 << dimension) + ((ux + 2) & 1) + 2 * ((uy + 2) & 1) +
-                      4 * ((uz + 2) & 1)]
+            p = table[(number[p] - 1) * (1 << dimension) + c]
     return p
 
 
@@ -162,10 +185,11 @@ def _kept_rows(rows, fcount, bound, span, lo, hi, marks, refined, value, packed)
 
 @tack.kernel
 def _advance_rows(rows, fcount, bound, packed, numbers, span, dimension, marks, refined, number,
-                  table, state, active, next_rows):
+                  table, lo, hi, value, fold, state, active, next_rows, next_packed):
     # From one scan of the packed counts: a kept leaf's row goes to ``active``
     # after the ones before (``state[0]``), a kept refined node's children's
-    # rows to the next frontier.
+    # rows to the next frontier -- each tested as it is written when ``fold``
+    # is set (its packed code to ``next_packed``, in place of a kernel a level).
     for k in range(bound):
         if k < fcount[0]:
             p = packed[k]
@@ -179,34 +203,202 @@ def _advance_rows(rows, fcount, bound, packed, numbers, span, dimension, marks, 
                 else:
                     corners = 1 << dimension
                     for j in range(corners):
-                        base = ((high - 1) * corners + j) * span
+                        at = (high - 1) * corners + j
+                        base = at * span
                         for o in range(span):
-                            next_rows[base + o] = _child_entry(rows, k * span, j, o, dimension,
-                                                               marks, refined, number, table)
+                            next_rows[base + o] = _descend(
+                                rows[k * span + _parent_offset(j, o, dimension)],
+                                _octant(j, o, dimension), dimension, marks, refined, number,
+                                table)
+                        if fold == 1:
+                            c = next_rows[base + span // 2]
+                            a = lo[c]
+                            b = hi[c]
+                            for o in range(span):
+                                q = next_rows[base + o]
+                                if q >= 0:
+                                    a = min(a, lo[q])
+                                    b = max(b, hi[q])
+                            code = tack.i64(0)
+                            if a <= value and value <= b:
+                                code = tack.i64(1) << tack.i64(32) \
+                                    if (marks[c] & refined) != 0 else tack.i64(1)
+                            next_packed[at] = code
 
 
 @tack.kernel
-def _counts(numbers, fcount, dimension, state, next_fcount):
+def _advance_split(rows, fcount, bound, packed, numbers, span, dimension, marks, refined, number,
+                   table, lo, hi, value, fold, state, active, next_rows, next_packed):
+    # _advance_rows with a thread a child: a GPU thread's chain of 2^d rows was
+    # the descent's cost (its latency, at the small levels), so each writes and
+    # tests one row; a kept leaf's row is copied by its first thread. Launched
+    # over bound * 2^d.
+    for e in range(bound):
+        corners = 1 << dimension
+        k = e // corners
+        j = e % corners
+        if k < fcount[0]:
+            p = packed[k]
+            if p == 1:
+                if j == 0:
+                    low = numbers[k] & ((tack.i64(1) << tack.i64(32)) - 1)
+                    base = (state[0] + low - 1) * span
+                    for o in range(span):
+                        active[base + o] = rows[k * span + o]
+            elif p != 0:
+                high = numbers[k] >> tack.i64(32)
+                at = (high - 1) * corners + j
+                base = at * span
+                for o in range(span):
+                    next_rows[base + o] = _descend(
+                        rows[k * span + _parent_offset(j, o, dimension)],
+                        _octant(j, o, dimension), dimension, marks, refined, number, table)
+                if fold == 1:
+                    c = next_rows[base + span // 2]
+                    a = lo[c]
+                    b = hi[c]
+                    for o in range(span):
+                        q = next_rows[base + o]
+                        if q >= 0:
+                            a = min(a, lo[q])
+                            b = max(b, hi[q])
+                    code = tack.i64(0)
+                    if a <= value and value <= b:
+                        code = tack.i64(1) << tack.i64(32) \
+                            if (marks[c] & refined) != 0 else tack.i64(1)
+                    next_packed[at] = code
+
+
+@tack.kernel
+def _compact_kept(rows, fcount, bound, packed, numbers, span, state, active, next_rows):
+    # The two-level descent's start: kept leaves' rows to ``active``, kept
+    # refined nodes' own rows to the frontier.
+    for k in range(bound):
+        if k < fcount[0]:
+            p = packed[k]
+            if p != 0:
+                low = numbers[k] & ((tack.i64(1) << tack.i64(32)) - 1)
+                high = numbers[k] >> tack.i64(32)
+                base = (state[0] + low - 1) * span if p == 1 else (high - 1) * span
+                for o in range(span):
+                    if p == 1:
+                        active[base + o] = rows[k * span + o]
+                    else:
+                        next_rows[base + o] = rows[k * span + o]
+
+
+@tack.kernel
+def _step_two(rows, fcount, bound, totals, numbers, span, dimension, marks, refined, number,
+              table, lo, hi, value, state, active, next_rows, write):
+    # Two levels a step: the frontier's nodes are kept refined nodes; each
+    # makes and tests its children's rows (in registers) and its kept refined
+    # children's children's; kept leaves go to ``active``, kept refined
+    # grandchildren's rows to the next frontier. Twice: counting (``write``
+    # 0: a node's counts to ``totals``, scanned between) and writing.
+    for k in range(bound):
+        if k < fcount[0]:
+            na = tack.i64(0)
+            nf = tack.i64(0)
+            a_at = tack.i64(0)
+            f_at = tack.i64(0)
+            if write == 1:
+                mask = (tack.i64(1) << tack.i64(32)) - 1
+                a_at = state[0] + (numbers[k] & mask) - (totals[k] & mask)
+                f_at = (numbers[k] >> tack.i64(32)) - (totals[k] >> tack.i64(32))
+            corners = 1 << dimension
+            crow = tack.local_array(tack.i32, 27)
+            grow = tack.local_array(tack.i32, 27)
+            for j in range(corners):
+                for o in range(span):
+                    crow[o] = _descend(rows[k * span + _parent_offset(j, o, dimension)],
+                                       _octant(j, o, dimension), dimension, marks, refined,
+                                       number, table)
+                c = crow[span // 2]
+                a = lo[c]
+                b = hi[c]
+                for o in range(span):
+                    q = crow[o]
+                    if q >= 0:
+                        a = min(a, lo[q])
+                        b = max(b, hi[q])
+                if a <= value and value <= b:
+                    if (marks[c] & refined) == 0:
+                        if write == 1:
+                            for o in range(span):
+                                active[(a_at + na) * span + o] = crow[o]
+                        na += 1
+                    else:
+                        for g in range(corners):
+                            for o in range(span):
+                                grow[o] = _descend(crow[_parent_offset(g, o, dimension)],
+                                                   _octant(g, o, dimension), dimension, marks,
+                                                   refined, number, table)
+                            gc = grow[span // 2]
+                            ga = lo[gc]
+                            gb = hi[gc]
+                            for o in range(span):
+                                q = grow[o]
+                                if q >= 0:
+                                    ga = min(ga, lo[q])
+                                    gb = max(gb, hi[q])
+                            if ga <= value and value <= gb:
+                                if (marks[gc] & refined) == 0:
+                                    if write == 1:
+                                        for o in range(span):
+                                            active[(a_at + na) * span + o] = grow[o]
+                                    na += 1
+                                else:
+                                    if write == 1:
+                                        for o in range(span):
+                                            next_rows[(f_at + nf) * span + o] = grow[o]
+                                    nf += 1
+            if write == 0:
+                totals[k] = na | (nf << tack.i64(32))
+
+
+@tack.kernel
+def _counts(numbers, fcount, shift, state, next_fcount):
     # One thread: the level's kept leaves added to ``state[0]``, and the next
-    # frontier's count, from the scan's last entry.
+    # frontier's count, from the scan's last entry (the kept refined nodes'
+    # children, ``shift`` the dimension; or the kept nodes themselves, 0).
     for i in range(1):
         f = fcount[0]
         total = tack.i64(0)
         if f > 0:
             total = numbers[f - 1]
         state[0] = state[0] + (total & ((tack.i64(1) << tack.i64(32)) - 1))
-        next_fcount[0] = (total >> tack.i64(32)) << tack.i64(dimension)
+        next_fcount[0] = (total >> tack.i64(32)) << tack.i64(shift)
 
 
 #: On a GPU, a level whose bound (its nodes) is at most this is launched over the
 #: bound with its count left on the device; a larger one reads its count first,
-#: so as not to launch, and size its rows for, every node of the level. The
+#: so as not to launch, and size its rows for, every node of the level (never
+#: reading cost Metal 2.5 ms at 1M leaves; reading below this, nothing). The
 #: CPU reads every count (a read costs it nothing).
 _READ_ABOVE = 1 << 17
+
+#: Whether a child's row is tested as its parent writes it (its packed code with
+#: it), saving the kept-test launch a level (0.3 ms a contour on the CPU, 0.5
+#: on Metal); else a kernel a level tests the frontier's rows.
+_FOLD_TEST = True
+
+#: Levels a step of the descent: 1, a frontier of rows to test; or 2, a
+#: frontier of kept refined nodes, each making and testing its children's and
+#: grandchildren's rows in one kernel (run twice, to count and to write), so a
+#: GPU pays half the launches and scans. Tried and lost: a thread's chain of
+#: 72 rows is what a GPU is slow at (3-4x slower on Metal), and the second pass
+#: costs the CPU 1 ms at 1M leaves. Kept as the measurement.
+_LEVELS_PER_STEP = 1
 
 
 def _reads_counts(device, bound):
     return device.type == "cpu" or bound > _READ_ABOVE
+
+
+def _split_children(device):
+    """Whether the advance takes a thread a child row (GPUs) or a thread a node,
+    its 2^d children's rows in turn (the CPU)."""
+    return device.type != "cpu"
 
 
 def _active_leaves(octree, r, value):
@@ -223,30 +415,75 @@ def _active_leaves(octree, r, value):
     refined = int(Ghosts.REFINEDCELL)
     number, table = children(octree)
     leaves = octree.num_nodes - (len(table) >> d)
+    value = float(value)
+    split = _split_children(octree.device)
     with octree.device:
         rows = root_rows(octree)
         bound = int(per_level[0])
         fcount = tack.array(np.array([bound], np.int64))
         state = tack.zeros((1,), tack.i64)
         active = tack.empty((max(leaves, 1) * span,), tack.i32)
-        for lv in range(finest + 1):
-            if bound == 0:
-                break
-            packed = tack.empty((bound,), tack.i64)
-            _kept_rows(rows, fcount, bound, span, r.lo, r.hi, octree.marks, refined,
-                       float(value), packed)
-            numbers = tack.empty((bound,), tack.i64)
-            inclusive_scan(packed, numbers, bound, total=False)
-            next_bound = int(per_level[lv + 1])
-            next_rows = tack.empty((max(next_bound, 1) * span,), tack.i32)
-            _advance_rows(rows, fcount, bound, packed, numbers, span, d, octree.marks, refined,
-                          number, table, state, active, next_rows)
-            next_fcount = tack.empty((1,), tack.i64)
-            _counts(numbers, fcount, d, state, next_fcount)
-            rows, fcount = next_rows, next_fcount
-            if _reads_counts(octree.device, next_bound):
-                next_bound = int(next_fcount.numpy()[0])
-            bound = next_bound
+        packed = tack.empty((max(bound, 1),), tack.i64)
+        if bound:
+            _kept_rows(rows, fcount, bound, span, r.lo, r.hi, octree.marks, refined, value,
+                       packed)
+        if _LEVELS_PER_STEP == 1:
+            for lv in range(finest + 1):
+                if bound == 0:
+                    break
+                numbers = tack.empty((bound,), tack.i64)
+                inclusive_scan(packed, numbers, bound, total=False)
+                next_bound = int(per_level[lv + 1])
+                next_rows = tack.empty((max(next_bound, 1) * span,), tack.i32)
+                next_packed = tack.empty((max(next_bound, 1),), tack.i64)
+                if split:
+                    _advance_split(rows, fcount, bound << d, packed, numbers, span, d,
+                                   octree.marks, refined, number, table, r.lo, r.hi, value,
+                                   int(_FOLD_TEST), state, active, next_rows, next_packed)
+                else:
+                    _advance_rows(rows, fcount, bound, packed, numbers, span, d, octree.marks,
+                                  refined, number, table, r.lo, r.hi, value, int(_FOLD_TEST),
+                                  state, active, next_rows, next_packed)
+                next_fcount = tack.empty((1,), tack.i64)
+                _counts(numbers, fcount, d, state, next_fcount)
+                rows, fcount, packed = next_rows, next_fcount, next_packed
+                if _reads_counts(octree.device, next_bound):
+                    next_bound = int(next_fcount.numpy()[0])
+                bound = next_bound
+                if bound and not _FOLD_TEST:
+                    _kept_rows(rows, fcount, bound, span, r.lo, r.hi, octree.marks, refined,
+                               value, packed)
+        else:
+            # The frontier becomes the kept refined roots, then two levels a step.
+            if bound:
+                numbers = tack.empty((bound,), tack.i64)
+                inclusive_scan(packed, numbers, bound, total=False)
+                next_rows = tack.empty((bound * span,), tack.i32)
+                _compact_kept(rows, fcount, bound, packed, numbers, span, state, active,
+                              next_rows)
+                next_fcount = tack.empty((1,), tack.i64)
+                _counts(numbers, fcount, 0, state, next_fcount)
+                rows, fcount = next_rows, next_fcount
+                if _reads_counts(octree.device, bound):
+                    bound = int(next_fcount.numpy()[0])
+            lv = 0
+            while bound and lv < finest:
+                totals = tack.empty((bound,), tack.i64)
+                _step_two(rows, fcount, bound, totals, totals, span, d, octree.marks, refined,
+                          number, table, r.lo, r.hi, value, state, active, rows, 0)
+                numbers = tack.empty((bound,), tack.i64)
+                inclusive_scan(totals, numbers, bound, total=False)
+                next_bound = int(per_level[lv + 2]) if lv + 2 <= finest else 0
+                next_rows = tack.empty((max(next_bound, 1) * span,), tack.i32)
+                _step_two(rows, fcount, bound, totals, numbers, span, d, octree.marks, refined,
+                          number, table, r.lo, r.hi, value, state, active, next_rows, 1)
+                next_fcount = tack.empty((1,), tack.i64)
+                _counts(numbers, fcount, 0, state, next_fcount)
+                rows, fcount = next_rows, next_fcount
+                if _reads_counts(octree.device, next_bound):
+                    next_bound = int(next_fcount.numpy()[0])
+                bound = next_bound
+                lv += 2
         n_active = int(state.numpy()[0])
     return active, n_active
 
