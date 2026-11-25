@@ -107,7 +107,7 @@ class TackRenderer:
     ``vtkOverlappingAMR``) as a volume Tack renders: the sampler ``TackVolume`` makes
     (tents across levels with ``blend=1``) and its macrocells, made once."""
 
-    def __init__(self, data, array="values", blend=1, macrocells=64):
+    def __init__(self, data, array="values", blend=1, macrocells=64, bits=32):
         prepare = TackVolume(array, blend, macrocells)
         self.box, self.bounds, cells, self.range, self.cell, coarse = prepare._sampler(data)
         self.grid, self.lows, self.highs = volume_tack.macro_grid(self.box, cells, self.bounds,
@@ -116,8 +116,10 @@ class TackRenderer:
         self._seen = (None, None, None)
         #: The march made for Tack (``tack_march``); None for an image, which the
         #: shader's march (``volume_tack._march``) renders.
-        self.tents = (tack_march.Tents(self.box)
-                      if isinstance(self.box, volume_tack.AMRVolume) else None)
+        #: ``bits`` 16: its values as 16-bit codes (``tack_march.CodedTents``).
+        self.tents = None
+        if isinstance(self.box, volume_tack.AMRVolume):
+            self.tents = (tack_march.CodedTents if bits == 16 else tack_march.Tents)(self.box)
         self._sub = {}
 
     def sub(self, shift):

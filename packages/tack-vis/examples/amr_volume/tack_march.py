@@ -6,12 +6,14 @@
 The reconstruction is ``volume_tack.AMRVolume``'s (tent basis functions of every active
 cell); what differs is how a sample finds its cells and how a ray steps:
 
-- **One record per box, one per level** (``Tents``): a box's corners and where its
-  values start are eight ints side by side, a level's brick table and cell sizes
-  likewise, where ``AMRVolume`` reads a dozen small arrays.
-- **Refined cells are a value**, ``REFINED``, so a cell is one load, not a value and a
-  bit.
-- **Bricks are a power of two wide**, so a cell's brick is a shift.
+- **Bricks with a border** (``Tents``): the values are stored again as bricks of 8
+  cells a side, each with one more layer of cells on its far sides, taken from
+  whichever box holds them. The eight cells around a point are then always in the
+  brick of the first, at fixed offsets: one load from the level's table of bricks and
+  eight reads side by side, with no box to find and no special case where boxes meet
+  (boxes here are 16 or 32 cells across, so a fifth of the samples were at one).
+- **Refined cells are a value**, ``REFINED``, as are a brick's cells outside every
+  box, so a cell is one load, not a value and a bit.
 - **32-bit indices**: a ``range`` loop's variable is 64-bit on GPUs, and so was every
   index made from a level or a corner.
 - **One lookup a step**: the sample also says how fine the data is there, which sets
@@ -43,94 +45,120 @@ ACTIVE = tack.constant(-1.0e38)
 FAR = tack.constant(60)
 
 
+#: A brick's width in cells is ``1 << BRICK``; with its border it holds ``PADDED`` cells
+#: along each axis.
+BRICK = tack.constant(3)
+PADDED = tack.constant(9)
+
+
 @tack.kernel
-def _mark_refined(volume, out):
-    """Each cell's value, ``REFINED`` where a finer level covers it."""
+def _fill_bricks(volume, slots, out):
+    """Each brick's cells with its border, x fastest: the cell's value where it is in a
+    box and active, else ``REFINED``. ``slots`` holds a brick's level and first cell."""
     for n in range(out.shape[0]):
-        value, active, x, y, z, sx, sy, sz, level = volume.cell_info(n)
-        out[n] = value if active == 1 else REFINED
+        m = tack.i32(n)
+        s = m // (PADDED * PADDED * PADDED)
+        local = m - s * (PADDED * PADDED * PADDED)
+        value, found, refined = volume.cell(
+            slots[4 * s], slots[4 * s + 1] + local % PADDED,
+            slots[4 * s + 2] + (local // PADDED) % PADDED,
+            slots[4 * s + 3] + local // (PADDED * PADDED))
+        out[n] = value if found == 1 and refined == 0 else REFINED
 
 
 @tack.device_class
 class Tents:
     """``volume_tack.AMRVolume``'s tents, laid out for the march (see the module).
 
-    - ``values``: every box's cells one after another, ``REFINED`` where refined;
-    - ``boxes``: 8 ints a box, its first cell, one past its last, and where its values
-      start;
-    - ``levels``: 8 ints a level, its bricks' first cell, the shift of a brick's width,
-      the bricks along each axis, and where its bricks start in ``bricks``;
+    - ``values``: every brick's cells with its border, one brick after another,
+      ``REFINED`` where refined or in no box;
+    - ``levels``: 8 ints a level, its bricks' first cell, the bricks along each axis,
+      and where its bricks start in ``bricks``;
     - ``sizes``: 4 floats a level, one over the cell size per axis, and the smallest;
-    - ``bricks``: each brick's box, or -1."""
+    - ``bricks``: each brick's place in ``values``, or -1 where no box meets it."""
 
     def __init__(self, volume):
         host = {name: getattr(volume, name).numpy() for name in
-                ("box_lo", "box_dims", "box_level", "box_values", "spacing")}
+                ("box_lo", "box_dims", "box_level", "spacing")}
         lo = host["box_lo"].reshape(-1, 3).astype(np.int64)
         hi = lo + host["box_dims"].reshape(-1, 3)
-        count = len(lo)
-        boxes = np.zeros((count, 8), np.int32)
-        boxes[:, 0:3], boxes[:, 3:6], boxes[:, 6] = lo, hi, host["box_values"]
+        shift = int(BRICK)
         levels = np.zeros((volume.nlevels, 8), np.int32)
         sizes = np.zeros((volume.nlevels, 4), np.float32)
         spacing = host["spacing"].reshape(-1, 3).astype(np.float64)
-        bricks = []
-        at = 0
+        bricks, slots = [], []
+        at = made = 0
         for level in range(volume.nlevels):
             ids = np.flatnonzero(host["box_level"] == level)
             llo, lhi = lo[ids], hi[ids]
-            # The widest power of two dividing every corner: a brick lies in one box or
-            # none.
-            shared = int(np.gcd.reduce(np.concatenate([llo.ravel(), lhi.ravel()])))
-            shift = 0
-            while shared > 0 and shared % (2 << shift) == 0:
-                shift += 1
-            start = llo.min(axis=0)
-            dims = (lhi.max(axis=0) - start) >> shift
-            table = np.full(tuple(int(d) for d in dims[::-1]), -1, np.int32)
-            for box, blo, bhi in zip(ids, llo, lhi):
-                a, z = (blo - start) >> shift, (bhi - start) >> shift
-                table[a[2]:z[2], a[1]:z[1], a[0]:z[0]] = box
-            levels[level] = (*start, shift, *dims, at)
+            start = (llo.min(axis=0) >> shift) << shift
+            dims = (lhi.max(axis=0) - start + (1 << shift) - 1) >> shift
+            met = np.zeros(tuple(int(d) for d in dims[::-1]), bool)
+            for blo, bhi in zip(llo, lhi):
+                a = (blo - start) >> shift
+                z = (bhi - start + (1 << shift) - 1) >> shift
+                met[a[2]:z[2], a[1]:z[1], a[0]:z[0]] = True
+            table = np.full(met.shape, -1, np.int32)
+            count = int(met.sum())
+            table[met] = made + np.arange(count, dtype=np.int32)
+            k, j, i = np.nonzero(met)
+            first = start + (np.stack([i, j, k], axis=1) << shift)
+            slots.append(np.concatenate([np.full((count, 1), level), first], axis=1))
+            levels[level] = (*start, *dims, at, 0)
             sizes[level] = (*(1.0 / spacing[level]), spacing[level].min())
             bricks.append(table.reshape(-1))
             at += table.size
-        values = tack.empty((len(volume.values),), tack.f32)
-        _mark_refined(volume, values)
+            made += count
+        values = tack.empty((made * int(PADDED) ** 3,), tack.f32)
+        _fill_bricks(volume, tack.array(np.concatenate(slots).astype(np.int32).reshape(-1)),
+                     values)
         self.values = values
-        self.boxes = tack.array(boxes.reshape(-1))
         self.levels = tack.array(levels.reshape(-1))
         self.sizes = tack.array(sizes.reshape(-1))
         self.bricks = tack.array(np.concatenate(bricks))
         self.ox, self.oy, self.oz = volume.ox, volume.oy, volume.oz
         self.coarse = float(spacing[0].min())
+        self.nlevels = int(volume.nlevels)
+
     @tack.func
-    def box_of(self, level, i, j, k):
-        """The box of ``level`` holding cell ``(i, j, k)``, or -1."""
+    def value(self, n):
+        """Value ``n`` of the bricks' cells."""
+        return self.values[n]
+
+    @tack.func
+    def brick_of(self, level, i, j, k):
+        """Where in ``values`` the brick of ``level`` holding cell ``(i, j, k)`` starts,
+        or -1 where there is none."""
         r = 8 * level
-        shift = self.levels[r + 3]
-        nx = self.levels[r + 4]
-        ny = self.levels[r + 5]
-        bi = (i - self.levels[r]) >> shift
-        bj = (j - self.levels[r + 1]) >> shift
-        bk = (k - self.levels[r + 2]) >> shift
-        box = -1
-        if bi >= 0 and bi < nx and bj >= 0 and bj < ny and bk >= 0 and bk < self.levels[r + 6]:
-            box = self.bricks[self.levels[r + 7] + bi + nx * (bj + ny * bk)]
-        return box
+        nx = self.levels[r + 3]
+        ny = self.levels[r + 4]
+        bi = (i - self.levels[r]) >> BRICK
+        bj = (j - self.levels[r + 1]) >> BRICK
+        bk = (k - self.levels[r + 2]) >> BRICK
+        at = -1
+        if bi >= 0 and bi < nx and bj >= 0 and bj < ny and bk >= 0 and bk < self.levels[r + 5]:
+            slot = self.bricks[self.levels[r + 6] + bi + nx * (bj + ny * bk)]
+            if slot >= 0:
+                at = slot * (PADDED * PADDED * PADDED)
+        return at
+
+    @tack.func
+    def within(self, level, i, j, k):
+        """Cell ``(i, j, k)``'s place in its brick of ``level``."""
+        r = 8 * level
+        last = (1 << BRICK) - 1
+        return (((i - self.levels[r]) & last)
+                + PADDED * (((j - self.levels[r + 1]) & last)
+                            + PADDED * ((k - self.levels[r + 2]) & last)))
 
     @tack.func
     def cell(self, level, i, j, k):
         """Cell ``(i, j, k)`` of ``level``: its value, ``REFINED`` where it is refined
         or in no box."""
         out = REFINED
-        box = self.box_of(level, i, j, k)
-        if box >= 0:
-            q = 8 * box
-            dx = self.boxes[q + 3] - self.boxes[q]
-            dy = self.boxes[q + 4] - self.boxes[q + 1]
-            out = self.values[self.boxes[q + 6] + (i - self.boxes[q])
-                              + dx * ((j - self.boxes[q + 1]) + dy * (k - self.boxes[q + 2]))]
+        at = self.brick_of(level, i, j, k)
+        if at >= 0:
+            out = self.value(at + self.within(level, i, j, k))
         return out
 
     @tack.func
@@ -162,32 +190,26 @@ class Tents:
         v101 = REFINED
         v011 = REFINED
         v111 = REFINED
-        box = self.box_of(level, ix, iy, iz)
-        q = 8 * max(box, 0)
-        if (box >= 0 and ix + 1 < self.boxes[q + 3] and iy + 1 < self.boxes[q + 4]
-                and iz + 1 < self.boxes[q + 5]):
-            # All eight in the first's box: read them directly.
-            dx = self.boxes[q + 3] - self.boxes[q]
-            dxy = dx * (self.boxes[q + 4] - self.boxes[q + 1])
-            n = (self.boxes[q + 6] + (ix - self.boxes[q])
-                 + dx * (iy - self.boxes[q + 1]) + dxy * (iz - self.boxes[q + 2]))
-            v000 = self.values[n]
-            v100 = self.values[n + 1]
-            v010 = self.values[n + dx]
-            v110 = self.values[n + dx + 1]
-            v001 = self.values[n + dxy]
-            v101 = self.values[n + dxy + 1]
-            v011 = self.values[n + dxy + dx]
-            v111 = self.values[n + dxy + dx + 1]
+        at = self.brick_of(level, ix, iy, iz)
+        if at >= 0:
+            # All eight are in the first's brick, with its border.
+            n = at + self.within(level, ix, iy, iz)
+            v000 = self.value(n)
+            v100 = self.value(n + 1)
+            v010 = self.value(n + PADDED)
+            v110 = self.value(n + PADDED + 1)
+            v001 = self.value(n + PADDED * PADDED)
+            v101 = self.value(n + PADDED * PADDED + 1)
+            v011 = self.value(n + PADDED * PADDED + PADDED)
+            v111 = self.value(n + PADDED * PADDED + PADDED + 1)
         else:
-            # Unless the eight share a brick that holds no box, look each up.
+            # No brick at the first: the others are in it too (and there are none)
+            # unless a brick's face lies between them.
             r = 8 * level
-            last = (1 << self.levels[r + 3]) - 1
-            if (box >= 0 or ((ix - self.levels[r]) & last) == last
+            last = (1 << BRICK) - 1
+            if (((ix - self.levels[r]) & last) == last
                     or ((iy - self.levels[r + 1]) & last) == last
-                    or ((iz - self.levels[r + 2]) & last) == last
-                    or self.box_of(level, ix + 1, iy + 1, iz + 1) >= 0):
-                v000 = self.cell(level, ix, iy, iz)
+                    or ((iz - self.levels[r + 2]) & last) == last):
                 v100 = self.cell(level, ix + 1, iy, iz)
                 v010 = self.cell(level, ix, iy + 1, iz)
                 v110 = self.cell(level, ix + 1, iy + 1, iz)
@@ -250,6 +272,38 @@ class Tents:
         if den > 0.0:
             out = num / den
         return out, size
+
+
+@tack.kernel
+def _encode(values, lo, step, codes):
+    for n in range(values.shape[0]):
+        v = values[n]
+        codes[n] = tack.u16(0)
+        if v > ACTIVE:
+            codes[n] = tack.u16(1 + int(floor((v - lo) / step + 0.5)))
+
+
+@tack.device_class
+class CodedTents(Tents):
+    """``Tents`` with the values as 16-bit codes (``codes``: 0 a refined cell, else one
+    more than the value's place among 65,535 evenly over the values' range): half the
+    memory a sample reads, the values within half a step (``qstep``) of ``Tents``'."""
+
+    def __init__(self, volume):
+        Tents.__init__(self, volume)
+        lo, hi = (float(v) for v in volume.host["range"])
+        self.qlo = lo
+        self.qstep = max(hi - lo, 1e-30) / 65534.0
+        codes = tack.empty((len(self.values),), tack.u16)
+        _encode(self.values, self.qlo, self.qstep, codes)
+        self.codes = codes
+        # Tents' kernels still name ``values``; one element stands in.
+        self.values = tack.empty((1,), tack.f32)
+
+    @tack.func
+    def value(self, n):
+        code = tack.i32(self.codes[n])
+        return REFINED if code == 0 else self.qlo + tack.f32(code - 1) * self.qstep
 
 
 @tack.kernel
