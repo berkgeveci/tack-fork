@@ -139,20 +139,22 @@ class TackRenderer:
         return np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32)
 
     def render(self, camera, size, table, lo, hi, depth=None, sample_distance=0.5,
-               unit_distance=1.0, min_step=0.0, jitter=0.0, fast=True, divide=3):
+               unit_distance=1.0, min_step=0.0, jitter=0.0, fast=True, divide=3,
+               aspect=None):
         """The volume seen by ``camera`` at ``size`` (w, h): ``(h, w, 4)`` f32,
         premultiplied, row 0 at the top. With ``depth`` (the frame's, ``frame_depth``)
         each ray ends at the frame's surface. Steps are ``sample_distance`` local cells
         and at least ``min_step``; ``table`` (over ``[lo, hi]``) gives opacity per
         ``unit_distance`` finest cells. ``divide`` is how finely the macrocells are divided
         to leave what cannot show (``1 << divide`` cells along each axis; -1: not at
-        all)."""
+        all); ``aspect`` is the viewport's width over its height where ``size``'s is
+        not (a smaller picture rounded)."""
         import time
 
         t0 = time.perf_counter()
         w, h = size
         count = w * h
-        m = np.array([[camera.GetCompositeProjectionTransformMatrix(w / h, 0, 1)
+        m = np.array([[camera.GetCompositeProjectionTransformMatrix(aspect or w / h, 0, 1)
                        .GetElement(i, j) for j in range(4)] for i in range(4)])
         f32 = np.float32
         inverse = tack.array(np.linalg.inv(m).astype(f32).reshape(-1))
