@@ -22,19 +22,11 @@ def cpu():
 
 
 @tack.kernel
-def _sample_points(tents, ps, values, sizes):
+def _sample_points(tents, ps, stop, values, sizes):
     for n in range(ps.shape[0]):
-        v, s = tents.sample(ps[n], 0, 1)
+        v, s = tents.sample(ps[n], 0, stop)
         values[n] = v
         sizes[n] = s
-
-
-@tack.kernel
-def _hidden_at(tents, ps, hides, boxes):
-    for n in range(ps.shape[0]):
-        h, lx, ly, lz, hx, hy, hz = tents.hidden(ps[n], 0, 1)
-        hides[n] = h
-        boxes[n] = [lx, ly, lz, hx, hy, hz]
 
 
 def _smooth(octree, c):
@@ -60,7 +52,8 @@ def test_leaf_values_are_probes_and_sizes_the_leaves(seed=1):
     x = _points(octree, 20_000)
     tents = ov.octree_tents(octree, "phi", blend=0)
     values, sizes = tack.empty((len(x),), tack.f32), tack.empty((len(x),), tack.f32)
-    _sample_points(tents, tack.array(x.astype(np.float32), tack.vec3(tack.f32)), values, sizes)
+    _sample_points(tents, tack.array(x.astype(np.float32), tack.vec3(tack.f32)),
+                   octree.finest + 1, values, sizes)
     # probe finds no leaf in a hidden one (-1); the sampler gives 0 there.
     found = np.asarray(octree._found(x - np.asarray(octree.origin)).numpy())
     held = found >= 0
@@ -86,49 +79,42 @@ def test_tents_are_continuous_and_at_least_as_close():
         tents = ov.octree_tents(octree, "phi", blend=blend)
         a, b = tack.empty((len(x),), tack.f32), tack.empty((len(x),), tack.f32)
         sizes = tack.empty((len(x),), tack.f32)
-        _sample_points(tents, tack.array(x.astype(np.float32), tack.vec3(tack.f32)), a, sizes)
-        _sample_points(tents, tack.array(y.astype(np.float32), tack.vec3(tack.f32)), b, sizes)
+        stop = octree.finest + 1
+        _sample_points(tents, tack.array(x.astype(np.float32), tack.vec3(tack.f32)), stop, a, sizes)
+        _sample_points(tents, tack.array(y.astype(np.float32), tack.vec3(tack.f32)), stop, b, sizes)
         jumps = np.abs(a.numpy() - b.numpy())
         out[blend] = (np.abs(a.numpy() - exact).mean(), np.percentile(jumps, 99.9), jumps.max())
     assert out[1][0] <= out[0][0]                       # the tents are no farther from the field
     assert out[1][1] < 1e-3 < out[0][2]                 # and continuous almost everywhere
 
 
-def test_hidden_subtrees_are_the_boxes_to_skip():
-    octree = _octree((5, 4, 4), depth=5)
+def test_tents_are_the_weighted_mean_of_every_leaf_reaching_the_point():
+    # Brute force: every visible leaf's tent (its own size wide about its centre)
+    # at each point, over all leaves.
+    octree = _octree((5, 4, 4), depth=4)
     c = octree.centers() + np.asarray(octree.origin)
     octree.fields = {"phi": tack.array(_smooth(octree, c), tack.f32)}
-    x = _points(octree, 5_000)
-    ps = tack.array(x.astype(np.float32), tack.vec3(tack.f32))
-    tents = ov.octree_tents(octree, "phi")
-    hides = tack.empty((len(x),), tack.i32)
-    boxes = tack.empty((len(x),), tack.vec(6, tack.f32))
-    lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) + (np.asarray(octree.origin)
-                if k == 0 else 0) for k, a in enumerate(octree.geometry()))
-    found = np.asarray(octree._found(x - np.asarray(octree.origin)).numpy())
-    # Everything can show: nothing hides, the box is the leaf's.
-    _hidden_at(tents, ps, hides, boxes)
-    assert not hides.numpy().any()
-    np.testing.assert_allclose(np.asarray(boxes.numpy())[:, :3], lo[found], rtol=1e-6, atol=1e-5)
-    np.testing.assert_allclose(np.asarray(boxes.numpy())[:, 3:], size[found], rtol=1e-6)
-    # Subtrees of level 2 cannot show: a point in one hides, with the level-2
-    # ancestor's box; a point in a coarser leaf does not.
-    seen = (octree._level < 2).astype(np.int32)
-    tents.seen = tack.array(seen, tack.i32)
-    _hidden_at(tents, ps, hides, boxes)
-    deep = octree._level[found] >= 2
-    np.testing.assert_array_equal(hides.numpy() == 1, deep)
-    assert deep.any() and not deep.all()
-    b = np.asarray(boxes.numpy())
-    np.testing.assert_allclose(b[deep, 3:], np.broadcast_to(size[octree._level == 2][0],
-                                                            (deep.sum(), 3)), rtol=1e-6)
-    assert ((b[:, :3] <= x + 1e-5) & (x < b[:, :3] + b[:, 3:] + 1e-5)).all()
-    # Nothing can show: the root cell.
-    tents.seen = tack.zeros((octree.num_nodes,), tack.i32)
-    _hidden_at(tents, ps, hides, boxes)
-    assert hides.numpy().all()
-    np.testing.assert_allclose(np.asarray(boxes.numpy())[:, 3:],
-                               np.broadcast_to(size[octree._level == 0][0], (len(x), 3)), rtol=1e-6)
+    s = octree.fields["phi"].numpy()
+    octree = of.threshold(octree, "phi", np.percentile(s, 5), np.inf)
+    x = _points(octree, 3_000, seed=4)
+    tents = ov.octree_tents(octree, "phi", blend=1)
+    values, sizes = tack.empty((len(x),), tack.f32), tack.empty((len(x),), tack.f32)
+    _sample_points(tents, tack.array(x.astype(np.float32), tack.vec3(tack.f32)),
+                   octree.finest + 1, values, sizes)
+    lo, side = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in octree.geometry())
+    visible = octree.is_leaf & ((octree.marks.numpy() & td.Ghosts.HIDDENCELL) == 0)
+    centre = (lo + 0.5 * side)[visible] + np.asarray(octree.origin)
+    size = side[visible]
+    phi = s[visible].astype(np.float64)
+    expected = np.zeros(len(x))
+    for k, p in enumerate(x):
+        w = np.prod(np.maximum(1.0 - np.abs(p - centre) / size, 0.0), axis=1)
+        if w.sum() > 0:
+            expected[k] = (w * phi).sum() / w.sum()
+        else:                                        # no tent: the leaf's value (hidden: 0)
+            found = int(np.asarray(octree._found(p[None] - np.asarray(octree.origin)).numpy())[0])
+            expected[k] = s[found] if found >= 0 else 0.0
+    np.testing.assert_allclose(values.numpy(), expected, rtol=1e-4, atol=1e-5)
 
 
 def test_macrocell_ranges_bound_the_leaves_reaching_them():
@@ -138,8 +124,8 @@ def test_macrocell_ranges_bound_the_leaves_reaching_them():
     s = octree.fields["phi"].numpy()
     octree = of.threshold(octree, "phi", np.percentile(s, 5), np.inf)
     r = ov.ranges(octree, "phi")
-    grid, lows, highs = ov.macro_ranges(octree, r, most=16)
-    lows, highs = lows.numpy(), highs.numpy()
+    grid, lows, highs, firsts, lasts = ov.macro_ranges(octree, r, most=16)
+    lows, highs, firsts, lasts = (a.numpy() for a in (lows, highs, firsts, lasts))
     dims, origin, size = (np.array(grid[k]) for k in ("dims", "origin", "size"))
     lo, side = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in octree.geometry())
     lo = lo + np.asarray(octree.origin)
@@ -157,6 +143,8 @@ def test_macrocell_ranges_bound_the_leaves_reaching_them():
             & visible
         if reach.any():
             assert lows[m] <= phi[reach].min() + 1e-6 and highs[m] >= phi[reach].max() - 1e-6
+            levels = octree._level[reach]
+            assert firsts[m] <= levels.min() and lasts[m] >= levels.max()
         inside = (lo <= a).all(axis=1) & (lo + side >= b).all(axis=1) & visible
         if inside.any():                             # the leaf holding the cell is counted
             assert lows[m] <= phi[inside].min() + 1e-6

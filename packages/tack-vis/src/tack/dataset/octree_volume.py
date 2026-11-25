@@ -9,31 +9,35 @@ blended into VTK's frame), written for an octree.
 
 - **The lookup is a descent.** From the root cell holding the point, down the
   children table by the point's octant bits, one i32 read a level: no keys, no
-  brick tables, nothing 64-bit (``OctreeTents.leaf_at``).
+  brick tables, nothing 64-bit (``OctreeTents.leaf_at``, ``node_at``).
 - **The step is the leaf.** ``sample(p, first, stop)`` returns the value and the
-  leaf's size, which sets the march's step; the levels ``first``, ``stop`` the
-  macrocell word carries are not needed.
+  leaf's size, which sets the march's step.
 - **Values with sentinels.** One f32 a node: the value on a visible leaf,
   ``REFINED`` (descend) on a refined node, ``HIDDEN`` (nothing here) on a hidden
   leaf -- one load a node, as the AMR sampler marks them.
 - **Reconstruction.** ``blend=0``: the leaf's value, piecewise constant, exactly
-  what ``probe`` gives. ``blend=1``: tent basis functions, as the AMR sampler
-  blends levels: every visible leaf is a tent its own size wide about its
-  centre, and the value is the weighted mean of the tents reaching the point:
-  the leaf's and those of the leaves holding the points one cell over on the
-  point's side along each axis (seven more descents), each counted once.
-  Within a uniform region this is trilinear interpolation of the centres;
-  across a level change it blends the coarse and fine tents.
+  what ``probe`` gives. ``blend=1``: the AMR sampler's tents: every visible
+  leaf is a tent its own size wide about its centre, and the value is the
+  weighted mean of the tents reaching the point. The cells of level ``l``
+  whose tents reach the point are the eight around it on level ``l``'s
+  lattice, so the sum runs over the levels the macrocell's word gives
+  (``first`` up to ``stop``: the levels of the leaves reaching it) and, per
+  level, the eight lattice cells, each found by a descent that stops where a
+  leaf of another level holds it. Within a uniform region this is trilinear
+  interpolation of the centres; across a level change it blends the coarse
+  and fine tents, continuously.
 - **Empty space.** Per macrocell of a lattice ``depth`` levels below the roots,
-  the least and greatest value of the leaves whose tents reach it, from the
-  per-node ranges the contour keeps (``ranges``): a node at that level or a
-  coarser leaf writes its subtree's range over its block, widened by half its
-  size, with float atomics; the AMR march's ``visible`` and ``macro_words``
-  then make the distance words as for AMR.
+  the least and greatest value of the leaves whose tents reach it, and their
+  least and greatest level, from the per-node ranges the contour keeps
+  (``ranges``) and the same ranges over the leaves' levels: a node at that
+  level or a coarser leaf writes its subtree's ranges over its block, widened
+  by half its size, with atomics; the AMR march's ``visible`` and
+  ``macro_words`` then make the distance words as for AMR. The march's finer
+  skipping (``sub_grids``, divided macrocells) is not used yet.
 
-The AMR modules are imported from their worktree
-(``OctreeRenderer(..., amr_volume=<path>)``), not copied, so their march flows
-through unchanged.
+The AMR modules are imported from a directory the caller names
+(``OctreeRenderer(..., amr_volume=<path>)``): a snapshot of their committed
+state, since their worktree changes under a run.
 """
 
 import sys
@@ -44,8 +48,8 @@ import numpy as np
 import tack
 from tack.dataset.ghosts import Ghosts
 from tack.dataset.octree import _root_axes, _root_cells, _unkey
-from tack.dataset.octree_contour import ranges
-from tack.dataset.octree_topology import children
+from tack.dataset.octree_contour import _child_ranges, _leaf_ranges, ranges, subtree_ends
+from tack.dataset.octree_topology import children, refined_by_level
 
 __all__ = ["OctreeRenderer", "OctreeTents", "macro_ranges", "octree_tents"]
 
@@ -94,9 +98,6 @@ class OctreeTents:
                 _node_values(octree._field(name), octree.marks, int(Ghosts.REFINEDCELL),
                              int(Ghosts.HIDDENCELL), values)
             self.values = values
-            #: Per node, whether its subtree can show (1) under the transfer
-            #: function: every node until ``set_visible``.
-            self.seen = tack.ones((max(octree.num_nodes, 1),), tack.i32)
         self.nx, self.ny, self.nz = int(nx), int(ny), int(nz)
         self.ox, self.oy, self.oz = (float(axes[a][0] + origin[a]) for a in range(3))
         self.sx, self.sy, self.sz = (float(s) for s in sizes[0])
@@ -110,8 +111,8 @@ class OctreeTents:
 
     @tack.func
     def leaf_at(self, p):
-        """The leaf holding ``p`` (-1 beyond the roots) and its box: lower corner and
-        sides, by a descent from the root cell."""
+        """The leaf holding ``p`` (-1 beyond the roots) and its smallest side, by a
+        descent from the root cell."""
         rx = (p[0] - self.ox) / self.sx
         ry = (p[1] - self.oy) / self.sy
         rz = (p[2] - self.oz) / self.sz
@@ -122,12 +123,7 @@ class OctreeTents:
         fy = min(max(ry - tack.f32(tj), 0.0), 0.999999)
         fz = min(max(rz - tack.f32(tk), 0.0), 0.999999)
         n = self.roots[ti + self.nx * (tj + self.ny * tk)]
-        lx = self.ox + tack.f32(ti) * self.sx
-        ly = self.oy + tack.f32(tj) * self.sy
-        lz = self.oz + tack.f32(tk) * self.sz
-        hx = self.sx
-        hy = self.sy
-        hz = self.sz
+        size = self.coarse
         while n >= 0 and self.values[n] == REFINED:
             jx = 1 if fx >= 0.5 else 0
             jy = 1 if fy >= 0.5 else 0
@@ -135,112 +131,67 @@ class OctreeTents:
             fx = 2.0 * fx - tack.f32(jx)
             fy = 2.0 * fy - tack.f32(jy)
             fz = 2.0 * fz - tack.f32(jz)
-            hx = 0.5 * hx
-            hy = 0.5 * hy
-            hz = 0.5 * hz
-            lx = lx + tack.f32(jx) * hx
-            ly = ly + tack.f32(jy) * hy
-            lz = lz + tack.f32(jz) * hz
+            size = 0.5 * size
             n = self.table[(self.number[n] - 1) * 8 + jx + 2 * jy + 4 * jz]
-        return n, lx, ly, lz, hx, hy, hz
+        return n, size
 
     @tack.func
-    def hidden(self, p, first, stop):
-        """Whether the point is in a subtree that cannot show (1 or 0), and that
-        subtree's box: the first node on the descent to ``p`` whose range the
-        transfer function gives no opacity (``seen`` 0), the whole tree's
-        skipping at every scale; 0 and the leaf's box otherwise."""
-        rx = (p[0] - self.ox) / self.sx
-        ry = (p[1] - self.oy) / self.sy
-        rz = (p[2] - self.oz) / self.sz
-        ti = min(max(int(floor(rx)), 0), self.nx - 1)  # noqa: RUF046
-        tj = min(max(int(floor(ry)), 0), self.ny - 1)  # noqa: RUF046
-        tk = min(max(int(floor(rz)), 0), self.nz - 1)  # noqa: RUF046
-        fx = min(max(rx - tack.f32(ti), 0.0), 0.999999)
-        fy = min(max(ry - tack.f32(tj), 0.0), 0.999999)
-        fz = min(max(rz - tack.f32(tk), 0.0), 0.999999)
-        n = self.roots[ti + self.nx * (tj + self.ny * tk)]
-        lx = self.ox + tack.f32(ti) * self.sx
-        ly = self.oy + tack.f32(tj) * self.sy
-        lz = self.oz + tack.f32(tk) * self.sz
-        hx = self.sx
-        hy = self.sy
-        hz = self.sz
-        hides = 0
-        if n < 0:
-            hides = 1
-        else:
-            while self.seen[n] == 1 and self.values[n] == REFINED:
-                jx = 1 if fx >= 0.5 else 0
-                jy = 1 if fy >= 0.5 else 0
-                jz = 1 if fz >= 0.5 else 0
-                fx = 2.0 * fx - tack.f32(jx)
-                fy = 2.0 * fy - tack.f32(jy)
-                fz = 2.0 * fz - tack.f32(jz)
-                hx = 0.5 * hx
-                hy = 0.5 * hy
-                hz = 0.5 * hz
-                lx = lx + tack.f32(jx) * hx
-                ly = ly + tack.f32(jy) * hy
-                lz = lz + tack.f32(jz) * hz
-                n = self.table[(self.number[n] - 1) * 8 + jx + 2 * jy + 4 * jz]
-            if self.seen[n] == 0:
-                hides = 1
-        return hides, lx, ly, lz, hx, hy, hz
-
-    @tack.func
-    def tent(self, p, lx, ly, lz, hx, hy, hz):
-        """A leaf's tent at ``p``: 1 at its centre, 0 one cell away."""
-        wx = max(1.0 - abs(p[0] - lx - 0.5 * hx) / hx, 0.0)
-        wy = max(1.0 - abs(p[1] - ly - 0.5 * hy) / hy, 0.0)
-        wz = max(1.0 - abs(p[2] - lz - 0.5 * hz) / hz, 0.0)
-        return wx * wy * wz
+    def node_at(self, level, i, j, k):
+        """The node of level ``level`` at lattice cell ``(i, j, k)`` of that level, or
+        -1 where a leaf of a coarser level holds the cell, or beyond the roots."""
+        n = tack.i32(-1)
+        ti = i >> level
+        tj = j >> level
+        tk = k >> level
+        if i >= 0 and j >= 0 and k >= 0 and ti < self.nx and tj < self.ny and tk < self.nz:
+            n = self.roots[ti + self.nx * (tj + self.ny * tk)]
+            d = level
+            while n >= 0 and d > 0:
+                if self.values[n] != REFINED:
+                    n = tack.i32(-1)
+                else:
+                    d -= 1
+                    n = self.table[(self.number[n] - 1) * 8 + ((i >> d) & 1) +
+                                   2 * ((j >> d) & 1) + 4 * ((k >> d) & 1)]
+        return n
 
     @tack.func
     def sample(self, p, first, stop):
-        n, lx, ly, lz, hx, hy, hz = self.leaf_at(p)
-        size = self.coarse
+        n, size = self.leaf_at(p)
         value = 0.0
         if n >= 0:
-            size = min(hx, hy, hz)
             v = self.values[n]
             if v > ACTIVE:
                 value = v
-            if self.blend == 1:
-                num = 0.0
-                den = 0.0
-                if v > ACTIVE:
-                    w = self.tent(p, lx, ly, lz, hx, hy, hz)
-                    num = w * v
-                    den = w
-                seen = tack.local_array(tack.i32, 8)
-                seen[0] = n
-                count = 1
-                cx = lx + 0.5 * hx
-                cy = ly + 0.5 * hy
-                cz = lz + 0.5 * hz
-                dx = hx if p[0] >= cx else -hx
-                dy = hy if p[1] >= cy else -hy
-                dz = hz if p[2] >= cz else -hz
-                for s in range(1, 8):
-                    q = tack.vec3(cx + dx * tack.f32(s & 1), cy + dy * tack.f32((s >> 1) & 1),
-                                  cz + dz * tack.f32((s >> 2) & 1))
-                    m, mx, my, mz, ax, ay, az = self.leaf_at(q)
+        if self.blend == 1 and stop > first:
+            num = 0.0
+            den = 0.0
+            for wide in range(first, stop):
+                level = tack.i32(wide)
+                # Level's lattice: cell sides, and the point in cell-centre units.
+                hx = self.sx / tack.f32(1 << level)
+                hy = self.sy / tack.f32(1 << level)
+                hz = self.sz / tack.f32(1 << level)
+                ux = (p[0] - self.ox) / hx - 0.5
+                uy = (p[1] - self.oy) / hy - 0.5
+                uz = (p[2] - self.oz) / hz - 0.5
+                i0 = int(floor(ux))  # noqa: RUF046
+                j0 = int(floor(uy))  # noqa: RUF046
+                k0 = int(floor(uz))  # noqa: RUF046
+                for s in range(8):
+                    i = i0 + (s & 1)
+                    j = j0 + ((s >> 1) & 1)
+                    k = k0 + ((s >> 2) & 1)
+                    m = self.node_at(level, i, j, k)
                     if m >= 0:
-                        new = 1
-                        for i in range(count):
-                            if seen[i] == m:
-                                new = 0
-                        if new == 1:
-                            seen[count] = m
-                            count += 1
-                            u = self.values[m]
-                            if u > ACTIVE:
-                                w = self.tent(p, mx, my, mz, ax, ay, az)
-                                num += w * u
-                                den += w
-                if den > 0.0:
-                    value = num / den
+                        u = self.values[m]
+                        if u > ACTIVE:
+                            w = (1.0 - abs(ux - tack.f32(i))) * (1.0 - abs(uy - tack.f32(j))) * \
+                                (1.0 - abs(uz - tack.f32(k)))
+                            num += w * u
+                            den += w
+            if den > 0.0:
+                value = num / den
         return value, size
 
 
@@ -253,10 +204,11 @@ def octree_tents(octree, name, blend=1):
 
 
 @tack.kernel
-def _macro_ranges(tree, level, key, marks, refined, lo, hi, nx, ny, nz, depth, lows, highs):
-    # Each node at ``depth``, or a leaf above it, writes its subtree's range over
-    # its block of the lattice at ``depth``, widened by half its size (its tents
-    # reach that far), by atomics.
+def _macro_ranges(tree, level, key, marks, refined, lo, hi, llo, lhi, nx, ny, nz, depth, lows,
+                  highs, firsts, lasts):
+    # Each node at ``depth``, or a leaf above it, writes its subtree's ranges (of
+    # value and of leaf level) over its block of the lattice at ``depth``,
+    # widened by half its size (its tents reach that far), by atomics.
     for n in range(tree.shape[0]):
         lv = level[n]
         if lv <= depth and (lv == depth or (marks[n] & refined) == 0) and lo[n] <= hi[n]:
@@ -272,21 +224,49 @@ def _macro_ranges(tree, level, key, marks, refined, lo, hi, nx, ny, nz, depth, l
             bk = ((t // (nx * ny)) << depth) + (tack.i64(m) << (depth - lv))
             a = lo[n]
             b = hi[n]
+            la = tack.i32(llo[n])
+            lb = tack.i32(lhi[n])
             for dz in range(max(bk - reach, 0), min(bk + span + reach, gz)):
                 for dy in range(max(bj - reach, 0), min(bj + span + reach, gy)):
                     for dx in range(max(bi - reach, 0), min(bi + span + reach, gx)):
                         cell = dx + gx * (dy + gy * dz)
                         tack.atomic_min(lows, cell, a)
                         tack.atomic_max(highs, cell, b)
+                        tack.atomic_min(firsts, cell, la)
+                        tack.atomic_max(lasts, cell, lb)
+
+
+@tack.kernel
+def _leaf_levels(level, out):
+    for n in range(out.shape[0]):
+        out[n] = tack.f32(level[n])
+
+
+def _level_ranges(octree):
+    """Each node's least and greatest visible leaf level over its subtree, as the
+    value ranges are made: f32 device arrays."""
+    n = octree.num_nodes
+    with octree.device:
+        levels = tack.empty((n,), tack.f32)
+        lo, hi = tack.empty((n,), tack.f32), tack.empty((n,), tack.f32)
+        if n:
+            _leaf_levels(octree.level, levels)
+            _leaf_ranges(levels, octree.marks, int(Ghosts.REFINEDCELL | Ghosts.HIDDENCELL),
+                         3.0e38, lo, hi)
+            ends = subtree_ends(octree)
+            for nodes in refined_by_level(octree):
+                _child_ranges(nodes, ends, lo, hi)
+    return lo, hi
 
 
 def macro_ranges(octree, r, most=64):
     """The macrocells of the octree: the lattice ``depth`` levels below the roots,
     the deepest with at most ``most`` cells along the longest axis (at least the
-    roots), as the march's grid (``origin``, ``size``, ``dims``), and per
-    macrocell the least and greatest value of the leaves whose tents reach it
-    (``r``: ``ranges(octree, name)``), f32 device arrays (greatest < least
-    where none does)."""
+    roots), as the march's grid (``origin``, ``size``, ``dims``); per macrocell
+    the least and greatest value of the leaves whose tents reach it (``r``:
+    ``ranges(octree, name)``), f32 device arrays (greatest < least where none
+    does); and their least and greatest level, i32 (the march's words hold
+    levels up to 15)."""
     nx, ny, nz = [m - 1 for m in octree.roots.topology.point_dims]
     depth = 0
     while (max(nx, ny, nz) << (depth + 1)) <= most and depth < octree.finest:
@@ -297,17 +277,21 @@ def macro_ranges(octree, r, most=64):
     _, sizes = _root_cells(octree.roots)
     size = tuple(float(s) / (1 << depth) for s in sizes[0])
     count = int(np.prod(dims))
+    llo, lhi = _level_ranges(octree)
     with octree.device:
         lows = tack.full((count,), 3.0e38, tack.f32)
         highs = tack.full((count,), -3.0e38, tack.f32)
+        firsts = tack.full((count,), 1 << 20, tack.i32)
+        lasts = tack.full((count,), -1, tack.i32)
         lo = r.lo if r.lo.dtype == tack.f32 else r.lo.astype(tack.f32)
         hi = r.hi if r.hi.dtype == tack.f32 else r.hi.astype(tack.f32)
         if octree.num_nodes:
             _macro_ranges(octree.tree, octree.level, octree.key, octree.marks,
-                          int(Ghosts.REFINEDCELL), lo, hi, nx, ny, nz, depth, lows, highs)
+                          int(Ghosts.REFINEDCELL), lo, hi, llo, lhi, nx, ny, nz, depth, lows,
+                          highs, firsts, lasts)
     grid = {"origin": tuple(float(axes[a][0] + origin[a]) for a in range(3)), "size": size,
             "dims": tuple(int(d) for d in dims)}
-    return grid, lows, highs
+    return grid, lows, highs, firsts, lasts
 
 
 # -- the renderer ------------------------------------------------------------------------
@@ -320,7 +304,7 @@ class OctreeRenderer:
     AMR volume modules (``tack_march``, ``tack_composite``, ``volume_tack``)."""
 
     def __init__(self, octree, name, amr_volume, blend=1, macrocells=64):
-        if amr_volume not in sys.path:
+        if str(amr_volume) not in sys.path:
             sys.path.insert(0, str(amr_volume))
         import tack_composite
         import tack_march
@@ -330,7 +314,8 @@ class OctreeRenderer:
         self.octree = octree
         self.tents = octree_tents(octree, name, blend)
         self.ranges = ranges(octree, name)
-        self.grid, self.lows, self.highs = macro_ranges(octree, self.ranges, macrocells)
+        self.grid, self.lows, self.highs, self.firsts, self.lasts = macro_ranges(
+            octree, self.ranges, macrocells)
         self.bounds = self.tents.bounds
         self.cell = self.tents.finest
         self._seen = (None, None, None)
@@ -371,23 +356,19 @@ class OctreeRenderer:
             key = (table.tobytes(), lo, hi)
             if self._seen[0] != key:
                 seen = volume_tack.visible(self.lows, self.highs, table, lo, hi)
-                n = len(seen)
-                words = tack_march.macro_words(seen, tack.zeros((n,), tack.i32),
-                                               tack.ones((n,), tack.i32), self.grid["dims"])
-                # Per node too, for the sampler's ``hidden``.
-                r = self.ranges
-                self.tents.seen = volume_tack.visible(
-                    r.lo if r.lo.dtype == tack.f32 else r.lo.astype(tack.f32),
-                    r.hi if r.hi.dtype == tack.f32 else r.hi.astype(tack.f32), table, lo, hi)
+                undivided = tack.full((len(seen),), -1, tack.i32)
+                words = tack_march.macro_words(seen, self.firsts, self.lasts, self.grid["dims"],
+                                               undivided)
                 self._seen = (key, seen, words)
             out = tack.empty((count,), tack.vec4(tack.f32))
+            near = tack.zeros((1,), tack.i32)
             tack.sync()
             t1 = time.perf_counter()
             tack_march.march(self.tents, starts, dirs, tmins, tmaxs, tack.array(table, tack.vec4()),
                              self._seen[2], float(lo), float(hi), float(sample_distance),
                              float(min_step), float(unit_distance * self.cell), *self.grid["dims"],
                              *self.grid["origin"], *self.grid["size"], float(0.01 * self.cell),
-                             float(jitter), int(w), out)
+                             float(jitter), int(w), near, -1, out)
             tack.sync()
             t2 = time.perf_counter()
             picture = out.numpy().reshape(h, w, 4)
