@@ -18,13 +18,17 @@ cell); what differs is how a sample finds its cells and how a ray steps:
   the step; ``AMRVolume`` looked that up apart.
 - **Empty space by distance**: each macrocell holds how many macrocells away the
   nearest one that can show is, and a ray leaves that whole block in one step.
+- **Empty space within a macrocell**: a macrocell the fine levels reach is divided
+  again (``sub_grids``: ``1 << shift`` cells along each axis), each cell holding how
+  many of them away, within its macrocell, the nearest that can show is. The macrocell's
+  word says where its cells are, so asking costs one load.
 
 ``march`` samples at the start of each step, where ``volume_tack._march`` samples at
 its middle, so pictures agree closely, not exactly; ``Tents.sample`` gives
 ``AMRVolume.sample``'s values.
 """
 
-from math import floor, pow
+from math import ceil, floor, pow
 
 import numpy as np
 import volume_tack
@@ -35,7 +39,7 @@ import tack
 #: A refined cell's value, and what an active cell's value is above.
 REFINED = tack.constant(-3.0e38)
 ACTIVE = tack.constant(-1.0e38)
-#: The farthest a macrocell's distance to one that can show is counted.
+#: The farthest a macrocell's distance to one that can show is counted (6 bits).
 FAR = tack.constant(60)
 
 
@@ -100,7 +104,6 @@ class Tents:
         self.bricks = tack.array(np.concatenate(bricks))
         self.ox, self.oy, self.oz = volume.ox, volume.oy, volume.oz
         self.coarse = float(spacing[0].min())
-
     @tack.func
     def box_of(self, level, i, j, k):
         """The box of ``level`` holding cell ``(i, j, k)``, or -1."""
@@ -250,6 +253,106 @@ class Tents:
 
 
 @tack.kernel
+def _sub_ranges(tents, sub_macro, firsts, lasts, gx, gy, ox, oy, oz, mx, my, mz, shift, lows,
+                highs):
+    """Per cell of each divided macrocell (``sub_macro`` its macrocell, ``1 << shift``
+    cells along each axis, x fastest) the least and greatest value of the tents that
+    reach it: the active cells, of the levels reaching the macrocell, within a cell
+    of it (and a hundredth, for rounding)."""
+    for n in range(lows.shape[0]):
+        local = tack.i32(n)
+        across = 1 << shift
+        m = sub_macro[local >> (3 * shift)]
+        wx = mx / tack.f32(across)
+        wy = my / tack.f32(across)
+        wz = mz / tack.f32(across)
+        x0 = ox + tack.f32(m % gx) * mx + tack.f32(local & (across - 1)) * wx - tents.ox
+        y0 = (oy + tack.f32((m // gx) % gy) * my
+              + tack.f32((local >> shift) & (across - 1)) * wy - tents.oy)
+        z0 = (oz + tack.f32(m // (gx * gy)) * mz
+              + tack.f32((local >> (2 * shift)) & (across - 1)) * wz - tents.oz)
+        low = 3.0e38
+        high = -3.0e38
+        for other in range(firsts[m], lasts[m] + 1):
+            c = tack.i32(other)
+            i0 = int(floor(x0 * tents.sizes[4 * c] - 1.51)) + 1
+            i1 = int(ceil((x0 + wx) * tents.sizes[4 * c] + 0.51))
+            j0 = int(floor(y0 * tents.sizes[4 * c + 1] - 1.51)) + 1
+            j1 = int(ceil((y0 + wy) * tents.sizes[4 * c + 1] + 0.51))
+            k0 = int(floor(z0 * tents.sizes[4 * c + 2] - 1.51)) + 1
+            k1 = int(ceil((z0 + wz) * tents.sizes[4 * c + 2] + 0.51))
+            for k in range(k0, k1):
+                for j in range(j0, j1):
+                    for i in range(i0, i1):
+                        v = tents.cell(c, tack.i32(i), tack.i32(j), tack.i32(k))
+                        if v > ACTIVE:
+                            low = min(low, v)
+                            high = max(high, v)
+        lows[n] = low
+        highs[n] = high
+
+
+@tack.kernel
+def _nearest_sub(src, along, shift, out):
+    """Along one axis (``along`` 0, 1 or 2) of each divided macrocell: the least of each
+    cell and its two neighbours, a neighbour in another macrocell counting as 0."""
+    for n in range(src.shape[0]):
+        stride = 1 << (along * shift)
+        c = (tack.i32(n) >> (along * shift)) & ((1 << shift) - 1)
+        least = src[n]
+        if c > 0:
+            least = min(least, src[n - stride])
+        else:
+            least = 0
+        if c < (1 << shift) - 1:
+            least = min(least, src[n + stride])
+        else:
+            least = 0
+        out[n] = least
+
+
+def sub_grids(tents, grid, firsts, lasts, shift=3):
+    """The macrocells of ``grid`` divided again, ``1 << shift`` cells along each axis:
+    those a level reaches (``lasts``) whose cells are at most half such a cell. Gives
+    per macrocell its place among the divided ones or -1 (``index``, on the host), and
+    per cell of those the range of the tents reaching it (``lows``, ``highs``)."""
+    sizes = tents.sizes.numpy().reshape(-1, 4)[:, 3]
+    finest = lasts.numpy()
+    width = min(grid["size"]) / (1 << shift)
+    divided = np.flatnonzero((finest >= 0) & (sizes[np.maximum(finest, 0)] * 2
+                                              <= width * (1 + 1e-6)))
+    index = np.full(len(finest), -1, np.int32)
+    index[divided] = np.arange(len(divided), dtype=np.int32)
+    count = max(len(divided), 1) << (3 * shift)
+    lows, highs = tack.empty((count,), tack.f32), tack.empty((count,), tack.f32)
+    macros = tack.array(divided.astype(np.int32) if len(divided) else np.zeros(1, np.int32))
+    _sub_ranges(tents, macros, firsts, lasts, grid["dims"][0], grid["dims"][1],
+                *(float(v) for v in grid["origin"]), *(float(v) for v in grid["size"]),
+                int(shift), lows, highs)
+    return {"index": index, "lows": lows, "highs": highs, "shift": int(shift),
+            "count": len(divided)}
+
+
+def sub_away(sub, table, lo, hi):
+    """Per cell of the divided macrocells: 0 where the transfer function ``table`` over
+    ``[lo, hi]`` can show it, else how many cells away, within its macrocell, the
+    nearest it can show is, the macrocell's faces counting as one."""
+    seen = volume_tack.visible(sub["lows"], sub["highs"], table, lo, hi)
+    count = len(seen)
+    far = 1 << max(sub["shift"] - 1, 0)
+    away = tack.empty((count,), tack.i32)
+    _start(seen, far, away)
+    a = tack.empty((count,), tack.i32)
+    b = tack.empty((count,), tack.i32)
+    for _ in range(far):
+        _nearest_sub(away, 0, sub["shift"], a)
+        _nearest_sub(a, 1, sub["shift"], b)
+        _nearest_sub(b, 2, sub["shift"], a)
+        _further(a, away)
+    return away
+
+
+@tack.kernel
 def _sample_at(tents, ps, first, stop, values, sizes):
     for n in range(ps.shape[0]):
         value, size = tents.sample(ps[n], first, stop)
@@ -280,31 +383,33 @@ def _further(spread, distance):
 
 
 @tack.kernel
-def _start(seen, distance):
+def _start(seen, far, distance):
     for m in range(seen.shape[0]):
-        distance[m] = 0 if seen[m] == 1 else FAR
+        distance[m] = 0 if seen[m] == 1 else far
 
 
 @tack.kernel
-def _pack(distance, firsts, lasts, out):
-    """A macrocell's word: the distance, the first level reaching it and one past the
-    last (none: 0 and 0)."""
+def _pack(distance, firsts, lasts, divided, out):
+    """A macrocell's word: the distance (6 bits), the first level reaching it and one
+    past the last (4 bits each; none: 0 and 0), and one more than its place among the
+    divided macrocells (0: not divided)."""
     for m in range(out.shape[0]):
-        first = min(firsts[m], 255)
+        first = min(firsts[m], 15)
         stop = max(lasts[m] + 1, 0)
         if stop == 0:
             first = 0
-        out[m] = distance[m] | (first << 8) | (stop << 16)
+        out[m] = distance[m] | (first << 6) | (stop << 10) | ((divided[m] + 1) << 14)
 
 
-def macro_words(seen, firsts, lasts, dims):
+def macro_words(seen, firsts, lasts, dims, divided):
     """Per macrocell of a grid of ``dims``, one word: in its low byte how many
     macrocells away (the largest of the axes' differences, at most ``FAR``) the nearest
-    with ``seen`` 1 is, then the levels whose tents reach it."""
+    with ``seen`` 1 is, then the levels whose tents reach it and where its cells are
+    (``divided``: ``sub_grids``' index)."""
     gx, gy, gz = dims
     count = len(seen)
     distance = tack.empty((count,), tack.i32)
-    _start(seen, distance)
+    _start(seen, int(FAR), distance)
     a = tack.empty((count,), tack.i32)
     b = tack.empty((count,), tack.i32)
     for _ in range(int(FAR)):
@@ -313,7 +418,7 @@ def macro_words(seen, firsts, lasts, dims):
         _nearest(b, gx * gy, gz, a)
         _further(a, distance)
     out = tack.empty((count,), tack.i32)
-    _pack(distance, firsts, lasts, out)
+    _pack(distance, firsts, lasts, tack.array(divided), out)
     return out
 
 
@@ -329,10 +434,12 @@ def _leave(q, d, inv, lo, hi, m):
 
 @tack.kernel
 def march(tents, starts, dirs, tmins, tmaxs, tf, macro, lo, hi, factor, min_step, unit, gx, gy,
-          gz, ox, oy, oz, mx, my, mz, skip, jitter, width, out):
+          gz, ox, oy, oz, mx, my, mz, skip, jitter, width, near, shift, out):
     """Each ray's premultiplied colour and opacity: steps of ``factor`` local cells (at
     least ``min_step``), the sample at each step's start, opacity per ``unit`` of
-    length, blocks of macrocells that cannot show left in one step."""
+    length, blocks of macrocells that cannot show left in one step, and within a
+    divided macrocell blocks of its cells (``near``: ``sub_away``; ``shift`` -1: not
+    asked)."""
     for k in range(starts.shape[0]):
         p0 = starts[k]
         d = dirs[k]
@@ -353,23 +460,55 @@ def march(tents, starts, dirs, tmins, tmaxs, tf, macro, lo, hi, factor, min_step
         offset = jitter * _jitter(pixel % width, pixel // width)
         fresh = 1
         scale = 1.0 / (hi - lo)
+        first = 0
+        stop = 0
         while t < t1 and steps < MAX_STEPS:
-            steps += 1
-            mi = min(max(int(floor((qx + d[0] * t) / mx)), 0), gx - 1)
-            mj = min(max(int(floor((qy + d[1] * t) / my)), 0), gy - 1)
-            mk = min(max(int(floor((qz + d[2] * t) / mz)), 0), gz - 1)
-            word = macro[mi + gx * (mj + gy * mk)]
-            away = word & 255
-            if away > 0:
-                reach = away - 1
-                ex = _leave(qx, d[0], ix, mi - reach, mi + reach + 1, mx)
-                ey = _leave(qy, d[1], iy, mj - reach, mj + reach + 1, my)
-                ez = _leave(qz, d[2], iz, mk - reach, mk + reach + 1, mz)
-                t = max(min(ex, ey, ez), t) + skip
-                fresh = 1
-            else:
-                first = (word >> 8) & 255
-                stop = word >> 16
+            # On to the next point that can show. A loop of its own: the threads of a
+            # GPU's group run in step, and this way they sample together, where one
+            # skipping while another samples would make each wait for the other.
+            seeking = 1
+            while seeking == 1 and t < t1 and steps < MAX_STEPS:
+                steps += 1
+                mi = min(max(int(floor((qx + d[0] * t) / mx)), 0), gx - 1)
+                mj = min(max(int(floor((qy + d[1] * t) / my)), 0), gy - 1)
+                mk = min(max(int(floor((qz + d[2] * t) / mz)), 0), gz - 1)
+                word = macro[mi + gx * (mj + gy * mk)]
+                away = word & 63
+                if away > 0:
+                    reach = away - 1
+                    ex = _leave(qx, d[0], ix, mi - reach, mi + reach + 1, mx)
+                    ey = _leave(qy, d[1], iy, mj - reach, mj + reach + 1, my)
+                    ez = _leave(qz, d[2], iz, mk - reach, mk + reach + 1, mz)
+                    t = max(min(ex, ey, ez), t) + skip
+                    fresh = 1
+                else:
+                    first = (word >> 6) & 15
+                    stop = (word >> 10) & 15
+                    seeking = 0
+                    sub = (word >> 14) - 1
+                    if sub >= 0 and shift >= 0:
+                        across = 1 << shift
+                        wx = mx / tack.f32(across)
+                        wy = my / tack.f32(across)
+                        wz = mz / tack.f32(across)
+                        # From the macrocell's corner.
+                        cx = qx - tack.f32(mi) * mx
+                        cy = qy - tack.f32(mj) * my
+                        cz = qz - tack.f32(mk) * mz
+                        si = min(max(int(floor((cx + d[0] * t) / wx)), 0), across - 1)
+                        sj = min(max(int(floor((cy + d[1] * t) / wy)), 0), across - 1)
+                        sk = min(max(int(floor((cz + d[2] * t) / wz)), 0), across - 1)
+                        hides = near[(sub << (3 * shift)) + si + (sj << shift)
+                                     + (sk << (2 * shift))]
+                        if hides > 0:
+                            reach = hides - 1
+                            ex = _leave(cx, d[0], ix, si - reach, si + reach + 1, wx)
+                            ey = _leave(cy, d[1], iy, sj - reach, sj + reach + 1, wy)
+                            ez = _leave(cz, d[2], iz, sk - reach, sk + reach + 1, wz)
+                            t = max(min(ex, ey, ez), t) + skip
+                            fresh = 1
+                            seeking = 1
+            if seeking == 0:
                 value, size = tents.sample(p0 + d * t, first, stop)
                 h = max(factor * size, min_step)
                 if fresh == 1:

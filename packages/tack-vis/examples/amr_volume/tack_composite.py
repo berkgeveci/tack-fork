@@ -118,6 +118,16 @@ class TackRenderer:
         #: shader's march (``volume_tack._march``) renders.
         self.tents = (tack_march.Tents(self.box)
                       if isinstance(self.box, volume_tack.AMRVolume) else None)
+        self._sub = {}
+
+    def sub(self, shift):
+        """The macrocells divided again (``tack_march.sub_grids``), made once a
+        ``shift``."""
+        if shift not in self._sub:
+            self._sub[shift] = tack_march.sub_grids(self.tents, self.grid,
+                                                    self.box.macro_first,
+                                                    self.box.macro_last, shift)
+        return self._sub[shift]
 
     def table(self, color, opacity, lo, hi, size=256):
         """VTK's transfer functions sampled over ``[lo, hi]``: ``(size, 4)`` f32."""
@@ -127,12 +137,14 @@ class TackRenderer:
         return np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32)
 
     def render(self, camera, size, table, lo, hi, depth=None, sample_distance=0.5,
-               unit_distance=1.0, min_step=0.0, jitter=0.0, fast=True):
+               unit_distance=1.0, min_step=0.0, jitter=0.0, fast=True, divide=3):
         """The volume seen by ``camera`` at ``size`` (w, h): ``(h, w, 4)`` f32,
         premultiplied, row 0 at the top. With ``depth`` (the frame's, ``frame_depth``)
         each ray ends at the frame's surface. Steps are ``sample_distance`` local cells
         and at least ``min_step``; ``table`` (over ``[lo, hi]``) gives opacity per
-        ``unit_distance`` finest cells."""
+        ``unit_distance`` finest cells. ``divide`` is how finely the macrocells are divided
+        to leave what cannot show (``1 << divide`` cells along each axis; -1: not at
+        all)."""
         import time
 
         t0 = time.perf_counter()
@@ -152,14 +164,17 @@ class TackRenderer:
         tmaxs = tack.empty((count,), tack.f32)
         _rays(inverse, depths, ends, w, h, *(float(v) for v in self.bounds), starts, dirs,
               tmins, tmaxs)
-        key = (table.tobytes(), lo, hi)
+        key = (table.tobytes(), lo, hi, divide)
         fast = fast and self.tents is not None
         if self._seen[0] != key:
             seen = volume_tack.visible(self.lows, self.highs, table, lo, hi)
             words = None
             if self.tents is not None:
-                words = tack_march.macro_words(seen, self.box.macro_first,
-                                               self.box.macro_last, self.grid["dims"])
+                sub = self.sub(max(divide, 0))
+                words = (tack_march.macro_words(seen, self.box.macro_first,
+                                                self.box.macro_last, self.grid["dims"],
+                                                sub["index"]),
+                         tack_march.sub_away(sub, table, lo, hi))
             self._seen = (key, seen, words)
         out = tack.empty((count,), tack.vec4(tack.f32))
         grid = self.grid
@@ -169,11 +184,15 @@ class TackRenderer:
         tack.sync()
         t2 = time.perf_counter()
         if fast:
+            # Steps longer than the divided macrocells' cells gain nothing from asking.
+            asked = int(divide)
+            if divide >= 0 and min_step >= min(grid["size"]) / (1 << divide):
+                asked = -1
             tack_march.march(
-                self.tents, *arrays[:5], self._seen[2], float(lo), float(hi),
+                self.tents, *arrays[:5], self._seen[2][0], float(lo), float(hi),
                 float(sample_distance), float(min_step), float(unit_distance * self.cell),
                 *grid["dims"], *grid["origin"], *grid["size"], float(0.01 * self.cell),
-                float(jitter), int(size[0]), out)
+                float(jitter), int(size[0]), self._seen[2][1], asked, out)
         else:
             volume_tack._march(
                 self.box, *arrays,
