@@ -133,3 +133,34 @@ def test_the_faces_tile_every_leafs_surface(name, make):
     leaves = np.flatnonzero(octree.is_leaf)
     expected = area[leaves, None] / np.repeat(size[leaves], 2, axis=1)
     np.testing.assert_allclose(covered[leaves], expected)
+
+
+@pytest.mark.parametrize("name,make", CASES, ids=[c[0] for c in CASES])
+def test_the_children_table_and_root_rows_are_the_trees(name, make):
+    octree = make()
+    d = octree.dimension
+    corners = 1 << d
+    number, table = ot.children(octree)
+    number, table = number.numpy(), table.numpy()
+    end = ot.subtree_ends(octree).numpy()
+    refined = np.flatnonzero(~octree.is_leaf)
+    assert len(table) == len(refined) * corners
+    np.testing.assert_array_equal(number[refined] - 1, np.arange(len(refined)))
+    for n in refined:
+        c = n + 1
+        for j in range(corners):
+            assert table[(number[n] - 1) * corners + j] == c
+            assert octree._level[c] == octree._level[n] + 1
+            c = end[c]
+    # Each root's row: the root at each offset (x fastest), -1 beyond the grid.
+    dims = np.array(([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3])
+    roots = np.flatnonzero(octree._level == 0)
+    rows = ot.root_rows(octree).numpy().reshape(len(roots), 3 ** d)
+    at = {(t % dims[0], (t // dims[0]) % dims[1], t // (dims[0] * dims[1])): n
+          for n, t in zip(roots, octree._tree[roots])}
+    for k, n in enumerate(roots):
+        x, y, z = next(c for c, m in at.items() if m == n)
+        for o in range(3 ** d):
+            q = (x + o % 3 - 1, y + (o // 3) % 3 - 1, z + (o // 9 - 1 if d == 3 else 0))
+            assert rows[k, o] == at.get(q, -1)
+        assert rows[k, 3 ** d // 2] == n

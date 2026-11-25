@@ -24,16 +24,12 @@ except ImportError:
     pass
 
 
-@pytest.fixture(autouse=True, params=["chained", "split", "split from the roots"])
+@pytest.fixture(autouse=True, params=["counts read", "counts on device"])
 def cpu(request, monkeypatch):
-    # The CPU's searches in turn, and the GPUs' a thread each, forced here:
-    # starting deep as GPUs do (at the first level of 4k nodes), and at the
-    # roots, reading no counts.
-    if request.param != "chained":
-        monkeypatch.setattr(oc, "_split_searches", lambda device: True)
-    if request.param == "split from the roots":
-        monkeypatch.setattr(oc, "_START_NODES", 0)
-        monkeypatch.setattr(oc, "_READ_ABOVE", 1 << 60)
+    # The CPU reads each level's count; a GPU leaves the small levels' on the
+    # device, launching over the level's node count: forced here.
+    if request.param == "counts on device":
+        monkeypatch.setattr(oc, "_reads_counts", lambda device, bound: False)
     tack.set_default_device("cpu")
     yield
     tack.set_default_device("cpu")
@@ -79,6 +75,11 @@ def test_the_contour_is_vtks(depth):
         reference.SetValue(0, value)
         reference.Update()
         theirs = _surface(reference.GetOutput())
+        # The one-pass surface is the general contour of the crossing cells.
+        cells = oc.crossing_cells(octree, r, value)
+        general = td.contour(cells, "phi", value)
+        assert _surface(dataset_to_vtk(general)) == mine
+        assert oc.contour(octree, "phi", value, r).num_points == general.num_points
         assert mine[0] == theirs[0] > 0
         assert np.isclose(mine[1], theirs[1], rtol=1e-7)
         assert mine[2] == theirs[2]          # open only where the surface leaves the domain

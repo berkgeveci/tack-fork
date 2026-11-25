@@ -4,46 +4,62 @@
 """Contours of a cell-centred octree without its whole dual grid (study,
 ``study/octree-filters``), as ``vtkHyperTreeGridContour`` makes them: only the
 nodes near the surface are visited, and each dual cell is made where it is
-needed.
+needed -- with no search of the keys: each node's neighbourhood is carried down
+the tree from its parent's, as VTK's Moore supercursor carries it.
 
 1. **Ranges.** Each node's least and greatest visible leaf value in its
    subtree, a level at a time from the finest (each refined node over its
    children). They depend on the field alone, so every contour value shares
    them.
-2. **Descent.** From the roots, a level at a time (on a GPU a thread a
-   neighbour's search, on the CPU a thread a node: ``_split_searches``): a node is kept when the
-   range over it and its 26 neighbours at its level holds the value (a
-   neighbour is the node at that level, or the coarser leaf holding the
-   place). A kept refined node's children are the next level's nodes; a kept
-   leaf is active. A dual cell's leaves all lie in its finest leaf's
-   neighbourhood at that leaf's level, and an ancestor's neighbourhood holds
-   its descendants', so every leaf of a cell the surface crosses is kept with
-   its ancestors.
-3. **Cells.** Each active leaf looks at its corners: the leaves around a corner
-   are found by a search of the keys (as ``dual_grid`` finds them), and the
-   corner's cell is made by its owner, the finest leaf around it (a corner is
-   always a corner of the finest leaves around it), the one in the lowest slot
-   on a tie. A cell is kept when every leaf around is inside and visible and
-   its values hold the contour value.
-4. **The surface.** ``contour`` of those cells alone, on the active leaves'
-   centres: the dual grid's contour, polygon for polygon.
+2. **Descent.** From the roots, a level at a time. The frontier is rows of
+   3^d entries: a node's neighbours at its level (x fastest, the node in the
+   middle), each the node there, or the coarser leaf holding the place, or -1
+   beyond the roots. A node is kept when the range over its row holds the
+   value. A kept leaf's row goes to the active rows; a kept refined node's
+   children get their rows from its own: a child's neighbour at an offset is
+   in the parent's neighbour at the offset's half, that node itself when it is
+   a leaf, else its child at the octant the offset lands in (two reads of the
+   children table). A dual cell's leaves all lie in its finest leaf's row, and
+   an ancestor's row holds its descendants', so every leaf of a cell the
+   surface crosses is kept with its ancestors.
+3. **Cells.** Each active leaf looks at its corners: the leaves around a
+   corner are entries of its row, and the corner's cell is made by its owner,
+   the finest leaf around it (a corner is always a corner of the finest leaves
+   around it), the one in the lowest slot on a tie. A cell is kept when every
+   leaf around is inside and visible and its values hold the contour value.
+4. **The surface.** In 3D, marching cubes on those cells alone, in one pass:
+   each crossing lies on a dual edge, between two leaves across a face, and is
+   named by that face (the finer leaf's, or the lower one's between equals),
+   so every cell meeting it writes the same point to the same slot. In 2D,
+   ``contour`` of the crossing cells.
+
+The first form searched the keys for each neighbour (27 a kept node, 64 an
+active leaf, each a binary search of 20 dependent reads): 13 ms of 8 threads
+for the descent at 1M leaves, 5 ms more for the cells, 4 ms for the general
+contour of the cells, 23.5 ms in all (VTK, one thread: 82 ms). This form, on
+yavin's M1 Max with the f64 field: 6.4 ms on 8 threads and 12.8 on one, of
+which the ranges 1.8 / 4.2, the descent 2.5 / 3.6 (mostly the launches and
+scans of its nine levels: the frontier holds 24k nodes in all) and the
+surface 1.6 / 5.0.
 """
 
 import numpy as np
 
 import tack
-from tack.dataset.ghosts import Ghosts
-from tack.dataset.octree import _compute_type, _unkey
+from tack.dataset import _contour_tables as _ct
+from tack.dataset.algorithms._common import _crossing
+from tack.dataset.ghosts import Ghosts, _before
+from tack.dataset.octree import _compute_type
 from tack.dataset.octree_topology import (
-    _holder,
-    _interleave,
-    _lower_bound,
-    _search_arrays,
+    children,
+    nodes_per_level,
     refined_by_level,
+    root_rows,
     subtree_ends,
 )
+from tack.dataset.shapes import _HEXAHEDRON_EDGES
 
-__all__ = ["OctreeRanges", "contour", "ranges"]
+__all__ = ["OctreeRanges", "contour", "crossing_cells", "ranges"]
 
 
 @tack.kernel
@@ -99,149 +115,74 @@ def ranges(octree, name):
     return OctreeRanges(octree, name)
 
 
-@tack.kernel
-def _neighbour_ranges(frontier, fcount, entries, tree, carried, level, key, count, nx, ny, nz,
-                      finest, dimension, lo, hi, nlo, nhi):
-    # Entry e: node e // span's neighbour e % span at its level (x fastest, the
-    # node itself in the middle): the range of the node there, or of the coarser
-    # leaf holding the place; outside the roots, the node's own. One search a
-    # thread, so no thread waits on a chain of 26 (on a GPU the descent's
-    # early, small levels were bound by that chain). Launched over a bound; the
-    # frontier's count is on the device (``fcount``), and entries past it do
-    # nothing.
-    for e in range(entries):
-        span = 27 if dimension == 3 else 9
-        k = e // span
-        if k < fcount[0]:
-            o = e % span
-            n = frontier[k]
-            lv = level[n]
-            t = tree[n]
-            i, j, m = _unkey(key[n], lv, dimension)
-            side = tack.i64(1) << tack.i64(lv)
-            qi = ((t % nx) << tack.i64(lv)) + tack.i64(i) + tack.i64(o % 3) - 1
-            qj = (((t // nx) % ny) << tack.i64(lv)) + tack.i64(j) + tack.i64((o // 3) % 3) - 1
-            qk = ((t // (nx * ny)) << tack.i64(lv)) + tack.i64(m)
-            if dimension == 3:
-                qk = qk + tack.i64(o // 9) - 1
-            q = n
-            if o != span // 2 and qi >= 0 and qj >= 0 and qk >= 0 and qi < nx * side and \
-                    qj < ny * side and qk < nz * side:
-                mask = side - 1
-                t2 = (qi >> tack.i64(lv)) + nx * ((qj >> tack.i64(lv)) +
-                                                  ny * (qk >> tack.i64(lv)))
-                code = _interleave(tack.u64(qi & mask), tack.u64(qj & mask),
-                                   tack.u64(qk & mask), lv, dimension)
-                c = code << tack.u64(dimension * (finest - lv))
-                q = _lower_bound(tree, carried, level, count, t2, c, lv + 1) - 1
-            nlo[e] = lo[q]
-            nhi[e] = hi[q]
+# -- the descent ---------------------------------------------------------------------
+
+
+@tack.func
+def _child_entry(rows, base, j, o, dimension, marks, refined, number, table):
+    # Child j's (its octant's bits, x lowest) neighbour at offset o, from its
+    # parent's row at rows[base:]: the child lattice position (u) of the
+    # neighbour is -1..2 along each axis, in the parent's neighbour at its half
+    # (-1, 0, 0, 1), at the octant of its parity.
+    ux = (j & 1) + o % 3 - 1
+    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
+    uz = 0
+    po = (ux + 2) // 2 + 3 * ((uy + 2) // 2)
+    if dimension == 3:
+        uz = ((j >> 2) & 1) + o // 9 - 1
+        po = po + 9 * ((uz + 2) // 2)
+    p = rows[base + po]
+    if p >= 0:
+        if (marks[p] & refined) != 0:
+            p = table[(number[p] - 1) * (1 << dimension) + ((ux + 2) & 1) + 2 * ((uy + 2) & 1) +
+                      4 * ((uz + 2) & 1)]
+    return p
 
 
 @tack.kernel
-def _kept_codes(frontier, fcount, bound, nlo, nhi, marks, refined, value, span, packed):
-    # A node kept when the range over its neighbourhood holds ``value``: 1 for a
-    # leaf, 1 << 32 for a refined node, 0 otherwise (and past the count), so one
-    # scan counts both.
+def _kept_rows(rows, fcount, bound, span, lo, hi, marks, refined, value, packed):
+    # A node kept when the range over its row holds ``value``: 1 for a leaf,
+    # 1 << 32 for a refined node, 0 otherwise (and past the count), so one scan
+    # counts both. Launched over a bound; the frontier's count is on the device.
     for k in range(bound):
         packed[k] = tack.i64(0)
         if k < fcount[0]:
-            a = nlo[k * span]
-            b = nhi[k * span]
-            for o in range(1, span):
-                a = min(a, nlo[k * span + o])
-                b = max(b, nhi[k * span + o])
-            if a <= value and value <= b:
-                packed[k] = tack.i64(1) << tack.i64(32) if (marks[frontier[k]] & refined) != 0 \
-                    else tack.i64(1)
-
-
-@tack.kernel
-def _kept_codes_chained(frontier, fcount, bound, tree, carried, level, key, count, nx, ny, nz,
-                        finest, dimension, marks, refined, lo, hi, value, packed):
-    # The CPU's form of _neighbour_ranges and _kept_codes in one: each thread
-    # searches its node's 26 neighbours in turn, the ranges kept in registers.
-    for k in range(bound):
-        packed[k] = tack.i64(0)
-        if k < fcount[0]:
-            n = frontier[k]
-            lv = level[n]
-            t = tree[n]
-            i, j, m = _unkey(key[n], lv, dimension)
-            gi = ((t % nx) << tack.i64(lv)) + tack.i64(i)
-            gj = (((t // nx) % ny) << tack.i64(lv)) + tack.i64(j)
-            gk = ((t // (nx * ny)) << tack.i64(lv)) + tack.i64(m)
-            side = tack.i64(1) << tack.i64(lv)
-            mask = side - 1
+            n = rows[k * span + span // 2]
             a = lo[n]
             b = hi[n]
-            zs = 3 if dimension == 3 else 1
-            for dz in range(zs):
-                for dy in range(3):
-                    for dx in range(3):
-                        qi = gi + dx - 1
-                        qj = gj + dy - 1
-                        qk = gk + dz - 1 if dimension == 3 else gk
-                        if qi >= 0 and qj >= 0 and qk >= 0 and qi < nx * side and \
-                                qj < ny * side and qk < nz * side:
-                            t2 = (qi >> tack.i64(lv)) + nx * ((qj >> tack.i64(lv)) +
-                                                              ny * (qk >> tack.i64(lv)))
-                            code = _interleave(tack.u64(qi & mask), tack.u64(qj & mask),
-                                               tack.u64(qk & mask), lv, dimension)
-                            c = code << tack.u64(dimension * (finest - lv))
-                            q = _lower_bound(tree, carried, level, count, t2, c, lv + 1) - 1
-                            a = min(a, lo[q])
-                            b = max(b, hi[q])
+            for o in range(span):
+                q = rows[k * span + o]
+                if q >= 0:
+                    a = min(a, lo[q])
+                    b = max(b, hi[q])
             if a <= value and value <= b:
                 packed[k] = tack.i64(1) << tack.i64(32) if (marks[n] & refined) != 0 \
                     else tack.i64(1)
 
 
-def _split_searches(device):
-    """Whether the descent and the cells take a thread a search (GPUs: a chain of
-    26 or 8 dependent searches a thread left the early, small levels bound by
-    memory latency) or a thread a node or corner, the searches in turn (the
-    CPU: the split form writes and reads back 27 ranges a node and 64 holders a
-    leaf that the chains keep in registers, 15-20% of one thread)."""
-    return device.type != "cpu"
-
-
-#: On a GPU, a level whose bound (its nodes, times 27 neighbours in the split
-#: form) is at most this is launched over the bound with its count left on the
-#: device; a larger one reads its count first, so as not to launch millions of
-#: idle threads. The CPU reads every count (a read costs it nothing).
-_READ_ABOVE = 1 << 22
-
-#: On a GPU the descent starts at the first level of at least this many nodes,
-#: with every leaf above it: whether a node is kept depends on its own
-#: neighbourhood alone (its ancestors' test only saves work), and each level
-#: costs a GPU some launches whatever its size. But every node of the first
-#: level pays its 27 searches, which a GPU emulating 64-bit integers makes
-#: dear: on an M1 Max 4k saved 1-2 ms against the roots, 16k lost 1-5 and 64k
-#: 12-23 (28k to 1M leaves). The CPU starts at the roots.
-_START_NODES = 1 << 12
-
-
 @tack.kernel
-def _advance(frontier, fcount, bound, packed, numbers, end, dimension, state, active,
-             next_frontier):
-    # From one scan of the packed counts: a kept leaf goes to ``active`` after the
-    # ones before (``state[0]``), a kept refined node's children to the next
-    # frontier.
+def _advance_rows(rows, fcount, bound, packed, numbers, span, dimension, marks, refined, number,
+                  table, state, active, next_rows):
+    # From one scan of the packed counts: a kept leaf's row goes to ``active``
+    # after the ones before (``state[0]``), a kept refined node's children's
+    # rows to the next frontier.
     for k in range(bound):
         if k < fcount[0]:
             p = packed[k]
             if p != 0:
                 low = numbers[k] & ((tack.i64(1) << tack.i64(32)) - 1)
                 high = numbers[k] >> tack.i64(32)
-                n = frontier[k]
                 if p == 1:
-                    active[state[0] + low - 1] = n
+                    base = (state[0] + low - 1) * span
+                    for o in range(span):
+                        active[base + o] = rows[k * span + o]
                 else:
-                    c = n + 1
-                    for j in range(1 << dimension):
-                        next_frontier[(high - 1) * (1 << dimension) + j] = c
-                        c = end[c]
+                    corners = 1 << dimension
+                    for j in range(corners):
+                        base = ((high - 1) * corners + j) * span
+                        for o in range(span):
+                            next_rows[base + o] = _child_entry(rows, k * span, j, o, dimension,
+                                                               marks, refined, number, table)
 
 
 @tack.kernel
@@ -257,161 +198,107 @@ def _counts(numbers, fcount, dimension, state, next_fcount):
         next_fcount[0] = (total >> tack.i64(32)) << tack.i64(dimension)
 
 
+#: On a GPU, a level whose bound (its nodes) is at most this is launched over the
+#: bound with its count left on the device; a larger one reads its count first,
+#: so as not to launch, and size its rows for, every node of the level. The
+#: CPU reads every count (a read costs it nothing).
+_READ_ABOVE = 1 << 17
+
+
+def _reads_counts(device, bound):
+    return device.type == "cpu" or bound > _READ_ABOVE
+
+
 def _active_leaves(octree, r, value):
-    """The leaves the descent keeps for ``value``: a device array (at least as
-    long as their count) and their count. Each level's arrays are sized by a
-    bound the host knows (that level's nodes, or the count read back), its count
-    kept on the device; on a GPU only levels above ``_READ_ABOVE`` read their
-    count, and the descent ends with one read."""
+    """The leaves the descent keeps for ``value``: their rows (a device i32
+    array of 3^d entries a leaf, at least as long as their count) and their
+    count. Each level's arrays are sized by a bound the host knows (that
+    level's nodes, or the count read back), its count kept on the device."""
     from tack.algorithms import inclusive_scan
 
     d = octree.dimension
-    span = 27 if d == 3 else 9
-    split = _split_searches(octree.device)
-    nx, ny, nz = ([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3]
-    tree, carried, level, count = _search_arrays(octree)
+    span = 3 ** d
     finest = octree.finest
-    per_level = np.bincount(octree._level, minlength=finest + 2)
-    start = 0
-    if split:
-        deep = np.flatnonzero(per_level[:finest + 1] >= _START_NODES)
-        start = int(deep[0]) if len(deep) else finest
+    per_level = nodes_per_level(octree)
+    refined = int(Ghosts.REFINEDCELL)
+    number, table = children(octree)
+    leaves = octree.num_nodes - (len(table) >> d)
     with octree.device:
-        first = np.flatnonzero((octree._level == start) |
-                               (octree.is_leaf & (octree._level < start))).astype(np.int64)
-        frontier = tack.array(first)
-        fcount = tack.array(np.array([len(first)], np.int64))
-        bound = len(first)
+        rows = root_rows(octree)
+        bound = int(per_level[0])
+        fcount = tack.array(np.array([bound], np.int64))
         state = tack.zeros((1,), tack.i64)
-        active = tack.empty((max(int(octree.is_leaf.sum()), 1),), tack.i64)
-        for lv in range(start, finest + 1):
+        active = tack.empty((max(leaves, 1) * span,), tack.i32)
+        for lv in range(finest + 1):
             if bound == 0:
                 break
             packed = tack.empty((bound,), tack.i64)
-            if split:
-                nlo = tack.empty((bound * span,), r.lo.dtype)
-                nhi = tack.empty((bound * span,), r.lo.dtype)
-                _neighbour_ranges(frontier, fcount, bound * span, tree, carried, level,
-                                  octree.key, count, nx, ny, nz, finest, d, r.lo, r.hi, nlo,
-                                  nhi)
-                _kept_codes(frontier, fcount, bound, nlo, nhi, octree.marks,
-                            int(Ghosts.REFINEDCELL), float(value), span, packed)
-            else:
-                _kept_codes_chained(frontier, fcount, bound, tree, carried, level, octree.key,
-                                    count, nx, ny, nz, finest, d, octree.marks,
-                                    int(Ghosts.REFINEDCELL), r.lo, r.hi, float(value), packed)
+            _kept_rows(rows, fcount, bound, span, r.lo, r.hi, octree.marks, refined,
+                       float(value), packed)
             numbers = tack.empty((bound,), tack.i64)
             inclusive_scan(packed, numbers, bound, total=False)
             next_bound = int(per_level[lv + 1])
-            next_frontier = tack.empty((max(next_bound, 1),), tack.i64)
-            _advance(frontier, fcount, bound, packed, numbers, r.ends, d, state, active,
-                     next_frontier)
+            next_rows = tack.empty((max(next_bound, 1) * span,), tack.i32)
+            _advance_rows(rows, fcount, bound, packed, numbers, span, d, octree.marks, refined,
+                          number, table, state, active, next_rows)
             next_fcount = tack.empty((1,), tack.i64)
             _counts(numbers, fcount, d, state, next_fcount)
-            frontier, fcount = next_frontier, next_fcount
-            if not split or next_bound * span > _READ_ABOVE:
+            rows, fcount = next_rows, next_fcount
+            if _reads_counts(octree.device, next_bound):
                 next_bound = int(next_fcount.numpy()[0])
             bound = next_bound
         n_active = int(state.numpy()[0])
     return active, n_active
 
 
-@tack.kernel
-def _corner_holders(active, tree, carried, level, key, count, nx, ny, nz, finest, dimension,
-                    cells):
-    # Entry e: active leaf a's corner v, slot s (a hexahedron's order: x as
-    # (s ^ s >> 1) & 1, y as s >> 1 & 1, z as s >> 2 & 1): the leaf holding the
-    # lattice cell there, -1 outside. One search a thread.
-    for e in range(cells.shape[0]):
-        corners = 1 << dimension
-        a = e // (corners * corners)
-        v = (e // corners) % corners
-        s = e % corners
-        n = active[a]
-        lv = level[n]
-        t = tree[n]
-        i, j, m = _unkey(key[n], lv, dimension)
-        step = tack.i64(1) << tack.i64(finest - lv)
-        gi = ((t % nx) << tack.i64(finest)) + (tack.i64(i) + tack.i64(v & 1)) * step + \
-            tack.i64((s ^ (s >> 1)) & 1) - 1
-        gj = (((t // nx) % ny) << tack.i64(finest)) + \
-            (tack.i64(j) + tack.i64((v >> 1) & 1)) * step + tack.i64((s >> 1) & 1) - 1
-        gk = ((t // (nx * ny)) << tack.i64(finest)) + tack.i64(m) * step
-        if dimension == 3:
-            gk = gk + tack.i64((v >> 2) & 1) * step + tack.i64((s >> 2) & 1) - 1
-        cells[e] = _holder(gi, gj, gk, nx, ny, nz, finest, dimension, tree, carried, level,
-                           count)
+# -- the cells -----------------------------------------------------------------------
+
+
+@tack.func
+def _slot_offset(v, s, dimension):
+    # Corner v's slot s (a hexahedron's order: x as (s ^ s >> 1) & 1, y as
+    # s >> 1 & 1, z as s >> 2 & 1) in the leaf's row.
+    o = (v & 1) + ((s ^ (s >> 1)) & 1) + 3 * (((v >> 1) & 1) + ((s >> 1) & 1))
+    if dimension == 3:
+        o = o + 9 * (((v >> 2) & 1) + ((s >> 2) & 1))
+    return o
 
 
 @tack.kernel
-def _owned_cells(active, cells, level, marks, hidden, values, value, corners, keep):
-    # Corner e (leaf e // corners, corner e % corners): kept when its leaf owns
-    # it (the finest leaf around, the lowest slot on a tie), every leaf around is
-    # inside and visible, and their values hold ``value``.
-    for e in range(keep.shape[0]):
-        n = active[e // corners]
-        ok = 1
-        owner = tack.i64(-1)
-        deepest = -1
-        a_min = values[n]
-        a_max = values[n]
-        for s in range(corners):
-            q = cells[e * corners + s]
-            if q < 0:
-                ok = 0
-            elif (marks[q] & hidden) != 0:
-                ok = 0
-            else:
-                if level[q] > deepest:
-                    deepest = level[q]
-                    owner = q
-                a_min = min(a_min, values[q])
-                a_max = max(a_max, values[q])
-        keep[e] = 1 if ok == 1 and owner == n and a_min <= value and value <= a_max else 0
-
-
-@tack.kernel
-def _owned_cells_chained(active, tree, carried, level, key, count, nx, ny, nz, finest,
-                         dimension, marks, hidden, values, value, cells, keep):
-    # The CPU's form of _corner_holders and _owned_cells in one: a thread a
-    # corner, its 8 slots searched in turn.
+def _owned_cells(active, span, dimension, level, marks, refined, hidden, values, value, cells,
+                 keep):
+    # Corner e (leaf e // corners, corner e % corners): its cell's leaves in a
+    # hexahedron's order, kept when its leaf owns it (the finest leaf around:
+    # none refined, none as fine in a lower slot), every leaf around is inside
+    # and visible, and their values hold ``value``.
     for e in range(keep.shape[0]):
         corners = 1 << dimension
-        n = active[e // corners]
+        base = (e // corners) * span
         v = e % corners
+        n = active[base + span // 2]
         lv = level[n]
-        t = tree[n]
-        i, j, m = _unkey(key[n], lv, dimension)
-        step = tack.i64(1) << tack.i64(finest - lv)
-        px = ((t % nx) << tack.i64(finest)) + (tack.i64(i) + tack.i64(v & 1)) * step
-        py = (((t // nx) % ny) << tack.i64(finest)) + (tack.i64(j) + tack.i64((v >> 1) & 1)) * step
-        pz = ((t // (nx * ny)) << tack.i64(finest)) + tack.i64(m) * step
-        if dimension == 3:
-            pz = pz + tack.i64((v >> 2) & 1) * step
         ok = 1
-        owner = tack.i64(-1)
-        deepest = -1
+        seen = 0
         a_min = values[n]
         a_max = values[n]
         for s in range(corners):
-            gi = px + tack.i64((s ^ (s >> 1)) & 1) - 1
-            gj = py + tack.i64((s >> 1) & 1) - 1
-            gk = pz
-            if dimension == 3:
-                gk = pz + tack.i64((s >> 2) & 1) - 1
-            q = _holder(gi, gj, gk, nx, ny, nz, finest, dimension, tree, carried, level, count)
-            cells[e * corners + s] = q
+            q = active[base + _slot_offset(v, s, dimension)]
+            cells[e * corners + s] = tack.i64(q)
             if q < 0:
+                ok = 0
+            elif (marks[q] & refined) != 0:
                 ok = 0
             elif (marks[q] & hidden) != 0:
                 ok = 0
             else:
-                if level[q] > deepest:
-                    deepest = level[q]
-                    owner = q
+                if level[q] == lv:
+                    if q == n:
+                        seen = 1
+                    elif seen == 0:
+                        ok = 0
                 a_min = min(a_min, values[q])
                 a_max = max(a_max, values[q])
-        keep[e] = 1 if ok == 1 and owner == n and a_min <= value and value <= a_max else 0
+        keep[e] = 1 if ok == 1 and a_min <= value and value <= a_max else 0
 
 
 @tack.kernel
@@ -461,8 +348,6 @@ def crossing_cells(octree, r, value):
 
     d = octree.dimension
     corners = 1 << d
-    nx, ny, nz = ([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3]
-    tree, carried, level, count = _search_arrays(octree)
     dtype = octree.roots.dtype
     active, n_active = _active_leaves(octree, r, value)
     with octree.device:
@@ -470,16 +355,9 @@ def crossing_cells(octree, r, value):
         cells = tack.empty((entries * corners,), tack.i64)
         keep = tack.empty((entries,), tack.i32)
         kept = 0
-        if entries and _split_searches(octree.device):
-            _corner_holders(active, tree, carried, level, octree.key, count, nx, ny, nz,
-                            octree.finest, d, cells)
-            _owned_cells(active, cells, level, octree.marks, int(Ghosts.HIDDENCELL), r.values,
-                         float(value), corners, keep)
-        elif entries:
-            _owned_cells_chained(active, tree, carried, level, octree.key, count, nx, ny, nz,
-                                 octree.finest, d, octree.marks, int(Ghosts.HIDDENCELL),
-                                 r.values, float(value), cells, keep)
         if entries:
+            _owned_cells(active, 3 ** d, d, octree.level, octree.marks, int(Ghosts.REFINEDCELL),
+                         int(Ghosts.HIDDENCELL), r.values, float(value), cells, keep)
             numbers = tack.empty((entries,), tack.i64)
             kept = int(inclusive_scan(keep, numbers, entries))
         rows = tack.empty((kept * corners,), tack.i64)
@@ -510,12 +388,210 @@ def crossing_cells(octree, r, value):
     return data
 
 
+# -- the surface, in 3D ----------------------------------------------------------------
+
+#: Entries a case of VTK's hexahedron table: three corners of up to five triangles.
+_HEX_CASE = tack.constant(3 * _ct.HEXAHEDRON_MAX_TRIANGLES, tack.i32)
+
+
+@tack.kernel
+def _active_numbers(active, span, count, out):
+    for a in range(count):
+        out[active[a * span + span // 2]] = tack.i32(a)
+
+
+@tack.func
+def _edge_ends(active, base, v, e):
+    # The leaves at the ends of hexahedron edge e of corner v's cell, the lower
+    # along the edge's axis first, and that axis (0, 1, 2).
+    ja = _HEXAHEDRON_EDGES[2 * e]
+    jb = _HEXAHEDRON_EDGES[2 * e + 1]
+    ax = (ja ^ (ja >> 1)) & 1
+    ay = (ja >> 1) & 1
+    az = (ja >> 2) & 1
+    bx = (jb ^ (jb >> 1)) & 1
+    by = (jb >> 1) & 1
+    bz = (jb >> 2) & 1
+    axis = 0 if ax != bx else (1 if ay != by else 2)
+    p = active[base + _slot_offset(v, ja, 3)]
+    q = active[base + _slot_offset(v, jb, 3)]
+    # The two corners differ along the axis alone, so the sums tell the lower.
+    if ax + ay + az > bx + by + bz:
+        p, q = q, p
+    return p, q, axis
+
+
+@tack.func
+def _edge_slot(p, q, axis, level, number):
+    # The dual edge between p and q (p the lower along the axis), as the face it
+    # crosses: the finer leaf's face toward the other, or the lower's upper face
+    # between equals -- one slot a dual edge, among 6 an active leaf.
+    return number[p] * 6 + 2 * axis + 1 if level[p] >= level[q] else number[q] * 6 + 2 * axis
+
+
+@tack.func
+def _corner_edge(active, base, v, case, t, i):
+    # Corner i of triangle t of the case: its dual edge's ends and axis.
+    return _edge_ends(active, base, v, _ct.HEXAHEDRON_EDGES[case * _HEX_CASE + 3 * t + i])
+
+
+@tack.func
+def _triangle_slots(active, base, v, case, t, level, number):
+    p0, q0, a0 = _corner_edge(active, base, v, case, t, 0)
+    p1, q1, a1 = _corner_edge(active, base, v, case, t, 1)
+    p2, q2, a2 = _corner_edge(active, base, v, case, t, 2)
+    return _edge_slot(p0, q0, a0, level, number), _edge_slot(p1, q1, a1, level, number), \
+        _edge_slot(p2, q2, a2, level, number)
+
+
+@tack.kernel
+def _triangle_counts(active, span, level, marks, refined, hidden, number, values, value, cases,
+                     counts):
+    # Corner e (leaf e // 8, corner e % 8): its cell's marching-cubes case (a bit
+    # a corner at or above ``value``) when its leaf owns the cell and every leaf
+    # around is inside, visible and valued (as _owned_cells keeps it), and the
+    # case's triangles with three distinct points (a cell's repeated corners, at
+    # a hanging corner, collapse some); 0 otherwise.
+    for e in range(counts.shape[0]):
+        base = (e // 8) * span
+        v = e % 8
+        n = active[base + span // 2]
+        lv = level[n]
+        ok = 1
+        seen = 0
+        case = 0
+        for s in range(8):
+            q = active[base + _slot_offset(v, s, 3)]
+            if q < 0:
+                ok = 0
+            elif (marks[q] & refined) != 0:
+                ok = 0
+            elif (marks[q] & hidden) != 0:
+                ok = 0
+            else:
+                if level[q] == lv:
+                    if q == n:
+                        seen = 1
+                    elif seen == 0:
+                        ok = 0
+                x = values[q]
+                if x >= value:
+                    case = case | (1 << s)
+                if x != x:
+                    ok = 0
+        if ok == 0:
+            case = 0
+        count = 0
+        for t in range(_ct.HEXAHEDRON_CASES[case]):
+            s0, s1, s2 = _triangle_slots(active, base, v, case, t, level, number)
+            if s0 != s1 and s1 != s2 and s0 != s2:
+                count += 1
+        cases[e] = case
+        counts[e] = count
+
+
+@tack.kernel
+def _mark_edges(active, span, cases, counts, level, number, used):
+    for e in range(counts.shape[0]):
+        if counts[e] > 0:
+            base = (e // 8) * span
+            v = e % 8
+            case = cases[e]
+            for t in range(_ct.HEXAHEDRON_CASES[case]):
+                s0, s1, s2 = _triangle_slots(active, base, v, case, t, level, number)
+                if s0 != s1 and s1 != s2 and s0 != s2:
+                    used[s0] = 1
+                    used[s1] = 1
+                    used[s2] = 1
+
+
+@tack.kernel
+def _triangles(active, span, cases, counts, starts, level, number, slots, values, value, lo, size,
+               triangles, positions):
+    # Each triangle's corners as the points of its dual edges, and each point
+    # (every cell meeting it writes the same bits): the crossing interpolated
+    # from the end first by position, as ``contour`` interpolates it.
+    for e in range(counts.shape[0]):
+        if counts[e] > 0:
+            base = (e // 8) * span
+            v = e % 8
+            case = cases[e]
+            at = 3 * starts[e]
+            for t in range(_ct.HEXAHEDRON_CASES[case]):
+                s0, s1, s2 = _triangle_slots(active, base, v, case, t, level, number)
+                if s0 != s1 and s1 != s2 and s0 != s2:
+                    for i in range(3):
+                        p, q, axis = _corner_edge(active, base, v, case, t, i)
+                        pid = slots[_edge_slot(p, q, axis, level, number)] - 1
+                        triangles[at + i] = pid
+                        xp = lo[p] + size[p] * 0.5
+                        xq = lo[q] + size[q] * 0.5
+                        a = p
+                        b = q
+                        if _before(xq, xp):
+                            a = q
+                            b = p
+                        xa = lo[a] + size[a] * 0.5
+                        xb = lo[b] + size[b] * 0.5
+                        w = _crossing(value, values[a], values[b])
+                        positions[pid] = xa + w * (xb - xa)
+                    at += 3
+
+
+def _surface(octree, r, value):
+    """The contour's triangles from the active leaves' owned cells, in one pass
+    (3D)."""
+    from tack.algorithms import exclusive_scan, inclusive_scan
+    from tack.dataset import ids, shapes
+    from tack.dataset.dataset import DataSet, Field
+    from tack.dataset.spaces import H1
+    from tack.dataset.topology import UnstructuredTopology, uniform_cells
+
+    span = 27
+    dtype = octree.roots.dtype
+    active, n_active = _active_leaves(octree, r, value)
+    with octree.device:
+        entries = n_active * 8
+        cases = tack.empty((entries,), tack.i32)
+        counts = tack.empty((entries,), tack.i32)
+        starts = tack.empty((entries,), tack.i64)
+        number = tack.empty((octree.num_nodes,), tack.i32)
+        used = tack.zeros((n_active * 6,), tack.i32)
+        slots = tack.empty((n_active * 6,), tack.i64)
+        n_triangles = n_points = 0
+        if entries:
+            _active_numbers(active, span, n_active, number)
+            _triangle_counts(active, span, octree.level, octree.marks, int(Ghosts.REFINEDCELL),
+                             int(Ghosts.HIDDENCELL), number, r.values, float(value), cases,
+                             counts)
+            n_triangles = int(exclusive_scan(counts, starts, entries))
+        if n_triangles:
+            _mark_edges(active, span, cases, counts, octree.level, number, used)
+            n_points = int(inclusive_scan(used, slots, n_active * 6))
+        idt = ids.choose(None, max(n_points, 3 * n_triangles))
+        triangles = tack.empty((3 * n_triangles,), idt)
+        positions = tack.empty((n_points,), tack.vec3(dtype))
+        if n_triangles:
+            lo, size = octree.geometry()
+            _triangles(active, span, cases, counts, starts, octree.level, number, slots, r.values,
+                       float(value), lo, size, triangles, positions)
+        types, offsets = uniform_cells(shapes.TRIANGLE, n_triangles, idt)
+        topology = UnstructuredTopology(types, offsets, triangles, num_points=n_points)
+        data = DataSet(topology, positions, dtype=dtype, **octree._frame())
+        data.fields[r.name] = Field(H1(data), tack.full((n_points,), float(value), r.values.dtype),
+                                    octree.units.get(r.name))
+    return data
+
+
 def contour(octree, name, value, r=None):
     """The contour of cell field ``name`` at ``value``: the dual grid's contour
     (``contour(dual_grid(octree), name, value)``), made from the dual cells the
-    surface crosses alone. ``r`` (``ranges(octree, name)``) may be given to share
-    the field's ranges between contours."""
+    surface crosses alone -- in 3D in one pass over them, its points named by
+    the faces the dual edges cross. ``r`` (``ranges(octree, name)``) may be
+    given to share the field's ranges between contours."""
     from tack.dataset.algorithms.contour import contour as contour_of
 
     r = ranges(octree, name) if r is None else r
+    if octree.dimension == 3:
+        return _surface(octree, r, value)
     return contour_of(crossing_cells(octree, r, value), name, value)

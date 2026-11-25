@@ -26,10 +26,11 @@ from typing import NamedTuple
 import numpy as np
 
 import tack
+from tack.dataset.ghosts import Ghosts
 from tack.dataset.octree import _unkey
 
-__all__ = ["OctreeFaces", "faces", "lattice_boxes", "parents", "refined_by_level",
-           "subtree_ends"]
+__all__ = ["OctreeChildren", "OctreeFaces", "children", "faces", "lattice_boxes",
+           "nodes_per_level", "parents", "refined_by_level", "root_rows", "subtree_ends"]
 
 #: Above every level, for the last node at a carried key.
 _DEEPEST = tack.constant(127, tack.i32)
@@ -229,6 +230,99 @@ def _last_child_ends(nodes, dimension, end):
         for j in range(1 << dimension):
             c = end[c]
         end[n] = c
+
+
+@tack.kernel
+def _refined_flags(marks, refined, out):
+    for n in range(out.shape[0]):
+        out[n] = 1 if (marks[n] & refined) != 0 else 0
+
+
+@tack.kernel
+def _child_table(numbers, marks, refined, end, dimension, children):
+    # A refined node's children in key order: the next node, then each child's
+    # subtree end.
+    for n in range(numbers.shape[0]):
+        if (marks[n] & refined) != 0:
+            r = numbers[n] - 1
+            c = n + 1
+            for j in range(1 << dimension):
+                children[r * (1 << dimension) + j] = tack.i32(c)
+                c = end[c]
+
+
+class OctreeChildren(NamedTuple):
+    """Each refined node's number among the refined nodes, from 1 (``number``,
+    i32, one a node, meaningless at leaves) and the children of each refined
+    node in key order (``children``, i32, ``2^d`` a refined node): node ``n``'s
+    child ``j`` is ``children[(number[n] - 1) * 2^d + j]``."""
+
+    number: tack.Array
+    children: tack.Array
+
+
+def children(octree):
+    """The children table of the refined nodes (``OctreeChildren``), made once an
+    octree from the subtree ends: a child by its octant in two reads, where
+    hopping the ends takes up to ``2^d``. A tenth of the nodes' size in 3D (a
+    number a node, eight children a refined node, as i32)."""
+    from tack.algorithms import inclusive_scan
+
+    cached = getattr(octree, "_children", None)
+    if cached is not None:
+        return cached
+    n, d = octree.num_nodes, octree.dimension
+    refined = int(Ghosts.REFINEDCELL)
+    with octree.device:
+        number = tack.empty((n,), tack.i32)
+        count = 0
+        if n:
+            flags = tack.empty((n,), tack.i32)
+            _refined_flags(octree.marks, refined, flags)
+            count = int(inclusive_scan(flags, number, n))
+        table = tack.empty((count << d,), tack.i32)
+        if count:
+            _child_table(number, octree.marks, refined, subtree_ends(octree), d, table)
+    octree._children = OctreeChildren(number, table)
+    return octree._children
+
+
+def nodes_per_level(octree):
+    """How many nodes each level has, as a host array of ``finest + 2`` counts
+    (the last 0), made once an octree: a count over a million levels costs 4
+    ms, which the descent paid at every call."""
+    cached = getattr(octree, "_nodes_per_level", None)
+    if cached is None:
+        cached = np.bincount(octree._level, minlength=octree.finest + 2)
+        octree._nodes_per_level = cached
+    return cached
+
+
+def root_rows(octree):
+    """Each root's neighbourhood: for the nodes of level 0, in their order, the
+    root node at each of the 3^d offsets (x fastest, the root itself in the
+    middle), -1 beyond the roots' grid or where no tree has nodes; a device i32
+    array, made once an octree. The descent starts from these rows."""
+    cached = getattr(octree, "_root_rows", None)
+    if cached is not None:
+        return cached
+    d = octree.dimension
+    dims = np.array(([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3])
+    roots = np.flatnonzero(octree._level == 0)
+    root_of = np.full(int(dims.prod()), -1, np.int64)
+    root_of[octree._tree[roots]] = roots
+    t = octree._tree[roots]
+    at = np.stack([t % dims[0], (t // dims[0]) % dims[1], t // (dims[0] * dims[1])], axis=1)
+    offsets = np.stack(np.meshgrid(*([np.arange(-1, 2)] * d + [np.zeros(1, np.int64)] * (3 - d)),
+                                   indexing="ij"), axis=-1).reshape(-1, 3)
+    offsets = offsets[np.lexsort(offsets.T)]                         # x fastest
+    q = at[:, None, :] + offsets[None, :, :]
+    inside = ((q >= 0) & (q < dims)).all(axis=2)
+    q = np.clip(q, 0, dims - 1)
+    rows = np.where(inside, root_of[q[..., 0] + dims[0] * (q[..., 1] + dims[1] * q[..., 2])], -1)
+    with octree.device:
+        octree._root_rows = tack.array(rows.reshape(-1).astype(np.int32), tack.i32)
+    return octree._root_rows
 
 
 def _searched_subtree_ends(octree):
