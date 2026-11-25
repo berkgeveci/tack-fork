@@ -18,6 +18,7 @@ one image. ``composite`` blends it over a frame.
 from math import sqrt
 
 import numpy as np
+import tack_march
 import volume_tack
 from tack_volume import TackVolume
 
@@ -112,7 +113,11 @@ class TackRenderer:
         self.grid, self.lows, self.highs = volume_tack.macro_grid(self.box, cells, self.bounds,
                                                                   coarse, macrocells)
         self.amr = getattr(prepare, "amr", None)
-        self._seen = (None, None)
+        self._seen = (None, None, None)
+        #: The march made for Tack (``tack_march``); None for an image, which the
+        #: shader's march (``volume_tack._march``) renders.
+        self.tents = (tack_march.Tents(self.box)
+                      if isinstance(self.box, volume_tack.AMRVolume) else None)
 
     def table(self, color, opacity, lo, hi, size=256):
         """VTK's transfer functions sampled over ``[lo, hi]``: ``(size, 4)`` f32."""
@@ -122,7 +127,7 @@ class TackRenderer:
         return np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32)
 
     def render(self, camera, size, table, lo, hi, depth=None, sample_distance=0.5,
-               unit_distance=1.0, min_step=0.0, jitter=0.0):
+               unit_distance=1.0, min_step=0.0, jitter=0.0, fast=True):
         """The volume seen by ``camera`` at ``size`` (w, h): ``(h, w, 4)`` f32,
         premultiplied, row 0 at the top. With ``depth`` (the frame's, ``frame_depth``)
         each ray ends at the frame's surface. Steps are ``sample_distance`` local cells
@@ -148,8 +153,14 @@ class TackRenderer:
         _rays(inverse, depths, ends, w, h, *(float(v) for v in self.bounds), starts, dirs,
               tmins, tmaxs)
         key = (table.tobytes(), lo, hi)
+        fast = fast and self.tents is not None
         if self._seen[0] != key:
-            self._seen = (key, volume_tack.visible(self.lows, self.highs, table, lo, hi))
+            seen = volume_tack.visible(self.lows, self.highs, table, lo, hi)
+            words = None
+            if self.tents is not None:
+                words = tack_march.macro_words(seen, self.box.macro_first,
+                                               self.box.macro_last, self.grid["dims"])
+            self._seen = (key, seen, words)
         out = tack.empty((count,), tack.vec4(tack.f32))
         grid = self.grid
         arrays = (starts, dirs, tmins, tmaxs, tack.array(table, tack.vec4()),
@@ -157,11 +168,18 @@ class TackRenderer:
         t1 = t0
         tack.sync()
         t2 = time.perf_counter()
-        volume_tack._march(
-            self.box, *arrays,
-            self._seen[1], float(lo), float(hi), float(sample_distance), float(min_step),
-            float(unit_distance * self.cell), *grid["dims"], *grid["origin"], *grid["size"],
-            float(0.01 * self.cell), float(jitter), int(size[0]), out)
+        if fast:
+            tack_march.march(
+                self.tents, *arrays[:5], self._seen[2], float(lo), float(hi),
+                float(sample_distance), float(min_step), float(unit_distance * self.cell),
+                *grid["dims"], *grid["origin"], *grid["size"], float(0.01 * self.cell),
+                float(jitter), int(size[0]), out)
+        else:
+            volume_tack._march(
+                self.box, *arrays,
+                self._seen[1], float(lo), float(hi), float(sample_distance), float(min_step),
+                float(unit_distance * self.cell), *grid["dims"], *grid["origin"],
+                *grid["size"], float(0.01 * self.cell), float(jitter), int(size[0]), out)
         tack.sync()
         t3 = time.perf_counter()
         picture = out.numpy().reshape(size[1], size[0], 4)
