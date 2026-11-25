@@ -57,6 +57,9 @@ from tack.dataset.algorithms._common import _crossing
 from tack.dataset.ghosts import Ghosts, _before
 from tack.dataset.octree import _compute_type
 from tack.dataset.octree_topology import (
+    _descend,
+    _octant,
+    _parent_offset,
     children,
     nodes_per_level,
     refined_by_level,
@@ -122,44 +125,6 @@ def ranges(octree, name):
 
 
 # -- the descent ---------------------------------------------------------------------
-
-
-@tack.func
-def _parent_offset(j, o, dimension):
-    # Child j's (its octant's bits, x lowest) neighbour at offset o is in its
-    # parent's neighbour at this offset of the parent's row: the child lattice
-    # position (u) of the neighbour is -1..2 along each axis, in the parent's
-    # neighbour at its half (-1, 0, 0, 1).
-    ux = (j & 1) + o % 3 - 1
-    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
-    po = (ux + 2) // 2 + 3 * ((uy + 2) // 2)
-    if dimension == 3:
-        uz = ((j >> 2) & 1) + o // 9 - 1
-        po = po + 9 * ((uz + 2) // 2)
-    return po
-
-
-@tack.func
-def _octant(j, o, dimension):
-    # ...and, when that neighbour is refined, at this octant of it: the child
-    # lattice position's parity.
-    ux = (j & 1) + o % 3 - 1
-    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
-    c = ((ux + 2) & 1) + 2 * ((uy + 2) & 1)
-    if dimension == 3:
-        uz = ((j >> 2) & 1) + o // 9 - 1
-        c = c + 4 * ((uz + 2) & 1)
-    return c
-
-
-@tack.func
-def _descend(p, c, dimension, marks, refined, number, table):
-    # Entry p of a parent's row, at a child's: p itself (a leaf, or -1), or its
-    # child at octant c.
-    if p >= 0:
-        if (marks[p] & refined) != 0:
-            p = table[(number[p] - 1) * (1 << dimension) + c]
-    return p
 
 
 @tack.kernel

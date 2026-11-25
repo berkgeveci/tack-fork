@@ -18,15 +18,16 @@ leaf is left out.
 Every algorithm on hexahedra with point data then runs on it (``contour``,
 ``slice``, ``probe`` with interpolation, ``streamlines``).
 
-Built on the device: 21 ms for 77,000 leaves and 67 ms for 300,000 on yavin's
-CPU, against 0.48 and 2.1 s for the host build it replaced (``_dual_grid_host``,
-kept to check it).
+Built on the device from every node's carried neighbourhood, no search (the
+host build, ``_dual_grid_host``, is kept to check it: 0.48 s at 77,000
+leaves).
 """
 
 import numpy as np
 
 import tack
 from tack.dataset.ghosts import Ghosts
+from tack.dataset.octree_contour import _slot_offset
 from tack.dataset.octree_topology import _holder, _search_arrays, lattice_boxes
 
 __all__ = ["dual_grid"]
@@ -117,50 +118,6 @@ def _dual_grid_host(octree):
 
 
 @tack.kernel
-def _interior_runs(si, sj, sk, flags, ex, ey, ez, dimension, keep):
-    # A run's first entry (a distinct corner) strictly inside the domain.
-    for s in range(keep.shape[0]):
-        inside = si[s] > 0 and si[s] < ex and sj[s] > 0 and sj[s] < ey
-        if dimension == 3:
-            inside = inside and sk[s] > 0 and sk[s] < ez
-        keep[s] = 1 if flags[s] == 1 and inside else 0
-
-
-@tack.kernel
-def _compact_corners(si, sj, sk, keep, numbers, px, py, pz):
-    for s in range(keep.shape[0]):
-        if keep[s] == 1:
-            k = numbers[s] - 1
-            px[k] = si[s]
-            py[k] = sj[s]
-            pz[k] = sk[s]
-
-
-@tack.kernel
-def _whole_cells(nodes, marks, hidden, corners, keep):
-    # A corner makes a cell when every leaf around it is inside and visible.
-    for q in range(keep.shape[0]):
-        ok = 1
-        for v in range(corners):
-            n = nodes[q * corners + v]
-            if n < 0:
-                ok = 0
-            elif (marks[n] & hidden) != 0:
-                ok = 0
-        keep[q] = ok
-
-
-@tack.kernel
-def _cell_points(nodes, keep, numbers, number, corners, connectivity):
-    # A kept corner's cell: its leaves' numbers, the dual grid's point ids.
-    for q in range(keep.shape[0]):
-        if keep[q] == 1:
-            k = numbers[q] - 1
-            for v in range(corners):
-                connectivity[k * corners + v] = number[nodes[q * corners + v]] - 1
-
-
-@tack.kernel
 def _leaf_flags(marks, refined, out):
     for n in range(out.shape[0]):
         out[n] = 1 if (marks[n] & refined) == 0 else 0
@@ -173,63 +130,85 @@ def _leaf_centres(leaf, lo, size, out):
         out[c] = lo[n] + size[n] * 0.5
 
 
+@tack.kernel
+def _dual_cells(leaf, rows, span, dimension, level, marks, refined, hidden, cells, keep):
+    # Corner e (leaf e // corners, corner e % corners): its cell's leaves in a
+    # hexahedron's order from the leaf's row (as the contour's _owned_cells),
+    # kept when the leaf owns the corner (the finest leaf around: none refined,
+    # none as fine in a lower slot) and every leaf around is inside and visible.
+    for e in range(keep.shape[0]):
+        corners = 1 << dimension
+        n = leaf[e // corners]
+        base = n * span
+        v = e % corners
+        lv = level[n]
+        ok = 1
+        seen = 0
+        for s in range(corners):
+            q = rows[base + _slot_offset(v, s, dimension)]
+            cells[e * corners + s] = tack.i64(q)
+            if q < 0:
+                ok = 0
+            elif (marks[q] & refined) != 0:
+                ok = 0
+            elif (marks[q] & hidden) != 0:
+                ok = 0
+            elif level[q] == lv:
+                if q == n:
+                    seen = 1
+                elif seen == 0:
+                    ok = 0
+        keep[e] = ok
+
+
 def dual_grid(octree):
     """The dual grid of ``octree``'s visible leaves: a ``DataSet`` of hexahedra
     (quads in 2D), point ``c`` the ``c``-th leaf's centre (as ``leaves()``
-    numbers them), every field as point data. On the device: the leaves'
-    corners sorted and numbered by runs (as ``leaves()`` finds its points), the
-    interior ones kept, the leaves around each found by a search of the keys,
-    and the cells around hidden leaves or the boundary dropped."""
-    from tack.algorithms import argsort, gather, inclusive_scan
+    numbers them), every field as point data. On the device, with no search:
+    every node's neighbourhood carried down the tree (``neighbourhoods``), each
+    leaf makes the cells of the corners it owns (the finest leaf around a
+    corner, the lowest slot on a tie) from its row, as the pruned contour makes
+    the cells it needs; cells around hidden leaves or the boundary dropped.
+    (The first device form sorted the leaves' corners and searched the keys for
+    the leaves around each: 199 ms of 8 threads at 1M leaves.)"""
+    from tack.algorithms import gather, inclusive_scan
     from tack.dataset import ids, shapes
     from tack.dataset.dataset import DataSet, Field
-    from tack.dataset.octree import _leaf_corners, _run_starts
+    from tack.dataset.octree_contour import _cell_rows, _renumber
+    from tack.dataset.octree_topology import neighbourhoods
     from tack.dataset.spaces import H1
     from tack.dataset.topology import UnstructuredTopology, uniform_cells
 
     d = octree.dimension
     corners = 1 << d
-    finest = octree.finest
-    nx, ny, nz = ([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3]
-    count = int(octree.is_leaf.sum())
-    entries = count * corners
+    span = 3 ** d
+    leaf = np.flatnonzero(octree.is_leaf)
+    count = len(leaf)
     dtype = octree.roots.dtype
     with octree.device:
-        leaf = tack.array(np.flatnonzero(octree.is_leaf).astype(np.int64), tack.i64)
-        columns = [tack.empty((entries,), tack.i64) for _ in range(3)]
-        m = 0
+        leaf = tack.array(leaf.astype(np.int64), tack.i64)
+        entries = count * corners
+        cells = tack.empty((entries * corners,), tack.i64)
+        keep = tack.empty((entries,), tack.i32)
+        kept = 0
         if entries:
-            _leaf_corners(leaf, octree.tree, octree.level, octree.key, nx, ny, d, finest,
-                          *columns)
-            order = argsort(columns[0], index_dtype=tack.i64)
-            for column in columns[1:d]:
-                order = gather(order, argsort(gather(column, order), index_dtype=tack.i64))
-            si, sj, sk = (gather(c, order) for c in columns)
-            flags = tack.empty((entries,), tack.i32)
-            _run_starts(si, sj, sk, flags)
-            keep = tack.empty((entries,), tack.i32)
-            _interior_runs(si, sj, sk, flags, nx << finest, ny << finest, nz << finest, d, keep)
+            rows = neighbourhoods(octree)
+            _dual_cells(leaf, rows, span, d, octree.level, octree.marks, int(Ghosts.REFINEDCELL),
+                        int(Ghosts.HIDDENCELL), cells, keep)
+            del rows
             numbers = tack.empty((entries,), tack.i64)
-            m = int(inclusive_scan(keep, numbers, entries))
-        px, py, pz = (tack.empty((m,), tack.i64) for _ in range(3))
-        nodes = tack.empty((m * corners,), tack.i64)
-        cells = 0
-        if m:
-            _compact_corners(si, sj, sk, keep, numbers, px, py, pz)
-            _around(px, py, pz, nx, ny, nz, finest, d, *_search_arrays(octree), nodes)
-            whole = tack.empty((m,), tack.i32)
-            _whole_cells(nodes, octree.marks, int(Ghosts.HIDDENCELL), corners, whole)
-            cell_numbers = tack.empty((m,), tack.i64)
-            cells = int(inclusive_scan(whole, cell_numbers, m))
-        idt = ids.choose(None, max(count, cells * corners))
-        connectivity = tack.empty((cells * corners,), idt)
-        if cells:
+            kept = int(inclusive_scan(keep, numbers, entries))
+        idt = ids.choose(None, max(count, kept * corners))
+        connectivity = tack.empty((kept * corners,), idt)
+        if kept:
+            cell_nodes = tack.empty((kept * corners,), tack.i64)
+            _cell_rows(cells, keep, numbers, corners, cell_nodes)
             is_leaf = tack.empty((octree.num_nodes,), tack.i64)
             _leaf_flags(octree.marks, int(Ghosts.REFINEDCELL), is_leaf)
             number = tack.empty((octree.num_nodes,), tack.i64)
             inclusive_scan(is_leaf, number, octree.num_nodes)
-            _cell_points(nodes, whole, cell_numbers, number, corners, connectivity)
-        types, offsets = uniform_cells(shapes.HEXAHEDRON if d == 3 else shapes.QUAD, cells, idt)
+            _renumber(cell_nodes, number, connectivity)
+        types, offsets = uniform_cells(shapes.HEXAHEDRON if d == 3 else shapes.QUAD, kept, idt)
         topology = UnstructuredTopology(types, offsets, connectivity, num_points=count)
         lo, size = octree.geometry()
         positions = tack.empty((count,), tack.vec3(dtype))

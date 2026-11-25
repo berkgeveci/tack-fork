@@ -25,34 +25,11 @@ import numpy as np
 import tack
 from tack.dataset import units as _units
 from tack.dataset.ghosts import Ghosts
-from tack.dataset.octree import OctreeDataSet, _compute_type, _root_axes, _run_starts, _unkey
-from tack.dataset.octree_filters import average_up
-from tack.dataset.octree_topology import _interleave, children, refined_by_level
+from tack.dataset.octree import OctreeDataSet, _compute_type, _root_axes, _run_starts
+from tack.dataset.octree_filters import _dropped, average_up
+from tack.dataset.octree_topology import children, refined_by_level
 
 __all__ = ["project_along"]
-
-
-@tack.kernel
-def _dropped(tree, level, key, nx, ny, axis, finest, out_tree, out_level, out_key):
-    # Each node dropped onto the plane of the other two axes: its root column,
-    # level, and 2D key (the other two axes' bits, in order).
-    for n in range(tree.shape[0]):
-        lv = level[n]
-        i, j, m = _unkey(key[n], lv, 3)
-        t = tree[n]
-        ti = t % nx
-        tj = (t // nx) % ny
-        tk = t // (nx * ny)
-        if axis == 0:
-            out_tree[n] = tj + ny * tk
-            out_key[n] = _interleave(j, m, tack.u64(0), lv, 2)
-        elif axis == 1:
-            out_tree[n] = ti + nx * tk
-            out_key[n] = _interleave(i, m, tack.u64(0), lv, 2)
-        else:
-            out_tree[n] = ti + nx * tj
-            out_key[n] = _interleave(i, j, tack.u64(0), lv, 2)
-        out_level[n] = tack.i64(lv)
 
 
 @tack.kernel

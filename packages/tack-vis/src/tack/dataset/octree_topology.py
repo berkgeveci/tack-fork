@@ -32,8 +32,8 @@ import tack
 from tack.dataset.ghosts import Ghosts
 
 __all__ = ["OctreeChildren", "OctreeFaces", "children", "face_neighbours", "faces",
-           "lattice_boxes", "nodes_per_level", "parents", "refined_by_level", "root_rows",
-           "subtree_ends"]
+           "lattice_boxes", "neighbourhoods", "nodes_per_level", "parents", "refined_by_level",
+           "root_rows", "subtree_ends"]
 
 #: Above every level, for the last node at a carried key.
 _DEEPEST = tack.constant(127, tack.i32)
@@ -99,6 +99,89 @@ def _holder(gi, gj, gk, nx, ny, nz, finest, dimension, tree, carried, level, cou
                            finest, dimension)
         found = _lower_bound(tree, carried, level, count, t, code, _DEEPEST) - 1
     return found
+
+
+@tack.func
+def _parent_offset(j, o, dimension):
+    # Child j's (its octant's bits, x lowest) neighbour at offset o is in its
+    # parent's neighbour at this offset of the parent's row: the child lattice
+    # position (u) of the neighbour is -1..2 along each axis, in the parent's
+    # neighbour at its half (-1, 0, 0, 1).
+    ux = (j & 1) + o % 3 - 1
+    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
+    po = (ux + 2) // 2 + 3 * ((uy + 2) // 2)
+    if dimension == 3:
+        uz = ((j >> 2) & 1) + o // 9 - 1
+        po = po + 9 * ((uz + 2) // 2)
+    return po
+
+
+@tack.func
+def _octant(j, o, dimension):
+    # ...and, when that neighbour is refined, at this octant of it: the child
+    # lattice position's parity.
+    ux = (j & 1) + o % 3 - 1
+    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
+    c = ((ux + 2) & 1) + 2 * ((uy + 2) & 1)
+    if dimension == 3:
+        uz = ((j >> 2) & 1) + o // 9 - 1
+        c = c + 4 * ((uz + 2) & 1)
+    return c
+
+
+@tack.func
+def _descend(p, c, dimension, marks, refined, number, table):
+    # Entry p of a parent's row, at a child's: p itself (a leaf, or -1), or its
+    # child at octant c.
+    if p >= 0:
+        if (marks[p] & refined) != 0:
+            p = table[(number[p] - 1) * (1 << dimension) + c]
+    return p
+
+
+@tack.kernel
+def _root_neighbourhoods(rows, count, span, out):
+    for k in range(count):
+        n = rows[k * span + span // 2]
+        for o in range(span):
+            out[n * span + o] = rows[k * span + o]
+
+
+@tack.kernel
+def _child_neighbourhoods(nodes, number, table, marks, refined, dimension, span, rows):
+    # A refined node's children's rows from its own (as the contour's descent
+    # makes them), by node.
+    for k in range(nodes.shape[0]):
+        n = nodes[k]
+        corners = 1 << dimension
+        r = (number[n] - 1) * corners
+        for j in range(corners):
+            c = table[r + j]
+            for o in range(span):
+                rows[c * span + o] = _descend(rows[n * span + _parent_offset(j, o, dimension)],
+                                              _octant(j, o, dimension), dimension, marks,
+                                              refined, number, table)
+
+
+def neighbourhoods(octree):
+    """Every node's row: its 3^d neighbours at its level (x fastest, the node in
+    the middle), each the node there, or the coarser leaf holding the place,
+    or -1 beyond the roots; a device i32 array of ``3^d`` entries a node, from
+    the roots' rows down through the children table. Not cached (108 MB at 1M
+    leaves): the dual grid builds it and lets it go."""
+    d = octree.dimension
+    span = 3 ** d
+    n = octree.num_nodes
+    number, table = children(octree)
+    with octree.device:
+        out = tack.empty((n * span,), tack.i32)
+        if n:
+            rows = root_rows(octree)
+            _root_neighbourhoods(rows, len(rows) // span, span, out)
+            for nodes in reversed(refined_by_level(octree)):
+                _child_neighbourhoods(nodes, number, table, octree.marks,
+                                      int(Ghosts.REFINEDCELL), d, span, out)
+    return out
 
 
 @tack.kernel

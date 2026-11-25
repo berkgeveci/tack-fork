@@ -24,8 +24,8 @@ import numpy as np
 
 import tack
 from tack.dataset.ghosts import Ghosts
-from tack.dataset.octree import OctreeDataSet, _root_axes
-from tack.dataset.octree_topology import subtree_ends
+from tack.dataset.octree import OctreeDataSet, _root_axes, _unkey
+from tack.dataset.octree_topology import _interleave, subtree_ends
 
 __all__ = ["average_up", "axis_slice", "cell_gradients", "limit_depth", "threshold"]
 
@@ -154,15 +154,53 @@ def threshold(octree, name, lower, upper):
     return _with(octree, marks=marks)
 
 
-def _coordinates(octree):
-    """Each node's integer coordinates in its tree at its level, ``(n, 3)``."""
-    d = octree.dimension
-    key, level = octree._key, octree._level
-    index = np.zeros((len(key), 3), np.int64)
-    for b in range(int(level.max()) + 1 if len(level) else 0):
-        for a in range(d):
-            index[:, a] |= ((key >> np.uint64(d * b + a)) & np.uint64(1)).astype(np.int64) << b
-    return index
+@tack.kernel
+def _dropped(tree, level, key, nx, ny, axis, finest, out_tree, out_level, out_key):
+    # Each node dropped onto the plane of the other two axes: its root column,
+    # level, and 2D key (the other two axes' bits, in order).
+    for n in range(tree.shape[0]):
+        lv = level[n]
+        i, j, m = _unkey(key[n], lv, 3)
+        t = tree[n]
+        ti = t % nx
+        tj = (t // nx) % ny
+        tk = t // (nx * ny)
+        if axis == 0:
+            out_tree[n] = tj + ny * tk
+            out_key[n] = _interleave(j, m, tack.u64(0), lv, 2)
+        elif axis == 1:
+            out_tree[n] = ti + nx * tk
+            out_key[n] = _interleave(i, m, tack.u64(0), lv, 2)
+        else:
+            out_tree[n] = ti + nx * tj
+            out_key[n] = _interleave(i, j, tack.u64(0), lv, 2)
+        out_level[n] = tack.i64(lv)
+
+
+@tack.kernel
+def _on_plane(tree, level, key, nx, ny, axis, root, g, finest, flags):
+    # The nodes holding the plane: in root ``root`` along the axis, their cell
+    # there holding the finest lattice's cell ``g``.
+    for n in range(flags.shape[0]):
+        lv = level[n]
+        i, j, m = _unkey(key[n], lv, 3)
+        t = tree[n]
+        r = t % nx
+        c = i
+        if axis == 1:
+            r = (t // nx) % ny
+            c = j
+        if axis == 2:
+            r = t // (nx * ny)
+            c = m
+        flags[n] = 1 if r == root and tack.i64(c) == (g >> (finest - lv)) else 0
+
+
+@tack.kernel
+def _flagged(flags, numbers, out):
+    for n in range(flags.shape[0]):
+        if flags[n] == 1:
+            out[numbers[n] - 1] = n
 
 
 def axis_slice(octree, axis, position):
@@ -170,9 +208,10 @@ def axis_slice(octree, axis, position):
     octree: the nodes holding the plane, with their values and marks (a leaf on
     the plane's lower side is taken, as ``probe`` takes it). The 2D octree's x
     and y are the two other axes in order, and its plane's z is ``position``, so
-    a slice along z is in place. Host arrays (a study)."""
+    a slice along z is in place. The nodes are found and dropped onto the plane
+    on the device; the 2D octree is made from the few that hold it."""
+    from tack.algorithms import gather, inclusive_scan
     from tack.dataset.dataset import rectilinear_grid
-    from tack.dataset.octree import _interleave
 
     if octree.dimension != 3:
         raise ValueError("axis_slice takes a 3D octree")
@@ -188,21 +227,24 @@ def axis_slice(octree, axis, position):
     finest = octree.finest
     g = int(np.clip(np.floor((x - lines[root]) / (lines[root + 1] - lines[root]) * (1 << finest)),
                     0, (1 << finest) - 1))
-    dims = [n - 1 for n in octree.roots.topology.point_dims]
-    tree = octree._tree
-    roots_ijk = np.stack([tree % dims[0], (tree // dims[0]) % dims[1],
-                          tree // (dims[0] * dims[1])], axis=1)
-    level = octree._level
-    index = _coordinates(octree)
-    keep = (roots_ijk[:, axis] == root) & (index[:, axis] == (g >> (finest - level)))
-    tree2 = roots_ijk[keep, u] + dims[u] * roots_ijk[keep, v]
-    key2 = _interleave(np.stack([index[keep, u], index[keep, v], np.zeros(keep.sum(), np.int64)],
-                                axis=1), 2)
+    nx, ny, nz = [m - 1 for m in octree.roots.topology.point_dims]
+    n = octree.num_nodes
+    with octree.device:
+        flags = tack.empty((n,), tack.i32)
+        numbers = tack.empty((n,), tack.i64)
+        _on_plane(octree.tree, octree.level, octree.key, nx, ny, axis, root, g, finest, flags)
+        count = int(inclusive_scan(flags, numbers, n)) if n else 0
+        held = tack.empty((count,), tack.i64)
+        if count:
+            _flagged(flags, numbers, held)
+        tree2, level2, key2 = (tack.empty((n,), t) for t in (tack.i64, tack.i64, tack.u64))
+        _dropped(octree.tree, octree.level, octree.key, nx, ny, axis, finest, tree2, level2, key2)
+        tree2, level2, key2 = (gather(a, held).numpy() for a in (tree2, level2, key2))
+        fields = {k: gather(f, held).numpy() for k, f in octree.fields.items()}
+        hidden = (np.asarray(gather(octree.marks, held).numpy()) & Ghosts.HIDDENCELL) != 0
     roots2 = rectilinear_grid(axes[u] + origin[u], axes[v] + origin[v], (float(position),),
                               dtype=octree.roots.dtype, unit=octree.unit)
-    fields = {k: np.asarray(f.numpy())[keep] for k, f in octree.fields.items()}
-    hidden = (octree.marks.numpy()[keep] & Ghosts.HIDDENCELL) != 0
-    return OctreeDataSet(roots2, tree2, level[keep], key2, fields=fields, mask=hidden,
+    return OctreeDataSet(roots2, tree2, level2, key2, fields=fields, mask=hidden,
                          world=octree.world, units=octree.units)
 
 
