@@ -270,6 +270,30 @@ def _advance_split(rows, fcount, bound, packed, numbers, span, dimension, marks,
 
 
 @tack.kernel
+def _advance_entries(rows, fcount, bound, packed, numbers, span, dimension, marks, refined,
+                     number, table, state, active, next_rows):
+    # _advance_rows with a thread an entry of a child's row (and of a kept
+    # leaf's copy): no chain at all; the rows are then tested by _kept_rows.
+    # Launched over bound * 2^d * span.
+    for e in range(bound):
+        corners = 1 << dimension
+        k = e // (span * corners)
+        j = (e // span) % corners
+        o = e % span
+        if k < fcount[0]:
+            p = packed[k]
+            if p == 1:
+                if j == 0:
+                    low = numbers[k] & ((tack.i64(1) << tack.i64(32)) - 1)
+                    active[(state[0] + low - 1) * span + o] = rows[k * span + o]
+            elif p != 0:
+                high = numbers[k] >> tack.i64(32)
+                next_rows[((high - 1) * corners + j) * span + o] = _descend(
+                    rows[k * span + _parent_offset(j, o, dimension)], _octant(j, o, dimension),
+                    dimension, marks, refined, number, table)
+
+
+@tack.kernel
 def _compact_kept(rows, fcount, bound, packed, numbers, span, state, active, next_rows):
     # The two-level descent's start: kept leaves' rows to ``active``, kept
     # refined nodes' own rows to the frontier.
@@ -395,10 +419,14 @@ def _reads_counts(device, bound):
     return device.type == "cpu" or bound > _READ_ABOVE
 
 
-def _split_children(device):
-    """Whether the advance takes a thread a child row (GPUs) or a thread a node,
-    its 2^d children's rows in turn (the CPU)."""
-    return device.type != "cpu"
+def _threads(device):
+    """What a thread of the advance does: a node's 2^d children's rows in turn
+    (``"node"``, the CPU), one child's row (``"child"``, GPUs) or one entry of
+    one (``"entry"``, which forgoes the folded test). Measured on Metal, the
+    descent at 1M leaves: a node 10.8 ms, a child 6.5, an entry 19.7 (its 216
+    threads a node each divide a 64-bit index twice, emulated, and the kept
+    kernel comes back); on the CPU a child costs nothing, an entry 3 ms."""
+    return "node" if device.type == "cpu" else "child"
 
 
 def _active_leaves(octree, r, value):
@@ -416,7 +444,8 @@ def _active_leaves(octree, r, value):
     number, table = children(octree)
     leaves = octree.num_nodes - (len(table) >> d)
     value = float(value)
-    split = _split_children(octree.device)
+    threads = _threads(octree.device)
+    fold = _FOLD_TEST and threads != "entry"
     with octree.device:
         rows = root_rows(octree)
         bound = int(per_level[0])
@@ -436,13 +465,17 @@ def _active_leaves(octree, r, value):
                 next_bound = int(per_level[lv + 1])
                 next_rows = tack.empty((max(next_bound, 1) * span,), tack.i32)
                 next_packed = tack.empty((max(next_bound, 1),), tack.i64)
-                if split:
+                if threads == "entry":
+                    _advance_entries(rows, fcount, (bound << d) * span, packed, numbers, span, d,
+                                     octree.marks, refined, number, table, state, active,
+                                     next_rows)
+                elif threads == "child":
                     _advance_split(rows, fcount, bound << d, packed, numbers, span, d,
                                    octree.marks, refined, number, table, r.lo, r.hi, value,
-                                   int(_FOLD_TEST), state, active, next_rows, next_packed)
+                                   int(fold), state, active, next_rows, next_packed)
                 else:
                     _advance_rows(rows, fcount, bound, packed, numbers, span, d, octree.marks,
-                                  refined, number, table, r.lo, r.hi, value, int(_FOLD_TEST),
+                                  refined, number, table, r.lo, r.hi, value, int(fold),
                                   state, active, next_rows, next_packed)
                 next_fcount = tack.empty((1,), tack.i64)
                 _counts(numbers, fcount, d, state, next_fcount)
@@ -450,7 +483,7 @@ def _active_leaves(octree, r, value):
                 if _reads_counts(octree.device, next_bound):
                     next_bound = int(next_fcount.numpy()[0])
                 bound = next_bound
-                if bound and not _FOLD_TEST:
+                if bound and not fold:
                     _kept_rows(rows, fcount, bound, span, r.lo, r.hi, octree.marks, refined,
                                value, packed)
         else:

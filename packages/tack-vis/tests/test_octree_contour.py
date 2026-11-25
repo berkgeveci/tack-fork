@@ -26,7 +26,8 @@ except ImportError:
 
 @pytest.fixture(autouse=True, params=["folded", "a kept kernel a level", "two levels a step",
                                       "counts on device", "two levels, counts on device",
-                                      "a thread a child", "a thread a child, a kept kernel"])
+                                      "a thread a child", "a thread a child, a kept kernel",
+                                      "a thread an entry"])
 def cpu(request, monkeypatch):
     # The descent's forms: the child rows tested as written (the default), or by
     # a kernel a level; two levels a step; and the counts left on the device
@@ -36,8 +37,9 @@ def cpu(request, monkeypatch):
         monkeypatch.setattr(oc, "_FOLD_TEST", False)
     if "two levels" in request.param:
         monkeypatch.setattr(oc, "_LEVELS_PER_STEP", 2)
-    if "thread a child" in request.param:
-        monkeypatch.setattr(oc, "_split_children", lambda device: True)
+    if "thread a" in request.param:
+        what = "child" if "child" in request.param else "entry"
+        monkeypatch.setattr(oc, "_threads", lambda device: what)
     if "on device" in request.param:
         monkeypatch.setattr(oc, "_reads_counts", lambda device, bound: False)
     tack.set_default_device("cpu")
