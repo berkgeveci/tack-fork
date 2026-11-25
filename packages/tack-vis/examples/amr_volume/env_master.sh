@@ -12,3 +12,10 @@ export SLANGC=$B/slang-2026.22/bin/slangc
 PY=$HOME/Work/tack/tack/.venv/bin/python
 PYM=$HOME/Work/uv-venvs/3.13/bin/python
 cd $T/tack-vis/examples/amr_volume
+# For VTK to draw on the CPU with SwiftShader (tack_view.py --backend Vulkan): Dawn's
+# Vulkan loader and SwiftShader's driver, the only Vulkan driver here.
+#   source env_master.sh && swiftshader && $PYM tack_view.py --backend Vulkan --device metal
+swiftshader() {
+  export DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:$B/dawn-build/Darwin
+  export VK_ICD_FILENAMES=$B/dawn-build/Darwin/vk_swiftshader_icd.json
+}

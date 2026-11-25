@@ -13,6 +13,7 @@ same picture blended on the host (``tack_composite.composite``); otherwise it op
 interactive window.
 
     python tack_view.py [--amrwind] [--close] [--device D] [--size WxH] [--check OUTDIR]
+                        [--backend Vulkan]
 """
 
 import argparse
@@ -107,6 +108,9 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--size", default="1280x800")
     parser.add_argument("--check", default=None, metavar="OUTDIR")
+    parser.add_argument("--backend", default=None,
+                        help="the WebGPU backend VTK draws with (Metal, Vulkan; Vulkan is "
+                             "SwiftShader, on the CPU, when that is the Vulkan driver)")
     args = parser.parse_args()
     tack.set_default_device(args.device)
     size = tuple(int(v) for v in args.size.split("x"))
@@ -172,13 +176,23 @@ def main():
     renderer.AddVolume(volume)
     window = rr.vtkRenderWindow(size=size, off_screen_rendering=bool(args.check))
     window.AddRenderer(renderer)
+    drawn_by = ""
+    if args.backend:
+        from vtkmodules.vtkRenderingWebGPU import vtkWebGPUConfiguration
+
+        configuration = vtkWebGPUConfiguration()
+        configuration.SetBackend(getattr(vtkWebGPUConfiguration.BackendType, args.backend))
+        window.SetWGPUConfiguration(configuration)
+        window.Initialize()
+        drawn_by = (f" on {configuration.GetBackendInUseAsString()} "
+                    f"({' '.join(configuration.ReportCapabilities().split())[:160]})")
     camera = renderer.GetActiveCamera()
     camera.SetFocalPoint(*view[0])
     camera.SetPosition(*view[1])
     camera.SetViewUp(0.0, 0.0, 1.0)
     camera.SetViewAngle(30.0)
     renderer.ResetCameraClippingRange(*b)
-    print(f"render window: {window.GetClassName()}, Tack on {args.device}", flush=True)
+    print(f"render window: {window.GetClassName()}{drawn_by}, Tack on {args.device}", flush=True)
 
     if not args.check:
         interactor = rr.vtkRenderWindowInteractor()
