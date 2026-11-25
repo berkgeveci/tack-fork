@@ -16,7 +16,8 @@ quadtree nodes get their leaves' mean (``average_up``).
 
 With ``weight``, the column's mean weighted by that field along the line of
 sight, ``sum(value * weight * length) / sum(weight * length)`` (yt's weighted
-projection). Grouping on the host (a study).
+projection). Grouped on the device by a sort (the host's ``np.unique`` took
+1.2 s at 1M leaves).
 """
 
 import numpy as np
@@ -24,25 +25,85 @@ import numpy as np
 import tack
 from tack.dataset import units as _units
 from tack.dataset.ghosts import Ghosts
-from tack.dataset.octree import OctreeDataSet, _interleave, _root_axes
-from tack.dataset.octree_filters import _coordinates, average_up
-from tack.dataset.octree_topology import parents
+from tack.dataset.octree import OctreeDataSet, _compute_type, _root_axes, _run_starts, _unkey
+from tack.dataset.octree_filters import average_up
+from tack.dataset.octree_topology import _interleave, children, refined_by_level
 
 __all__ = ["project_along"]
 
 
-def _drop(octree, axis):
-    """Each node dropped onto the plane: (2D tree, level, 2D key), host arrays."""
-    u, v = [a for a in range(3) if a != axis]
-    dims = [n - 1 for n in octree.roots.topology.point_dims]
-    tree = octree._tree
-    root = np.stack([tree % dims[0], (tree // dims[0]) % dims[1], tree // (dims[0] * dims[1])],
-                    axis=1)
-    index = _coordinates(octree)
-    tree2 = root[:, u] + dims[u] * root[:, v]
-    key2 = _interleave(np.stack([index[:, u], index[:, v], np.zeros(len(tree), np.int64)],
-                                axis=1), 2)
-    return tree2, octree._level.copy(), key2
+@tack.kernel
+def _dropped(tree, level, key, nx, ny, axis, finest, out_tree, out_level, out_key):
+    # Each node dropped onto the plane of the other two axes: its root column,
+    # level, and 2D key (the other two axes' bits, in order).
+    for n in range(tree.shape[0]):
+        lv = level[n]
+        i, j, m = _unkey(key[n], lv, 3)
+        t = tree[n]
+        ti = t % nx
+        tj = (t // nx) % ny
+        tk = t // (nx * ny)
+        if axis == 0:
+            out_tree[n] = tj + ny * tk
+            out_key[n] = _interleave(j, m, tack.u64(0), lv, 2)
+        elif axis == 1:
+            out_tree[n] = ti + nx * tk
+            out_key[n] = _interleave(i, m, tack.u64(0), lv, 2)
+        else:
+            out_tree[n] = ti + nx * tj
+            out_key[n] = _interleave(i, j, tack.u64(0), lv, 2)
+        out_level[n] = tack.i64(lv)
+
+
+@tack.kernel
+def _contributions(order, marks, refined_or_hidden, values, weights, size, axis, sums, wsums):
+    # Sorted entry s: its node's value times weight times length along the
+    # axis, and weight times length, for a visible leaf; 0 otherwise.
+    for s in range(order.shape[0]):
+        n = order[s]
+        sums[s] = 0.0
+        wsums[s] = 0.0
+        if (marks[n] & refined_or_hidden) == 0:
+            length = size[n][axis]
+            sums[s] = values[n] * weights[n] * length
+            wsums[s] = weights[n] * length
+
+
+@tack.kernel
+def _runs(flags, numbers, st, sl, sk, count, out_tree, out_level, out_key, offsets):
+    # Each run's first entry: its 2D node, and where it starts.
+    for s in range(flags.shape[0]):
+        if flags[s] == 1:
+            k = numbers[s] - 1
+            out_tree[k] = st[s]
+            out_level[k] = sl[s]
+            out_key[k] = sk[s]
+            offsets[k] = s
+        if s == 0:
+            offsets[count] = flags.shape[0]
+
+
+@tack.kernel
+def _down_to_children(nodes, number, table, dimension, total, wtotal):
+    # A refined node's column so far added to its children's.
+    for k in range(nodes.shape[0]):
+        n = nodes[k]
+        r = (number[n] - 1) * (1 << dimension)
+        for j in range(1 << dimension):
+            c = table[r + j]
+            total[c] = total[c] + total[n]
+            wtotal[c] = wtotal[c] + wtotal[n]
+
+
+@tack.kernel
+def _column_values(total, wtotal, marks, refined, weighted, nan, out):
+    for n in range(out.shape[0]):
+        out[n] = nan
+        if (marks[n] & refined) == 0:
+            if weighted == 0:
+                out[n] = total[n]
+            elif wtotal[n] > 0:
+                out[n] = total[n] / wtotal[n]
 
 
 def project_along(octree, name, axis, weight=None):
@@ -51,51 +112,67 @@ def project_along(octree, name, axis, weight=None):
     roots' lower side along ``axis``) with the field ``name``: on each leaf the
     integral over its column, on refined nodes their leaves' mean. With
     ``weight`` (a field's name), the column's mean of ``name`` weighted by it.
-    Hidden leaves add nothing."""
+    Hidden leaves add nothing. On the device: the nodes dropped onto the plane
+    and grouped by a sort of their (column, level, key), each group's
+    contributions summed by segments; the 2D octree's columns then accumulated
+    down through its children table."""
+    from tack.algorithms import argsort, gather, inclusive_scan, segment_reduce
     from tack.dataset.dataset import rectilinear_grid
 
     if octree.dimension != 3:
         raise ValueError("project_along takes a 3D octree")
     axis = int(axis)
     u, v = [a for a in range(3) if a != axis]
-    tree2, level2, key2 = _drop(octree, axis)
-    rows = np.stack([tree2, level2, key2.astype(np.int64)], axis=1)
-    nodes, inverse = np.unique(rows, axis=0, return_inverse=True)
-    inverse = inverse.reshape(-1)
-
-    marks = octree.marks.numpy()
-    adds = octree.is_leaf & ((marks & Ghosts.HIDDENCELL) == 0)
-    _, size = octree.geometry()
-    length = np.asarray(size.numpy(), np.float64)[:, axis]
-    values = np.asarray(octree._field(name).numpy(), np.float64)
-    w = np.ones(len(values)) if weight is None else \
-        np.asarray(octree._field(weight).numpy(), np.float64)
-    on = np.flatnonzero(adds)
-    sums = np.bincount(inverse[on], values[on] * w[on] * length[on], minlength=len(nodes))
-    weights = np.bincount(inverse[on], w[on] * length[on], minlength=len(nodes))
+    n = octree.num_nodes
+    nx, ny, nz = [m - 1 for m in octree.roots.topology.point_dims]
+    dtype = _compute_type(octree.device, tack.f32)
+    with octree.device:
+        tree2 = tack.empty((n,), tack.i64)
+        level2 = tack.empty((n,), tack.i64)
+        key2 = tack.empty((n,), tack.u64)
+        _dropped(octree.tree, octree.level, octree.key, nx, ny, axis, octree.finest, tree2,
+                 level2, key2)
+        order = argsort(key2, index_dtype=tack.i64)
+        order = gather(order, argsort(gather(level2, order), index_dtype=tack.i64))
+        order = gather(order, argsort(gather(tree2, order), index_dtype=tack.i64))
+        st, sl, sk = (gather(c, order) for c in (tree2, level2, key2))
+        flags = tack.empty((n,), tack.i32)
+        _run_starts(st, sl, sk, flags)
+        numbers = tack.empty((n,), tack.i64)
+        count = int(inclusive_scan(flags, numbers, n))
+        utree, ulevel, ukey = (tack.empty((count,), t) for t in (tack.i64, tack.i64, tack.u64))
+        offsets = tack.empty((count + 1,), tack.i64)
+        _runs(flags, numbers, st, sl, sk, count, utree, ulevel, ukey, offsets)
+        values = octree._field(name).astype(dtype)
+        weights = tack.ones((n,), dtype) if weight is None else octree._field(weight).astype(dtype)
+        _, size = octree.geometry()
+        sums, wsums = tack.empty((n,), dtype), tack.empty((n,), dtype)
+        _contributions(order, octree.marks, int(Ghosts.REFINEDCELL | Ghosts.HIDDENCELL), values,
+                       weights, size, axis, sums, wsums)
+        total = segment_reduce(sums, offsets)
+        wtotal = segment_reduce(wsums, offsets)
 
     axes = _root_axes(octree.roots)
     origin = np.asarray(octree.origin, np.float64)
     roots = rectilinear_grid(axes[u] + origin[u], axes[v] + origin[v],
                              (float(axes[axis][0] + origin[axis]),),
                              dtype=octree.roots.dtype, unit=octree.unit)
-    out = OctreeDataSet(roots, nodes[:, 0], nodes[:, 1], nodes[:, 2].astype(np.uint64),
-                        fields={"sum": sums, "weight": weights}, world=octree.world)
+    out = OctreeDataSet(roots, utree.numpy(), ulevel.numpy(), ukey.numpy(),
+                        fields={"sum": total.numpy(), "weight": wtotal.numpy()},
+                        world=octree.world)
     # Each node's column, down to it: its own plus its ancestors', a level at a
-    # time from the roots.
-    parent = np.asarray(parents(out).numpy())
-    total = {k: np.asarray(out.fields[k].numpy(), np.float64).copy() for k in ("sum", "weight")}
-    for lv in range(1, out.finest + 1):
-        here = np.flatnonzero(out._level == lv)
-        for k in total:
-            total[k][here] += total[k][parent[here]]
-    column = total["sum"] if weight is None else \
-        np.divide(total["sum"], total["weight"], out=np.full(out.num_nodes, np.nan),
-                  where=total["weight"] > 0)
-    column[~out.is_leaf] = np.nan
+    # time from the roots, through the children table.
+    number, table = children(out)
+    with out.device:
+        total, wtotal = out.fields["sum"], out.fields["weight"]
+        for nodes in reversed(refined_by_level(out)):
+            _down_to_children(nodes, number, table, 2, total, wtotal)
+        column = tack.empty((out.num_nodes,), dtype)
+        _column_values(total, wtotal, out.marks, int(Ghosts.REFINEDCELL),
+                       0 if weight is None else 1, float("nan"), column)
     unit = octree.units.get(name)
     if weight is None:
         unit = _units.derived((unit, 1), (octree.unit, 1))
-    out.fields = {name: tack.array(column, tack.f64, device=out.device)}
+    out.fields = {name: column}
     out.units = {name: unit} if unit is not None else {}
     return average_up(out, [name])

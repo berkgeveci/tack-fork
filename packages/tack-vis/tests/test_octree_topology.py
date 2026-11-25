@@ -164,3 +164,27 @@ def test_the_children_table_and_root_rows_are_the_trees(name, make):
             q = (x + o % 3 - 1, y + (o // 3) % 3 - 1, z + (o // 9 - 1 if d == 3 else 0))
             assert rows[k, o] == at.get(q, -1)
         assert rows[k, 3 ** d // 2] == n
+
+
+@pytest.mark.parametrize("name,make", CASES, ids=[c[0] for c in CASES])
+def test_face_neighbours_are_the_nodes_across(name, make):
+    # Across each face of each node: the node at its level there, or the coarser
+    # leaf holding the place, or -1 beyond the roots -- by brute force over the
+    # nodes' lattice boxes.
+    octree = make()
+    d = octree.dimension
+    lo, hi = _boxes(octree)
+    level = octree._level
+    got = ot.face_neighbours(octree).numpy().reshape(-1, 2 * d)
+    rng = np.random.default_rng(3)
+    for n in rng.choice(octree.num_nodes, size=min(300, octree.num_nodes), replace=False):
+        for f in range(2 * d):
+            axis, upper = f // 2, f % 2
+            probe = lo[n].copy()
+            probe[axis] = hi[n, axis] if upper else lo[n, axis] - 1
+            holds = (lo <= probe).all(axis=1) & (probe < hi).all(axis=1) & (level <= level[n])
+            expected = np.flatnonzero(holds)
+            if len(expected) == 0:
+                assert got[n, f] == -1
+            else:
+                assert got[n, f] == expected[np.argmax(level[expected])]

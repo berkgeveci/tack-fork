@@ -12,13 +12,16 @@ to the finest level, level), on the device; nothing is stored beside the keys.
   or below its level.
 - **Subtree end:** the first node at or after the carried key one subtree
   further on, so ``[n + 1, end)`` are ``n``'s descendants.
-- **Faces:** each leaf looks across each of its faces at the cell of the
-  finest lattice just outside the face's lower corner. The leaf holding that
-  cell is the neighbour when it is as large or larger (it then covers the whole
-  face, since boxes are aligned at their level); a smaller one finds this leaf
-  from its own side. So every face is found once, from its smaller side, and is
-  that side's square; between leaves of one size, from the lower side. A face
-  on the domain's boundary has no neighbour (-1).
+- **Face neighbours:** each node's neighbour across each face at its level
+  (or the coarser leaf there), carried down from the roots: a child's is its
+  sibling, or in its parent's neighbour (``face_neighbours``, no search).
+- **Faces:** a leaf's face is recorded when the neighbour across it is as
+  large or larger (it then covers the whole face, since boxes are aligned at
+  their level); a smaller one finds this leaf from its own side. So every face
+  is found once, from its smaller side, and is that side's square; between
+  leaves of one size, from the lower side. A face on the domain's boundary has
+  no neighbour (-1). (The first form searched the keys for the leaf holding
+  the finest cell outside each face: 55 ms of 8 threads at 1M leaves.)
 """
 
 from typing import NamedTuple
@@ -27,10 +30,10 @@ import numpy as np
 
 import tack
 from tack.dataset.ghosts import Ghosts
-from tack.dataset.octree import _unkey
 
-__all__ = ["OctreeChildren", "OctreeFaces", "children", "faces", "lattice_boxes",
-           "nodes_per_level", "parents", "refined_by_level", "root_rows", "subtree_ends"]
+__all__ = ["OctreeChildren", "OctreeFaces", "children", "face_neighbours", "faces",
+           "lattice_boxes", "nodes_per_level", "parents", "refined_by_level", "root_rows",
+           "subtree_ends"]
 
 #: Above every level, for the last node at a carried key.
 _DEEPEST = tack.constant(127, tack.i32)
@@ -99,42 +102,65 @@ def _holder(gi, gj, gk, nx, ny, nz, finest, dimension, tree, carried, level, cou
 
 
 @tack.kernel
-def _leaf_faces(leaf, tree, carried, level, key, count, nx, ny, nz, dimension, finest,
-                small, large, direction):
-    # Slot c * 2d + f: leaf c's face f (axis f // 2, the upper side when f is odd),
-    # or small -1 where the face is found from its other side.
+def _root_faces(rows, count, span, dimension, out):
+    # Each root's 2d face neighbours (axis f // 2, the upper side when f is
+    # odd), from its row of 3^d.
+    for k in range(count):
+        n = rows[k * span + span // 2]
+        for f in range(2 * dimension):
+            stride = 1
+            if f // 2 == 1:
+                stride = 3
+            if f // 2 == 2:
+                stride = 9
+            o = span // 2 + stride if f % 2 == 1 else span // 2 - stride
+            out[n * (2 * dimension) + f] = rows[k * span + o]
+
+
+@tack.kernel
+def _child_faces(nodes, number, table, marks, refined, dimension, faces):
+    # A refined node's children's face neighbours from its own: across the
+    # face toward a sibling, the sibling; across the other, the parent's
+    # neighbour there -- its child at the mirrored octant when refined, else
+    # itself (a coarser leaf, or -1 beyond the roots).
+    for k in range(nodes.shape[0]):
+        n = nodes[k]
+        corners = 1 << dimension
+        r = (number[n] - 1) * corners
+        for j in range(corners):
+            c = table[r + j]
+            for f in range(2 * dimension):
+                axis = f // 2
+                mirrored = j ^ (1 << axis)
+                q = table[r + mirrored]
+                if ((j >> axis) & 1) == f % 2:
+                    q = faces[n * (2 * dimension) + f]
+                    if q >= 0:
+                        if (marks[q] & refined) != 0:
+                            q = table[(number[q] - 1) * corners + mirrored]
+                faces[c * (2 * dimension) + f] = q
+
+
+@tack.kernel
+def _leaf_faces(leaf, neighbours, level, marks, refined, dimension, small, large, direction):
+    # Slot c * 2d + f: leaf c's face f, or small -1 where the face is found from
+    # its other side: a finer neighbour (refined at this level) finds it from
+    # its own, an equal one from the lower side.
     for c in range(leaf.shape[0]):
         n = leaf[c]
-        t = tree[n]
         lv = level[n]
-        i, j, m = _unkey(key[n], lv, dimension)
-        step = tack.i64(1) << tack.i64(finest - lv)
-        bi = ((t % nx) << tack.i64(finest)) + tack.i64(i) * step
-        bj = (((t // nx) % ny) << tack.i64(finest)) + tack.i64(j) * step
-        bk = ((t // (nx * ny)) << tack.i64(finest)) + tack.i64(m) * step
         for f in range(2 * dimension):
-            axis = f // 2
-            upper = f % 2
-            gi = bi
-            gj = bj
-            gk = bk
-            if axis == 0:
-                gi = bi + step if upper == 1 else bi - 1
-            if axis == 1:
-                gj = bj + step if upper == 1 else bj - 1
-            if axis == 2:
-                gk = bk + step if upper == 1 else bk - 1
-            other = _holder(gi, gj, gk, nx, ny, nz, finest, dimension, tree, carried, level,
-                            count)
+            other = neighbours[n * (2 * dimension) + f]
             slot = c * (2 * dimension) + f
             small[slot] = -1
             if other < 0:
                 small[slot] = n
                 large[slot] = -1
                 direction[slot] = f
-            elif level[other] < lv or (level[other] == lv and upper == 1):
+            elif (marks[other] & refined) == 0 and (level[other] < lv or
+                                                    (level[other] == lv and f % 2 == 1)):
                 small[slot] = n
-                large[slot] = other
+                large[slot] = tack.i64(other)
                 direction[slot] = f
 
 
@@ -335,13 +361,37 @@ def _searched_subtree_ends(octree):
     return end
 
 
+def face_neighbours(octree):
+    """Each node's neighbour across each of its 2d faces (axis ``f // 2``, the
+    upper side when ``f`` is odd): the node at its level there, or the coarser
+    leaf holding the place, or -1 beyond the roots; a device i32 array of
+    ``2d`` entries a node, made once an octree, from the roots' rows down a
+    level at a time through the children table (a child's neighbour is its
+    sibling or in its parent's neighbour), no search."""
+    cached = getattr(octree, "_face_neighbours", None)
+    if cached is not None:
+        return cached
+    d = octree.dimension
+    n = octree.num_nodes
+    number, table = children(octree)
+    with octree.device:
+        out = tack.empty((n * 2 * d,), tack.i32)
+        if n:
+            rows = root_rows(octree)
+            _root_faces(rows, len(rows) // 3 ** d, 3 ** d, d, out)
+            for nodes in reversed(refined_by_level(octree)):
+                _child_faces(nodes, number, table, octree.marks, int(Ghosts.REFINEDCELL), d, out)
+    octree._face_neighbours = out
+    return out
+
+
 def faces(octree):
     """The faces between the leaves, and the leaves' faces on the domain's
-    boundary, each once (``OctreeFaces``). Hidden leaves are leaves here."""
+    boundary, each once (``OctreeFaces``), from ``face_neighbours``. Hidden
+    leaves are leaves here."""
     from tack.algorithms import inclusive_scan
 
     d = octree.dimension
-    nx, ny, nz = ([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3]
     with octree.device:
         leaf = tack.array(np.flatnonzero(octree.is_leaf).astype(np.int64), tack.i64)
         slots = len(leaf) * 2 * d
@@ -349,9 +399,8 @@ def faces(octree):
         large = tack.empty((slots,), tack.i64)
         direction = tack.empty((slots,), tack.u8)
         if slots:
-            tree, carried, level, count = _search_arrays(octree)
-            _leaf_faces(leaf, tree, carried, level, octree.key, count, nx, ny, nz, d,
-                        octree.finest, small, large, direction)
+            _leaf_faces(leaf, face_neighbours(octree), octree.level, octree.marks,
+                        int(Ghosts.REFINEDCELL), d, small, large, direction)
         flags = tack.empty((slots,), tack.i32)
         numbers = tack.empty((slots,), tack.i64)
         total = 0
