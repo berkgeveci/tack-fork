@@ -173,6 +173,14 @@ def main():
     print(f"frame at {size[0]}x{size[1]} on {args.device}: opaque render {times[0]:.1f} ms, "
           f"depth and colour read {times[1]:.1f} ms, Tack march {times[2]:.1f} ms, "
           f"blend {times[3]:.1f} ms", flush=True)
+    parts = tack_renderer.timings
+    print(f"  of Tack's {times[2]:.1f} ms: the rays' kernel and uploads "
+          f"{parts['rays_ms']:.1f}, the march kernel {parts['march_ms']:.1f}, read "
+          f"{parts['read_ms']:.1f}", flush=True)
+    for _ in range(3):
+        _, _, _, _, again = frame()
+        print(f"  again: Tack {again[2]:.1f} ms, the march kernel "
+              f"{tack_renderer.timings['march_ms']:.1f}", flush=True)
     tag = "composite_amrwind" + ("_close" if args.close else "") if args.amrwind \
         else "composite"
     write_png(os.path.join(args.out, f"{tag}_frame.png"), colour)
