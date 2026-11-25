@@ -27,7 +27,8 @@ from tack.dataset.ghosts import Ghosts
 from tack.dataset.octree import OctreeDataSet, _root_axes, _unkey
 from tack.dataset.octree_topology import _interleave, refined_by_level, subtree_ends
 
-__all__ = ["average_up", "axis_slice", "cell_gradients", "limit_depth", "threshold"]
+__all__ = ["average_up", "axis_slice", "cell_gradients", "covering_grid", "curl", "divergence",
+           "extract_box", "limit_depth", "threshold", "vector_gradients"]
 
 
 @tack.kernel
@@ -331,6 +332,35 @@ def _lsq_gradients(leaf, numbers, counts, neighbours, lo, size, marks, hidden, v
             out[c] = tack.vec3(nan)
 
 
+def _face_lists(octree):
+    """Each leaf's visible leaves across its faces: ``(leaf, numbers, counts,
+    across)`` device arrays, leaf ``c``'s at ``across[numbers[c] - counts[c]:
+    numbers[c]]``."""
+    from tack.algorithms import inclusive_scan
+    from tack.dataset.octree_topology import children, face_neighbours
+
+    if octree.dimension != 3:
+        raise ValueError("gradients take a 3D octree (a study)")
+    neighbours = face_neighbours(octree)
+    number, table = children(octree)
+    leaf = np.flatnonzero(octree.is_leaf)
+    count = len(leaf)
+    refined, hidden = int(Ghosts.REFINEDCELL), int(Ghosts.HIDDENCELL)
+    with octree.device:
+        leaf = tack.array(leaf.astype(np.int64))
+        counts = tack.empty((count,), tack.i32)
+        numbers = tack.empty((count,), tack.i64)
+        across = tack.empty((1,), tack.i64)
+        if count:
+            _face_leaves(leaf, neighbours, number, table, octree.marks, refined, hidden, 3, 0,
+                         numbers, counts, numbers)
+            total = int(inclusive_scan(counts, numbers, count))
+            across = tack.empty((max(total, 1),), tack.i64)
+            _face_leaves(leaf, neighbours, number, table, octree.marks, refined, hidden, 3, 1,
+                         numbers, counts, across)
+    return leaf, numbers, counts, across
+
+
 def cell_gradients(octree, name):
     """The gradient of cell field ``name`` at each visible leaf's centre, by least
     squares over the visible leaves across its faces (from
@@ -339,30 +369,244 @@ def cell_gradients(octree, name):
     nodes' order (as ``leaves()``); NaN on a hidden leaf, or one whose
     neighbours do not span the space. On the device throughout (the first form
     grouped the face list on the host: 440 ms of the 486 at 1M leaves)."""
-    from tack.algorithms import inclusive_scan
-    from tack.dataset.octree_topology import children, face_neighbours
-
-    if octree.dimension != 3:
-        raise ValueError("cell_gradients takes a 3D octree (a study)")
-    neighbours = face_neighbours(octree)
-    number, table = children(octree)
-    leaf = np.flatnonzero(octree.is_leaf)
-    count = len(leaf)
+    leaf, numbers, counts, across = _face_lists(octree)
     dtype = _compute_type(octree)
-    refined, hidden = int(Ghosts.REFINEDCELL), int(Ghosts.HIDDENCELL)
     with octree.device:
-        out = tack.empty((count,), tack.vec3(dtype))
-        if count:
-            leaf = tack.array(leaf.astype(np.int64))
-            counts = tack.empty((count,), tack.i32)
-            numbers = tack.empty((count,), tack.i64)
-            _face_leaves(leaf, neighbours, number, table, octree.marks, refined, hidden, 3, 0,
-                         numbers, counts, numbers)
-            total = int(inclusive_scan(counts, numbers, count))
-            across = tack.empty((max(total, 1),), tack.i64)
-            _face_leaves(leaf, neighbours, number, table, octree.marks, refined, hidden, 3, 1,
-                         numbers, counts, across)
+        out = tack.empty((len(leaf),), tack.vec3(dtype))
+        if len(leaf):
             lo, size = octree.geometry()
-            _lsq_gradients(leaf, numbers, counts, across, lo, size, octree.marks, hidden,
-                           octree._field(name).astype(dtype), float("nan"), out)
+            _lsq_gradients(leaf, numbers, counts, across, lo, size, octree.marks,
+                           int(Ghosts.HIDDENCELL), octree._field(name).astype(dtype),
+                           float("nan"), out)
     return out
+
+
+@tack.kernel
+def _lsq_vector_gradients(leaf, numbers, counts, neighbours, lo, size, marks, hidden, values,
+                          nan, out):
+    # _lsq_gradients for a vector field: one normal matrix, three right-hand
+    # sides; row i of the result is the gradient of component i.
+    for c in range(leaf.shape[0]):
+        n = leaf[c]
+        x = lo[n] + size[n] * 0.5
+        v = values[n]
+        a00 = 0.0 * v[0]
+        a01 = a00
+        a02 = a00
+        a11 = a00
+        a12 = a00
+        a22 = a00
+        b0 = tack.vec3(a00)
+        b1 = tack.vec3(a00)
+        b2 = tack.vec3(a00)
+        for k in range(numbers[c] - counts[c], numbers[c]):
+            m = neighbours[k]
+            dx = lo[m] + size[m] * 0.5 - x
+            w = 1.0 / dx.dot(dx)
+            dv = (values[m] - v) * w
+            a00 = a00 + w * dx[0] * dx[0]
+            a01 = a01 + w * dx[0] * dx[1]
+            a02 = a02 + w * dx[0] * dx[2]
+            a11 = a11 + w * dx[1] * dx[1]
+            a12 = a12 + w * dx[1] * dx[2]
+            a22 = a22 + w * dx[2] * dx[2]
+            b0 = b0 + dx * dv[0]
+            b1 = b1 + dx * dv[1]
+            b2 = b2 + dx * dv[2]
+        a = tack.mat3(a00, a01, a02, a01, a11, a12, a02, a12, a22)
+        det = a.determinant()
+        if det > 0.0 and (marks[n] & hidden) == 0:
+            inv = a.inverse()
+            g0 = inv @ b0
+            g1 = inv @ b1
+            g2 = inv @ b2
+            out[c] = [g0[0], g0[1], g0[2], g1[0], g1[1], g1[2], g2[0], g2[1], g2[2]]
+        else:
+            out[c] = [nan, nan, nan, nan, nan, nan, nan, nan, nan]
+
+
+@tack.kernel
+def _divergence(gradients, out):
+    for c in range(out.shape[0]):
+        g = gradients[c]
+        out[c] = g[0] + g[4] + g[8]
+
+
+@tack.kernel
+def _curl(gradients, out):
+    for c in range(out.shape[0]):
+        g = gradients[c]
+        out[c] = tack.vec3(g[7] - g[5], g[2] - g[6], g[3] - g[1])
+
+
+def vector_gradients(octree, name):
+    """The gradient of the 3-vector cell field ``name`` at each visible leaf's
+    centre, as ``cell_gradients`` takes a scalar's: a device array of 9
+    components a leaf, row-major, entry ``3 * i + j`` the derivative of
+    component ``i`` along axis ``j``; NaN on a hidden leaf."""
+    leaf, numbers, counts, across = _face_lists(octree)
+    dtype = _compute_type(octree)
+    values = octree._field_values(name)
+    if getattr(values, "_vector_n", None) != 3:
+        raise TypeError(f"{name!r} is not a 3-vector field")
+    with octree.device:
+        out = tack.empty((len(leaf),), tack.vec(9, dtype))
+        if len(leaf):
+            lo, size = octree.geometry()
+            _lsq_vector_gradients(leaf, numbers, counts, across, lo, size, octree.marks,
+                                  int(Ghosts.HIDDENCELL), values.astype(tack.vec3(dtype)),
+                                  float("nan"), out)
+    return out
+
+
+def divergence(octree, name):
+    """The divergence of the 3-vector cell field ``name`` at each visible leaf
+    (the trace of ``vector_gradients``): a device array, one per leaf."""
+    g = vector_gradients(octree, name)
+    with octree.device:
+        out = tack.empty((len(g),), _compute_type(octree))
+        if len(g):
+            _divergence(g, out)
+    return out
+
+
+def curl(octree, name):
+    """The curl of the 3-vector cell field ``name`` at each visible leaf (from
+    ``vector_gradients``): a device ``vec3`` array, one per leaf."""
+    g = vector_gradients(octree, name)
+    with octree.device:
+        out = tack.empty((len(g),), tack.vec3(_compute_type(octree)))
+        if len(g):
+            _curl(g, out)
+    return out
+
+
+# -- a region ------------------------------------------------------------------------
+
+
+@tack.kernel
+def _meets_box(lo, size, dimension, x0, y0, z0, x1, y1, z1, out):
+    # Whether each node's box meets the open region (touching does not count).
+    for n in range(out.shape[0]):
+        a = lo[n]
+        b = lo[n] + size[n]
+        inside = a[0] < x1 and b[0] > x0 and a[1] < y1 and b[1] > y0
+        if dimension == 3:
+            inside = inside and a[2] < z1 and b[2] > z0
+        out[n] = 1 if inside else 0
+
+
+@tack.kernel
+def _keep_children(nodes, number, table, dimension, meets, keep):
+    # A refined node that meets the region keeps all its children (so the
+    # subset's refined nodes are whole); the ones outside become hidden leaves.
+    for k in range(nodes.shape[0]):
+        n = nodes[k]
+        if meets[n] == 1:
+            r = (number[n] - 1) * (1 << dimension)
+            for j in range(1 << dimension):
+                keep[table[r + j]] = 1
+
+
+def extract_box(octree, lower, upper):
+    """The octree's nodes whose box meets the open box ``[lower, upper)`` (world
+    coordinates), as an octree: whole subtrees where they meet it, and, to keep
+    every refined node's children, the siblings outside as hidden leaves. The
+    values are the nodes' own."""
+    from tack.algorithms import gather
+    from tack.dataset.octree_topology import children, refined_by_level
+
+    d = octree.dimension
+    lower = np.asarray(lower, np.float64) - np.asarray(octree.origin, np.float64)
+    upper = np.asarray(upper, np.float64) - np.asarray(octree.origin, np.float64)
+    if d == 2:
+        lower, upper = np.append(lower[:2], -np.inf), np.append(upper[:2], np.inf)
+    number, table = children(octree)
+    n = octree.num_nodes
+    with octree.device:
+        lo, size = octree.geometry()
+        meets = tack.empty((n,), tack.i32)
+        keep = tack.empty((n,), tack.i32)
+        if n:
+            _meets_box(lo, size, d, *map(float, lower), *map(float, upper), meets)
+            tack.copyto(keep, meets)
+            for nodes in refined_by_level(octree):
+                _keep_children(nodes, number, table, d, meets, keep)
+        keep_host = np.asarray(keep.numpy()) == 1
+        meets_host = np.asarray(meets.numpy()) == 1
+        held = tack.array(np.flatnonzero(keep_host).astype(np.int64))
+        fields = {k: np.asarray(gather(v, held).numpy()) for k, v in octree.fields.items()}
+    hidden = ((octree.marks.numpy() & Ghosts.HIDDENCELL) != 0) | ~meets_host
+    return OctreeDataSet(octree.roots, octree._tree[keep_host], octree._level[keep_host],
+                         octree._key[keep_host], fields=fields, mask=hidden[keep_host],
+                         world=octree.world, units=octree.units, _ordered=True)
+
+
+# -- a covering grid -------------------------------------------------------------------
+
+
+@tack.kernel
+def _cover(tree, level, key, marks, refined, hidden, values, nx, ny, at, dimension, nan,
+           out):
+    # Each node at level ``at``, or a leaf above it, fills its block of the
+    # lattice at level ``at`` with its value (NaN when hidden); x fastest.
+    for n in range(tree.shape[0]):
+        lv = level[n]
+        if lv <= at and (lv == at or (marks[n] & refined) == 0):
+            i, j, m = _unkey(key[n], lv, dimension)
+            t = tree[n]
+            span = 1 << (at - lv)
+            side_x = nx << at
+            side_y = ny << at
+            bi = ((t % nx) << at) + (tack.i64(i) << (at - lv))
+            bj = (((t // nx) % ny) << at) + (tack.i64(j) << (at - lv))
+            bk = ((t // (nx * ny)) << at) + (tack.i64(m) << (at - lv))
+            v = values[n]
+            if (marks[n] & hidden) != 0:
+                v = nan
+            zs = span if dimension == 3 else 1
+            for dz in range(zs):
+                for dy in range(span):
+                    for dx in range(span):
+                        out[(bi + dx) + side_x * ((bj + dy) + side_y * (bk + dz))] = v
+
+
+def covering_grid(octree, level, names=None):
+    """The octree sampled on the uniform lattice of ``level`` over all its
+    roots, as a grid ``DataSet`` with each named field (by default every
+    scalar one) as cell data: a lattice cell takes the value of the node at
+    ``level`` holding it, or of the coarser leaf there (``average_up`` first to
+    have a refined node's value be its leaves' mean); NaN on hidden leaves and
+    where no node is. yt's covering grid."""
+    from tack.dataset.dataset import Field, rectilinear_grid
+    from tack.dataset.spaces import Constant
+
+    d = octree.dimension
+    at = int(level)
+    if not 0 <= at <= octree.finest:
+        raise ValueError(f"level is 0 to {octree.finest}")
+    names = [k for k, v in octree.fields.items() if not getattr(v, "_vector_n", None)] \
+        if names is None else list(names)
+    axes = _root_axes(octree.roots)
+    origin = np.asarray(octree.origin, np.float64)
+    fine = []
+    for a in range(d):
+        line = np.asarray(axes[a], np.float64)
+        steps = np.linspace(0.0, 1.0, (1 << at) + 1)[:-1]
+        fine.append(np.append((line[:-1, None] + steps[None, :] * np.diff(line)[:, None]).reshape(-1),
+                              line[-1]) + origin[a])
+    if d == 2:
+        fine.append((float(axes[2][0] + origin[2]) if len(axes) > 2 else 0.0,))
+    grid = rectilinear_grid(*fine, dtype=octree.roots.dtype, unit=octree.unit)
+    nx, ny, nz = ([m - 1 for m in octree.roots.topology.point_dims] + [1])[:3]
+    cells = (nx << at) * (ny << at) * (nz << at if d == 3 else 1)
+    with octree.device:
+        for name in names:
+            values = octree._field(name)
+            out = tack.full((cells,), float("nan"), values.dtype)
+            if octree.num_nodes:
+                _cover(octree.tree, octree.level, octree.key, octree.marks,
+                       int(Ghosts.REFINEDCELL), int(Ghosts.HIDDENCELL), values, nx, ny, at, d,
+                       float("nan"), out)
+            grid.fields[name] = Field(Constant(grid.topology), out, octree.units.get(name))
+    return grid
