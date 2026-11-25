@@ -25,18 +25,22 @@ import numpy as np
 import tack
 from tack.dataset.ghosts import Ghosts
 from tack.dataset.octree import OctreeDataSet, _root_axes, _unkey
-from tack.dataset.octree_topology import _interleave, subtree_ends
+from tack.dataset.octree_topology import _interleave, refined_by_level, subtree_ends
 
 __all__ = ["average_up", "axis_slice", "cell_gradients", "limit_depth", "threshold"]
 
 
 @tack.kernel
-def _weighted_leaves(values, measure, marks, refined_or_hidden, vm, m):
-    # A visible leaf's value times its measure, and its measure; 0 elsewhere.
+def _weighted_leaves(values, size, dimension, marks, refined_or_hidden, vm, m):
+    # A visible leaf's value times its measure (its sides' product), and its
+    # measure; 0 elsewhere.
     for n in range(vm.shape[0]):
         keep = (marks[n] & refined_or_hidden) == 0
-        vm[n] = values[n] * measure[n] if keep else 0.0
-        m[n] = measure[n] if keep else 0.0
+        measure = size[n][0] * size[n][1]
+        if dimension == 3:
+            measure = measure * size[n][2]
+        vm[n] = values[n] * measure if keep else 0.0
+        m[n] = measure if keep else 0.0
 
 
 @tack.kernel
@@ -77,16 +81,13 @@ def _subtree_sums(octree, name, ends=None):
     dtype = _compute_type(octree)
     ends = subtree_ends(octree) if ends is None else ends
     with octree.device:
-        measure = tack.array(octree.measures().astype(dtype.numpy_dtype), dtype)
+        _, size = octree.geometry()
         vm, m, mean = (tack.empty((n,), dtype) for _ in range(3))
         if n:
-            _weighted_leaves(values.astype(dtype), measure, octree.marks,
+            _weighted_leaves(values.astype(dtype), size, octree.dimension, octree.marks,
                              int(Ghosts.REFINEDCELL | Ghosts.HIDDENCELL), vm, m)
-            refined = ~octree.is_leaf
-            for level in range(octree.finest - 1, -1, -1):
-                nodes = np.flatnonzero(refined & (octree._level == level))
-                if len(nodes):
-                    _child_sums(tack.array(nodes.astype(np.int64), tack.i64), ends, vm, m)
+            for nodes in refined_by_level(octree):
+                _child_sums(nodes, ends, vm, m)
             _means(vm, m, float("nan"), mean)
     return mean, m
 
@@ -121,16 +122,23 @@ def limit_depth(octree, depth):
     so a node refined below ``depth`` becomes a leaf of its leaves' mean; one
     whose leaves are all hidden is hidden."""
     keep = octree._level <= int(depth)
-    averaged = average_up(octree)
     hidden = (octree.marks.numpy() & Ghosts.HIDDENCELL) != 0
-    names = [k for k, v in octree.fields.items() if not getattr(v, "_vector_n", None)]
-    if names:
-        _, weight = _subtree_sums(octree, names[0])
+    ends = subtree_ends(octree)
+    fields = {}
+    weight = None
+    for name, values in octree.fields.items():
+        if getattr(values, "_vector_n", None):
+            fields[name] = np.asarray(values.numpy())[keep]
+            continue
+        mean, weight = _subtree_sums(octree, name, ends)
+        fields[name] = np.asarray(mean.astype(values.dtype).numpy())[keep]
+    if weight is not None:
         hidden = hidden | (np.asarray(weight.numpy()) == 0)
-    fields = {k: np.asarray(v.numpy())[keep] for k, v in averaged.fields.items()}
+    # The kept nodes are a prefix-closed subset of a pre-order, so pre-ordered
+    # and whole: no sort, no check.
     return OctreeDataSet(octree.roots, octree._tree[keep], octree._level[keep],
                          octree._key[keep], fields=fields, mask=hidden[keep],
-                         world=octree.world, units=octree.units)
+                         world=octree.world, units=octree.units, _ordered=True)
 
 
 @tack.kernel

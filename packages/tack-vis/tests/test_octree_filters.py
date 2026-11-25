@@ -125,3 +125,69 @@ def test_cell_gradients_are_exact_for_a_linear_field(name, make):
     octree.fields["lin"] = tack.array(octree.centers() @ slope + 0.25, tack.f64)
     got = of.cell_gradients(octree, "lin").numpy()
     np.testing.assert_allclose(got, np.broadcast_to(slope, got.shape), atol=1e-9)
+
+
+# -- against VTK -------------------------------------------------------------------
+
+try:
+    from vtkmodules.vtkFiltersHyperTree import (
+        vtkHyperTreeGridDepthLimiter,
+        vtkHyperTreeGridEvaluateCoarse,
+    )
+
+    from tack.interop.vtk import dataset_to_vtk, vtk_to_dataset
+except ImportError:
+    vtkHyperTreeGridEvaluateCoarse = None
+
+needs_vtk = pytest.mark.skipif(vtkHyperTreeGridEvaluateCoarse is None, reason="needs VTK")
+
+
+def _by_node(octree, name):
+    """``{(tree, level, key): value}`` of a field, so octrees built in any node
+    order compare."""
+    values = np.asarray(octree.fields[name].numpy())
+    return {(int(t), int(lv), int(k)): v
+            for t, lv, k, v in zip(octree._tree, octree._level, octree._key, values)}
+
+
+@needs_vtk
+@pytest.mark.parametrize("name,make", CASES, ids=[c[0] for c in CASES])
+def test_average_up_is_vtks_coarse_average(name, make):
+    # Without masks VTK's AVERAGE (each coarse cell the mean of its children,
+    # recursively) is the leaves' mean by measure, since siblings have one
+    # measure.
+    octree = _with_field(make())
+    field = next(iter(octree.fields))
+    ours = _by_node(of.average_up(octree, [field]), field)
+    coarse = vtkHyperTreeGridEvaluateCoarse()
+    coarse.SetInputData(dataset_to_vtk(octree))
+    coarse.SetOperator(vtkHyperTreeGridEvaluateCoarse.OPERATOR_AVERAGE)
+    coarse.Update()
+    theirs = _by_node(vtk_to_dataset(coarse.GetOutput(), dtype=tack.f64), field)
+    assert ours.keys() == theirs.keys()
+    a = np.array([ours[k] for k in ours])
+    b = np.array([theirs[k] for k in ours])
+    np.testing.assert_allclose(a, b, rtol=1e-12)
+
+
+@needs_vtk
+@pytest.mark.parametrize("name,make", CASES, ids=[c[0] for c in CASES])
+def test_limit_depth_is_vtks_depth_limiter_of_the_coarse_average(name, make):
+    octree = _with_field(make())
+    field = next(iter(octree.fields))
+    depth = max(octree.finest - 2, 1)
+    ours = _by_node(of.limit_depth(octree, depth), field)
+    coarse = vtkHyperTreeGridEvaluateCoarse()
+    coarse.SetInputData(dataset_to_vtk(octree))
+    coarse.SetOperator(vtkHyperTreeGridEvaluateCoarse.OPERATOR_AVERAGE)
+    limiter = vtkHyperTreeGridDepthLimiter()
+    limiter.SetInputConnection(coarse.GetOutputPort())
+    limiter.SetDepth(depth)
+    limiter.SetJustCreateNewMask(False)                   # truncate, not mask
+    limiter.Update()
+    theirs = _by_node(vtk_to_dataset(limiter.GetOutput(), dtype=tack.f64), field)
+    assert ours.keys() == theirs.keys()
+    assert max(k[1] for k in ours) == depth
+    a = np.array([ours[k] for k in ours])
+    b = np.array([theirs[k] for k in ours])
+    np.testing.assert_allclose(a, b, rtol=1e-12)
