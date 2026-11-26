@@ -591,6 +591,7 @@ class LBM2D:
         role = np.asarray(octree.fields["role"].numpy(), np.int64)
         level = octree._level
         self.role, self.levels = role, level
+        self.tau = float(tau)
         self.taus = [0.5 + (1 << lv) * (tau - 0.5) for lv in range(self.finest + 1)]
         self.omega = [1.0 / t for t in self.taus]
         self.centred = centred

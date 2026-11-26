@@ -50,31 +50,42 @@ def exact(c, n, nu, t):
 
 class Vorticity:
     """Vorticity at the computational cells from their neighbours at their level
-    (central differences, one-sided beside a refined node or a solid)."""
+    (central differences; a refined neighbour by its children's mean; one-sided
+    beside a solid or a coarser cell)."""
 
     def __init__(self, solver):
         rows = solver.rows.numpy().reshape(-1, 9)
+        number, table = (a.numpy() for a in (solver.number, solver.table))
         self.keep = np.flatnonzero(solver.computational())
         role, level = solver.role, solver.levels
         self.side = solver.centres()[1][self.keep]
-        self.pairs = []
-        for lo, hi in ((3, 5), (1, 7)):              # west/east, south/north
-            a, b = rows[self.keep, lo], rows[self.keep, hi]
-            use_a = (a >= 0) & (level[np.maximum(a, 0)] == level[self.keep]) & \
-                (role[np.maximum(a, 0)] <= lb.GHOST)
-            use_b = (b >= 0) & (level[np.maximum(b, 0)] == level[self.keep]) & \
-                (role[np.maximum(b, 0)] <= lb.GHOST)
-            self.pairs.append((np.maximum(a, 0), np.maximum(b, 0), use_a, use_b))
+        self.slots = []
+        for o in (3, 5, 1, 7):                       # west, east, south, north
+            q = rows[self.keep, o]
+            qq = np.maximum(q, 0)
+            at = (q >= 0) & (level[qq] == level[self.keep])
+            direct = at & (role[qq] <= lb.GHOST)
+            split = at & (role[qq] == lb.REFINED)
+            first = np.where(split, (number[qq] - 1) * 4, 0)
+            kids = table[first[:, None] + np.arange(4)[None, :]] if len(table) else \
+                np.zeros((len(q), 4), np.int64)
+            split &= (role[kids] <= lb.INTERFACE).all(axis=1)
+            nodes = np.where(split[:, None], kids, qq[:, None])
+            self.slots.append((nodes, direct | split))
 
     def __call__(self, ux, uy):
-        def derivative(v, axis):
-            a, b, use_a, use_b = self.pairs[axis]
-            c = v[self.keep]
-            both = 0.5 * (v[b] - v[a])
-            return np.where(use_a & use_b, both, np.where(use_b, v[b] - c,
-                                                          np.where(use_a, c - v[a], 0.0))) / self.side
+        def at(slot, v):
+            nodes, ok = self.slots[slot]
+            return v[nodes].mean(axis=1), ok
 
-        return derivative(uy, 0) - derivative(ux, 1)
+        def derivative(v, lo, hi):
+            c = v[self.keep]
+            a, use_a = at(lo, v)
+            b, use_b = at(hi, v)
+            return np.where(use_a & use_b, 0.5 * (b - a),
+                            np.where(use_b, b - c, np.where(use_a, c - a, 0.0))) / self.side
+
+        return derivative(uy, 0, 1) - derivative(ux, 2, 3)
 
 
 def cells_polydata(solver):
