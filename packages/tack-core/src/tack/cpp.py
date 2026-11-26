@@ -179,17 +179,20 @@ _FLAGS = ("-std=c++17", "-O2", "-fno-exceptions", "-fno-rtti", "-ffp-contract=on
 class Library:
     """C++ source a kernel may call into: ``headers`` (included by these names),
     found through ``include_dirs``, and/or ``source`` text. ``flags`` go to
-    clang. ``depends`` names further files whose contents the code depends on
-    (headers the named ones include), so that the disk cache notices a change
-    to them."""
+    clang.
 
-    def __init__(self, headers=(), *, source="", include_dirs=(), flags=(), depends=()):
+    Its identity, for the disk cache, is its text and flags, the contents of
+    every file clang reads for it (system headers too) and clang's version
+    (`fingerprint`). Read once a process: a header edited while a process
+    runs is noticed by the next one."""
+
+    def __init__(self, headers=(), *, source="", include_dirs=(), flags=()):
         self.headers = tuple(str(h) for h in headers)
         self.source = source
         self.include_dirs = tuple(str(Path(d).resolve()) for d in include_dirs)
         self.flags = tuple(flags)
-        self.depends = tuple(str(d) for d in depends)
         self._fingerprint = None
+        self._base = None
 
     def function(self, name, *, result, args):
         """The C++ function ``name`` (qualified; ``{T}`` in it is replaced by the
@@ -205,26 +208,25 @@ class Library:
         state["_fingerprint"] = None     # another process reads the files again
         return state
 
-    def _find(self, header):
-        for folder in self.include_dirs:
-            path = Path(folder) / header
-            if path.is_file():
-                return path
-        path = Path(header)
-        return path if path.is_file() else None
+    def base(self) -> str:
+        """The library as written: its text, headers' names, include directories
+        and flags."""
+        if self._base is None:
+            self._base = hashlib.sha256(repr((
+                self.headers, self.source, self.include_dirs, self.flags, _FLAGS,
+            )).encode()).hexdigest()
+        return self._base
 
     def fingerprint(self) -> str:
-        """The library by content: its text, flags, and the bytes of its named
-        headers and ``depends``. A header clang finds on its own paths counts
-        by name alone."""
+        """The library by content, for the disk cache: `base`, clang's version
+        and the contents of every file clang read for it. Without a disk cache
+        nothing is stored, and `base` is enough."""
         if self._fingerprint is None:
-            h = hashlib.sha256()
-            h.update(repr((self.headers, self.source, self.flags, _FLAGS)).encode())
-            for name in self.headers + self.depends:
-                path = self._find(name)
-                h.update(b"\0" + name.encode() + b"\0")
-                h.update(path.read_bytes() if path is not None else b"<system>")
-            self._fingerprint = h.hexdigest()
+            from tack.runtime.disk_cache import _cache
+            if _cache() is None:
+                self._fingerprint = self.base()
+            else:
+                self._fingerprint = _dependencies(self).fingerprint
         return self._fingerprint
 
 
@@ -428,22 +430,137 @@ def _scratch() -> Path:
     return _folder
 
 
-def _precompiled(library, command):
-    """The path of ``library``'s precompiled header, built on first use, or
-    None if clang would not build one (the instantiation then includes the
-    text, and reports what is wrong with it). A library such as Eigen takes a
-    second to parse; without this every kernel that calls it would pay that
-    again, where with it an instantiation costs a third as much."""
-    key = hashlib.sha256(repr((command, library.fingerprint())).encode()).hexdigest()
+def _precompiled(library, command=None):
+    """``(path of library's precompiled header or None, the files clang read
+    for it or None)``, built on first use. The path is None if clang would not
+    build one (the instantiation then includes the text, and reports what is
+    wrong with it); the files are listed then too, unless clang cannot read
+    them. A library such as Eigen takes a second to parse; without this every
+    kernel that calls it would pay that again, where with it an instantiation
+    costs a third as much."""
+    command = command or _command(library)
+    key = hashlib.sha256(repr((command, library.base())).encode()).hexdigest()
     with _build_lock:
         if key not in _headers:
             header = _scratch() / f"{key[:16]}.h"
             header.write_text(_prefix(library))
-            out = header.with_suffix(".pch")
-            done = subprocess.run([*command, "-x", "c++-header", str(header), "-o", str(out)],
-                                  capture_output=True, text=True)
-            _headers[key] = out if done.returncode == 0 else None
+            out, listed = header.with_suffix(".pch"), header.with_suffix(".d")
+            done = subprocess.run([*command, "-x", "c++-header", str(header), "-o", str(out),
+                                   "-MD", "-MF", str(listed)], capture_output=True, text=True)
+            if done.returncode != 0:
+                out = None
+                done = subprocess.run([*command, "-x", "c++-header", str(header), "-M",
+                                       "-MF", str(listed)], capture_output=True, text=True)
+            files = _listed(listed, header) if done.returncode == 0 else None
+            _headers[key] = (out, files)
         return _headers[key]
+
+
+def _listed(path, header) -> list:
+    """The files a make rule lists as ``header``'s prerequisites, less itself."""
+    text = path.read_text().replace("\\\n", " ")
+    names = text.split(":", 1)[1].split() if ":" in text else []
+    files = {str(Path(n).resolve()) for n in (n.replace("\\ ", " ") for n in names)}
+    files.discard(str(Path(header).resolve()))
+    return sorted(files)
+
+
+# ---------------------------------------------------------------------------
+# What a library depends on, for the disk cache
+# ---------------------------------------------------------------------------
+
+class _Dependencies:
+    """The files a library was compiled from, with what each held, and the
+    clang that compiled it: an entry of the disk cache (``.cppdeps``), by the
+    library's `Library.base`. ``fingerprint`` is the library's identity."""
+
+    def __init__(self, files, clang_version):
+        self.files = files                  # [(path, size, mtime_ns, sha256)]
+        self.clang_version = clang_version
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(repr((self.clang_version, [
+            (path, digest) for path, _, _, digest in self.files])).encode()).hexdigest()
+
+
+def _digest_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+_versions = {}
+
+
+def _clang_version():
+    """The version clang reports, or None where there is none."""
+    found = shutil.which(os.environ.get("TACK_CLANG") or "clang++")
+    if found is None:
+        return None
+    if found not in _versions:
+        done = subprocess.run([found, "--version"], capture_output=True, text=True)
+        _versions[found] = done.stdout if done.returncode == 0 else None
+    return _versions[found]
+
+
+def _dependencies(library) -> _Dependencies:
+    """``library``'s dependencies, as the disk cache records them, checked.
+
+    A record is used while every file it names holds what it did, and clang
+    (if there is one) is the version it names: a file whose size and
+    modification time are as recorded is taken to hold what it did, any other
+    is read again. Otherwise -- no record, a file changed or gone, another
+    clang -- the files are listed afresh, by building the library's
+    precompiled header, which compiling will want anyway; a changed file may
+    include others. Without clang a record is all there is: if it does not
+    hold, the fingerprint names that, and compiling asks for clang."""
+    from tack.runtime.disk_cache import _cache
+    cache = _cache()
+    key = library.base()
+    entry = cache.get(key, "cppdeps")
+    record = _Dependencies([tuple(f) for f in entry["files"]], entry["clang"]) if entry else None
+    version = _clang_version()
+    if record is not None and (version is None or version == record.clang_version):
+        files, changed = [], False
+        for path, size, mtime, digest in record.files:
+            try:
+                st = os.stat(path)
+            except OSError:
+                changed = True
+                break
+            if (st.st_size, st.st_mtime_ns) != (size, mtime):
+                if _digest_file(path) != digest:
+                    changed = True
+                    break
+                size, mtime = st.st_size, st.st_mtime_ns
+            files.append((path, size, mtime, digest))
+        if not changed:
+            fresh = _Dependencies(files, record.clang_version)
+            if files != record.files:
+                _store(cache, key, fresh)           # spare the next process the reads
+            return fresh
+    if version is None:
+        return _Dependencies([("<no clang to list the library's files>", 0, 0, key)], None)
+    _, listed = _precompiled(library)
+    if listed is None:
+        return _Dependencies([("<clang could not read the library>", 0, 0, key)], version)
+    files = []
+    for path in listed:
+        st = os.stat(path)
+        files.append((path, st.st_size, st.st_mtime_ns, _digest_file(path)))
+    fresh = _Dependencies(files, version)
+    _store(cache, key, fresh)
+    return fresh
+
+
+def _store(cache, key, record):
+    """The record as an entry of plain data (the cache unpickles only its own)."""
+    if cache.writes:
+        cache.put(key, "cppdeps", {"key": key, "files": record.files,
+                                   "clang": record.clang_version})
 
 
 def _compile(library, source) -> bytes:
@@ -454,7 +571,7 @@ def _compile(library, source) -> bytes:
         found = _bitcode.get(key)
     if found is not None:
         return found
-    header = _precompiled(library, command)
+    header, _ = _precompiled(library, command)
     with tempfile.TemporaryDirectory(prefix="tack-cpp-") as folder:
         src, out = Path(folder) / "shim.cpp", Path(folder) / "shim.bc"
         done = None

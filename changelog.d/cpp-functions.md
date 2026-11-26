@@ -15,4 +15,6 @@
   that is linked into the kernel before it is optimized, so the library's code
   is inlined and vectorized with the loop and stored with the variant in the
   disk cache. A library is parsed once a process, into a precompiled header
-  its instantiations are compiled against.
+  its instantiations are compiled against. The cache knows a library by its text, clang's
+  version and every file clang read for it (`.cppdeps` entries), so an edit to
+  any header it includes, directly or not, compiles it again.

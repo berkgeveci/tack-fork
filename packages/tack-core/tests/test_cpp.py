@@ -769,7 +769,7 @@ def test_an_error_in_the_librarys_own_text_is_clangs_message():
 
 _SCRIPT = """
 import sys, numpy as np, tack, tack.cpp
-lib = tack.cpp.Library(headers=["demo.h"], include_dirs=[sys.argv[1]])
+lib = tack.cpp.Library(headers=["demo.h"], include_dirs=[sys.argv[1]], flags=["-I" + sys.argv[1] + "/inner"])
 scale = lib.function("demo::scale", result=tack.cpp.T, args=(tack.cpp.T,))
 
 @tack.kernel
@@ -785,10 +785,16 @@ print(x.numpy()[0], tack.cache.stats().get("variant_hit", 0))
 
 def test_disk_cache_needs_no_clang_and_notices_a_changed_header(tmp_path):
     """A stored variant holds the library's code, so a second process compiles
-    nothing; a header's contents are in the key."""
+    nothing; the contents of every header clang read are in the key, one the
+    library names and one that header includes alike, and a header touched
+    without change keeps the entry."""
     import os
+    (tmp_path / "inner").mkdir()
+    factor = tmp_path / "inner" / "factor.h"
+    factor.write_text("#define FACTOR 1\n")
     header = tmp_path / "demo.h"
-    header.write_text("namespace demo { template <class V> V scale(V x) { return 2 * x; } }")
+    header.write_text('#include "factor.h"\n'
+                      "namespace demo { template <class V> V scale(V x) { return 2 * x; } }")
     script = tmp_path / "run.py"
     script.write_text(_SCRIPT)
     env = dict(os.environ, TACK_CACHE="write", TACK_CACHE_DIR=str(tmp_path / "cache"))
@@ -805,8 +811,21 @@ def test_disk_cache_needs_no_clang_and_notices_a_changed_header(tmp_path):
     code, out, err = run(TACK_CLANG="/no/such/clang++")
     assert code == 0, err
     assert out == ["2.0", "1"]
-    header.write_text("namespace demo { template <class V> V scale(V x) { return 3 * x; } }")
+    os.utime(header)            # touched, not changed
+    code, out, err = run(TACK_CLANG="/no/such/clang++")
+    assert code == 0, err
+    assert out == ["2.0", "1"]
+    header.write_text('#include "factor.h"\n'
+                      "namespace demo { template <class V> V scale(V x) "
+                      "{ return 3 * FACTOR * x; } }")
     code, out, err = run(TACK_CLANG="/no/such/clang++")
     assert code != 0 and "needs clang" in err
     code, out, err = run()
     assert out == ["3.0", "0"]
+    # A header the library never names, which the named one includes.
+    factor.write_text("#define FACTOR 2\n")
+    code, out, err = run()
+    assert code == 0, err
+    assert out == ["6.0", "0"]
+    code, out, err = run(TACK_CLANG="/no/such/clang++")
+    assert out == ["6.0", "1"]

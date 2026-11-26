@@ -97,6 +97,11 @@ _state = None          # the resolved _Cache, built on first use
 _stats = {}
 
 
+#: The kinds of entry: lowered IR, compiled variants, and the files a C++
+#: library a kernel calls (tack.cpp) was compiled from.
+_SUFFIXES = (".ir", ".variant", ".cppdeps")
+
+
 def _count(name, n=1):
     _stats[name] = _stats.get(name, 0) + n
 
@@ -821,7 +826,7 @@ def pack(directory=None) -> tuple:
             raise PermissionError(f"{cache.root} belongs to another user or others can "
                                   "write to it")
         for file in sorted(cache.root.glob("*/*")):
-            if file.suffix in (".ir", ".variant") and not file.name.startswith("."):
+            if file.suffix in _SUFFIXES and not file.name.startswith("."):
                 entries[file.name] = file.read_bytes()
     payload = pickle.dumps(entries, protocol=5)
     _write_atomically(cache.bundle_path,
@@ -931,7 +936,7 @@ def prune(directory=None, max_size=None) -> tuple:
                         with contextlib.suppress(FileNotFoundError):
                             os.unlink(item.path)
                             removed += 1
-                elif item.name.endswith((".ir", ".variant")):
+                elif item.name.endswith(_SUFFIXES):
                     entries.append((st.st_mtime, st.st_size, item.path))
     total = sum(size for _, size, _ in entries)
     if limit is not None and total > limit:
@@ -998,7 +1003,7 @@ def describe(directory=None) -> dict:
         "mode": mode,
         "mpi rank": rank,
         "tack version key": cache.version,
-        "entries": sum(1 for p in files if p.suffix in (".ir", ".variant")),
+        "entries": sum(1 for p in files if p.suffix in _SUFFIXES),
         "bytes": sum(p.stat().st_size for p in files),
         "bytes, every version": sum(p.stat().st_size for p in every),
         "size limit": size_limit(),
