@@ -79,7 +79,7 @@ class OctreeTents:
     """An octree as the march's sampler: ``sample(p, first, stop)``, the value at
     ``p`` and the size of the leaf there."""
 
-    def __init__(self, octree, name, blend=1, balanced=0):
+    def __init__(self, octree, name, blend=1, balanced=0, chunk=None):
         if octree.dimension != 3:
             raise ValueError("the volume sampler takes a 3D octree")
         number, table = children(octree)
@@ -117,10 +117,18 @@ class OctreeTents:
             with octree.device:
                 self.corners = tack.empty((max(octree.num_nodes, 1) * 8,), tack.f32)
                 if octree.num_nodes and int(balanced) == 1:
+                    # ``chunk`` nodes a launch, each waited for: a launch of the
+                    # whole octree held the GPU for seconds (2.2 s at 78M nodes on
+                    # an M1 Max), and a viewer's frames queued behind it.
                     nx, ny = self.nx, self.ny
-                    _corner_values_balanced(exact, octree.tree, octree.level, octree.key,
-                                            octree.marks, int(Ghosts.REFINEDCELL), nx, ny,
-                                            self.corners)
+                    n = octree.num_nodes
+                    step = n if chunk is None else max(int(chunk), 1)
+                    for start in range(0, n, step):
+                        _corner_values_balanced(exact, octree.tree, octree.level, octree.key,
+                                                octree.marks, int(Ghosts.REFINEDCELL), nx, ny,
+                                                start, min(step, n - start), self.corners)
+                        if chunk is not None:
+                            tack.sync()
                 elif octree.num_nodes:
                     lo, size = octree.geometry()
                     _corner_values(exact, lo, size, octree.marks, int(Ghosts.REFINEDCELL),
@@ -328,9 +336,11 @@ class OctreeTents:
 
 
 @tack.kernel
-def _corner_values_balanced(tents, tree, level, key, marks, refined, nx, ny, out):
-    # Each leaf's eight corners by corner_value, from its lattice cell.
-    for n in range(marks.shape[0]):
+def _corner_values_balanced(tents, tree, level, key, marks, refined, nx, ny, first, count, out):
+    # Each leaf's eight corners by corner_value, from its lattice cell: the nodes
+    # first .. first + count.
+    for k in range(count):
+        n = first + k
         if (marks[n] & refined) == 0:
             lv = level[n]
             i, j, m = _unkey(key[n], lv, 3)
@@ -574,7 +584,8 @@ class OctreeRenderer:
     frame (``tack_composite.composite``). ``amr_volume`` is the directory of the
     AMR volume modules (``tack_march``, ``tack_composite``, ``volume_tack``)."""
 
-    def __init__(self, octree, name, amr_volume, blend=1, macrocells=64, divide=-1, balanced=0):
+    def __init__(self, octree, name, amr_volume, blend=1, macrocells=64, divide=-1, balanced=0,
+                 chunk=None):
         if str(amr_volume) not in sys.path:
             sys.path.insert(0, str(amr_volume))
         import tack_composite
@@ -586,7 +597,7 @@ class OctreeRenderer:
         # ``balanced``: the sampler for octrees whose neighbouring leaves differ by
         # at most a level (``OctreeTents``); made once here, as replacing it after
         # cost a second sampler (5 of a 94M-node octree's 9 s on Metal).
-        self.tents = OctreeTents(octree, name, blend, balanced=balanced)
+        self.tents = OctreeTents(octree, name, blend, balanced=balanced, chunk=chunk)
         self.ranges = ranges(octree, name)
         self.grid, self.lows, self.highs, self.firsts, self.lasts = macro_ranges(
             octree, self.ranges, macrocells)
