@@ -349,6 +349,124 @@ def macro_ranges(octree, r, most=64):
     return grid, lows, highs, firsts, lasts
 
 
+# -- the divided macrocells -------------------------------------------------------------
+
+
+@tack.kernel
+def _sub_holders(divided, gx, gy, depth, shift, roots, nx, ny, number, table, values, lo, hi, lows,
+                 highs):
+    # Each cell of each divided macrocell: the range of the node holding it (the
+    # node at the cells' level, or the coarser leaf), by a descent from the
+    # root cell. Cells are x fastest within a macrocell.
+    for e in range(lows.shape[0]):
+        across = 1 << shift
+        k = e >> (3 * shift)
+        local = e & ((1 << (3 * shift)) - 1)
+        m = divided[k]
+        mi = m % gx
+        mj = (m // gx) % gy
+        mk = m // (gx * gy)
+        # The cell's lattice coordinates at level depth + shift, and its root cell.
+        ci = (mi << shift) + (local & (across - 1))
+        cj = (mj << shift) + ((local >> shift) & (across - 1))
+        ck = (mk << shift) + (local >> (2 * shift))
+        level = depth + shift
+        n = roots[(ci >> level) + nx * ((cj >> level) + ny * (ck >> level))]
+        d = level
+        while n >= 0 and d > 0 and values[n] == REFINED:
+            d -= 1
+            n = table[(number[n] - 1) * 8 + ((ci >> d) & 1) + 2 * ((cj >> d) & 1) +
+                      4 * ((ck >> d) & 1)]
+        lows[e] = 3.0e38
+        highs[e] = -3.0e38
+        if n >= 0:
+            lows[e] = lo[n]
+            highs[e] = hi[n]
+
+
+@tack.kernel
+def _sub_widen(lows, highs, index, gx, gy, gz, shift, macro_lows, macro_highs, out_lows,
+               out_highs):
+    # Each cell's range over itself and its 26 neighbours (a value inside a leaf
+    # is within its neighbours' values): a neighbour in an undivided macrocell
+    # counts as that macrocell's whole range.
+    for e in range(out_lows.shape[0]):
+        across = 1 << shift
+        k = e >> (3 * shift)
+        local = e & ((1 << (3 * shift)) - 1)
+        m = index_of(index, k)
+        mi = m % gx
+        mj = (m // gx) % gy
+        mk = m // (gx * gy)
+        ci = (mi << shift) + (local & (across - 1))
+        cj = (mj << shift) + ((local >> shift) & (across - 1))
+        ck = (mk << shift) + (local >> (2 * shift))
+        a = lows[e]
+        b = highs[e]
+        for dz in range(-1, 2):
+            for dy in range(-1, 2):
+                for dx in range(-1, 2):
+                    qi = ci + dx
+                    qj = cj + dy
+                    qk = ck + dz
+                    if qi >= 0 and qj >= 0 and qk >= 0 and qi < (gx << shift) and \
+                            qj < (gy << shift) and qk < (gz << shift):
+                        q = (qi >> shift) + gx * ((qj >> shift) + gy * (qk >> shift))
+                        j = index[q]
+                        if j >= 0:
+                            f = (j << (3 * shift)) + (qi & (across - 1)) + \
+                                ((qj & (across - 1)) << shift) + ((qk & (across - 1)) << (2 * shift))
+                            a = min(a, lows[f])
+                            b = max(b, highs[f])
+                        else:
+                            a = min(a, macro_lows[q])
+                            b = max(b, macro_highs[q])
+        out_lows[e] = a
+        out_highs[e] = b
+
+
+@tack.func
+def index_of(index, k):
+    # The macrocell of divided cell k: index holds, after the macrocells' own
+    # entries, the divided ones' macrocells (appended by sub_ranges).
+    return index[index.shape[0] - index[index.shape[0] - 1] + k]
+
+
+def sub_ranges(octree, tents, r, grid, lasts, lows, highs, shift=2):
+    """The macrocells a level reaches whose leaves are at most half a divided cell
+    wide, divided ``1 << shift`` cells an axis, with each cell's range of the
+    values a sample in it can take: the march's ``sub`` (``index``, ``lows``,
+    ``highs``, ``shift``, ``count``), its ``sub_away`` then giving the skips."""
+    nx, ny, nz = [m - 1 for m in octree.roots.topology.point_dims]
+    gx, gy, gz = grid["dims"]
+    depth = 0
+    while (nx << depth) < gx:
+        depth += 1
+    finest = np.asarray(lasts.numpy())
+    divided = np.flatnonzero(finest >= depth + shift + 1)
+    index = np.full(len(finest), -1, np.int32)
+    index[divided] = np.arange(len(divided), dtype=np.int32)
+    count = max(len(divided), 1) << (3 * shift)
+    # One array: the index, then the divided macrocells, then how many of them.
+    packed = np.concatenate([index, divided.astype(np.int32), [np.int32(len(divided) + 1)]])
+    with octree.device:
+        index_dev = tack.array(packed, tack.i32)
+        divided_dev = tack.array(divided.astype(np.int32) if len(divided) else np.zeros(1, np.int32),
+                                 tack.i32)
+        a, b = tack.empty((count,), tack.f32), tack.empty((count,), tack.f32)
+        lo = r.lo if r.lo.dtype == tack.f32 else r.lo.astype(tack.f32)
+        hi = r.hi if r.hi.dtype == tack.f32 else r.hi.astype(tack.f32)
+        if len(divided):
+            _sub_holders(divided_dev, gx, gy, depth, shift, tents.roots, nx, ny, tents.number,
+                         tents.table, tents.values, lo, hi, a, b)
+            sub_lows, sub_highs = tack.empty((count,), tack.f32), tack.empty((count,), tack.f32)
+            _sub_widen(a, b, index_dev, gx, gy, gz, shift, lows, highs, sub_lows, sub_highs)
+        else:
+            sub_lows, sub_highs = a, b
+    return {"index": index, "lows": sub_lows, "highs": sub_highs, "shift": int(shift),
+            "count": len(divided)}
+
+
 # -- the renderer ------------------------------------------------------------------------
 
 
@@ -358,7 +476,7 @@ class OctreeRenderer:
     frame (``tack_composite.composite``). ``amr_volume`` is the directory of the
     AMR volume modules (``tack_march``, ``tack_composite``, ``volume_tack``)."""
 
-    def __init__(self, octree, name, amr_volume, blend=1, macrocells=64):
+    def __init__(self, octree, name, amr_volume, blend=1, macrocells=64, divide=-1):
         if str(amr_volume) not in sys.path:
             sys.path.insert(0, str(amr_volume))
         import tack_composite
@@ -373,6 +491,10 @@ class OctreeRenderer:
             octree, self.ranges, macrocells)
         self.bounds = self.tents.bounds
         self.cell = self.tents.finest
+        #: The divided macrocells (``divide`` the shift, -1 for none).
+        self.divide = int(divide)
+        self.sub = sub_ranges(octree, self.tents, self.ranges, self.grid, self.lasts, self.lows,
+                              self.highs, divide) if divide >= 0 else None
         self._seen = (None, None, None)
 
     def table(self, color, opacity, lo, hi, size=256):
@@ -411,19 +533,27 @@ class OctreeRenderer:
             key = (table.tobytes(), lo, hi)
             if self._seen[0] != key:
                 seen = volume_tack.visible(self.lows, self.highs, table, lo, hi)
-                undivided = tack.full((len(seen),), -1, tack.i32)
+                if self.sub is None:
+                    divided = tack.full((len(seen),), -1, tack.i32)
+                    near = tack.zeros((1,), tack.i32)
+                else:
+                    divided = tack.array(self.sub["index"], tack.i32)
+                    near = tack_march.sub_away(self.sub, table, lo, hi)
                 words = tack_march.macro_words(seen, self.firsts, self.lasts, self.grid["dims"],
-                                               undivided)
-                self._seen = (key, seen, words)
+                                               divided)
+                self._seen = (key, seen, (words, near))
             out = tack.empty((count,), tack.vec4(tack.f32))
-            near = tack.zeros((1,), tack.i32)
+            words, near = self._seen[2]
+            asked = self.divide
+            if self.sub is not None and min_step >= min(self.grid["size"]) / (1 << self.divide):
+                asked = -1
             tack.sync()
             t1 = time.perf_counter()
             tack_march.march(self.tents, starts, dirs, tmins, tmaxs, tack.array(table, tack.vec4()),
-                             self._seen[2], float(lo), float(hi), float(sample_distance),
+                             words, float(lo), float(hi), float(sample_distance),
                              float(min_step), float(unit_distance * self.cell), *self.grid["dims"],
                              *self.grid["origin"], *self.grid["size"], float(0.01 * self.cell),
-                             float(jitter), int(w), near, -1, out)
+                             float(jitter), int(w), near, asked, out)
             tack.sync()
             t2 = time.perf_counter()
             picture = out.numpy().reshape(h, w, 4)
