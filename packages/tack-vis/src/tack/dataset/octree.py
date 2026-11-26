@@ -251,12 +251,16 @@ class OctreeDataSet:
     ``vtkHyperTreeGrid``s."""
 
     def __init__(self, roots, tree, level, key, fields=None, mask=None, world=None,
-                 units=None, _ordered=False):
+                 units=None, _ordered=False, _adopt=False):
         from tack.dataset.topology import StructuredTopology
 
         if not isinstance(roots.topology, StructuredTopology) or \
                 not isinstance(roots.geometry.values, (UniformCoordinates, CartesianProduct)):
             raise TypeError("an octree's roots are an image or a rectilinear grid")
+        # ``_adopt``: tree, level and key are device arrays the caller hands
+        # over (i64, i32, u64 on the roots' device, nothing else holding them),
+        # kept as the octree's own rather than read back and uploaded again.
+        adopted = (tree, level, key) if _adopt else None
         self.roots = roots
         self.dimension = len(roots.topology.point_dims)
         if self.dimension not in (2, 3):
@@ -299,9 +303,12 @@ class OctreeDataSet:
             marks[np.asarray(mask[order] != 0)] |= Ghosts.HIDDENCELL
         device = roots.device
         with device:
-            self.tree = tack.array(self._tree, tack.i64)
-            self.level = tack.array(self._level.astype(np.int32), tack.i32)
-            self.key = tack.array(self._key, tack.u64)
+            if adopted is not None and _ordered:
+                self.tree, self.level, self.key = adopted
+            else:
+                self.tree = tack.array(self._tree, tack.i64)
+                self.level = tack.array(self._level.astype(np.int32), tack.i32)
+                self.key = tack.array(self._key, tack.u64)
             self.marks = tack.array(marks, tack.u8)
         self.fields = {}
         for name, values in (fields or {}).items():

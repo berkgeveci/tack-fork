@@ -412,7 +412,7 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
         solid_flag, src, how = (tack.empty((total,), tack.i32) for _ in range(3))
         _place(count, start, octree.tree, octree.level, octree.key, solver.role_array, merge, d,
                tree, lev, key, solid_flag, src, how)
-    logical = OctreeDataSet(octree.roots, tree, lev, key, _ordered=True)
+    logical = OctreeDataSet(octree.roots, tree, lev, key, _ordered=True, _adopt=True)
     periodic = getattr(octree, "periodic", (False,) * d)
     rows = lb._rows(logical, periodic)
     refined_mark = int(Ghosts.REFINEDCELL)
@@ -426,7 +426,8 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
         _place_ghosts(count2, start2, tree, lev, key, logical.marks, refined_mark, solid_flag, d,
                       tree2, lev2, key2, role2, mapped)
     roles = role2.numpy()
-    mesh = OctreeDataSet(octree.roots, tree2, lev2, key2, fields={"role": roles}, _ordered=True)
+    mesh = OctreeDataSet(octree.roots, tree2, lev2, key2, fields={"role": roles}, _ordered=True,
+                         _adopt=True)
     mesh.periodic = periodic
     if solid is not None:
         lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in mesh.geometry())
