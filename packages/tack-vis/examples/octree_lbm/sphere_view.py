@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) Kitware Inc.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Flow past a sphere in 3D, live in a VTK WebGPU window: the lattice Boltzmann
-prototype in D3Q27 (``tack.dataset.octree_lbm``) on an adaptive octree of three
-levels, the finest around the sphere and wherever the wake's vorticity is,
+"""Flow past a sphere, or a finite cylinder (``--body cylinder``), in 3D, live
+in a VTK WebGPU window: the lattice Boltzmann prototype in D3Q27
+(``tack.dataset.octree_lbm``) on an adaptive octree of three levels, the finest
+around the body and wherever the wake's vorticity is,
 steps on the CPU or a GPU (``--device metal``) while VTK shows
 
 - above, the wake: a surface of constant vorticity magnitude, contoured on the
@@ -19,8 +20,15 @@ side, a pressure outlet with a sponge before it at the high-x side, periodic
 across. The wake first turns oblique, then starts to shed, after about 2000
 steps; ``--start`` runs that many steps before the window opens.
 
-    sphere_view.py [--re 300] [--diameter 8] [--steps 4] [--every 16] [--start 0]
-                   [--level 1.5] [--device cpu] [--dtype f32|f64] [--check OUTDIR]
+The finite cylinder (``--body cylinder``, ``finite_cylinder_view.sh``): its axis
+across the flow (z), ``--length`` diameters long with free ends, 2 diameters
+clear of the domain's z sides, which are periodic as y's are; Re 200 by
+default. It sheds as a cylinder does along its middle, and its ends make tip
+vortices and bend the shed ones; the mid-plane below cuts its middle.
+
+    sphere_view.py [--body sphere|cylinder] [--length 2] [--re 300] [--diameter 8]
+                   [--steps 4] [--every 16] [--start 0] [--level 1.5]
+                   [--device cpu] [--dtype f32|f64] [--check OUTDIR]
 
 On a device without f64 (Metal) the solver keeps its values in f32.
 
@@ -39,7 +47,7 @@ import vtkmodules.vtkRenderingWebGPU  # noqa: F401  (the WebGPU window)
 from vortex_view import SEQUENTIAL
 from vtkmodules.vtkCommonCore import vtkFloatArray, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
-from vtkmodules.vtkFiltersSources import vtkOutlineSource, vtkSphereSource
+from vtkmodules.vtkFiltersSources import vtkCylinderSource, vtkOutlineSource, vtkSphereSource
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkIOImage import vtkPNGWriter
 from vtkmodules.vtkRenderingCore import vtkTextActor, vtkWindowToImageFilter
@@ -65,6 +73,19 @@ def _inside_sphere(x, y, z, xc, yc, zc, r2, out):
             out[n] = 1
 
 
+@tack.kernel
+def _near_cylinder(x, y, z, xc, yc, zc, radius, half, margin, out):
+    # 1 where a centre is within ``margin`` of the cylinder of ``radius`` about
+    # (xc, yc), from zc - half to zc + half (its ends flat): the pinned cells.
+    for n in range(out.shape[0]):
+        dx = x[n] - xc
+        dy = y[n] - yc
+        dr = max(tack.sqrt(dx * dx + dy * dy) - radius, 0.0)
+        dz = max(abs(z[n] - zc) - half, 0.0)
+        if dr * dr + dz * dz < margin * margin:
+            out[n] = 1
+
+
 def text(renderer, x, y, size):
     actor = vtkTextActor()
     actor.GetTextProperty().SetColor(0.1, 0.1, 0.1)
@@ -86,7 +107,11 @@ def polydata(points, connectivity, size):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--re", type=float, default=300.0)
+    parser.add_argument("--body", default="sphere", choices=("sphere", "cylinder"))
+    parser.add_argument("--length", type=float, default=2.0,
+                        help="the cylinder's length, in diameters")
+    parser.add_argument("--re", type=float, default=None,
+                        help="Reynolds number by the diameter (sphere 300, cylinder 200)")
     parser.add_argument("--diameter", type=float, default=8.0, help="in root cells")
     parser.add_argument("--steps", type=int, default=4, help="level-0 steps a frame")
     parser.add_argument("--every", type=int, default=16, help="level-0 steps between remeshes")
@@ -104,7 +129,14 @@ def main():
     dtype = {"f32": tack.f32, "f64": tack.f64}[args.dtype or
                                                 ("f64" if args.device == "cpu" else "f32")]
     d = args.diameter
-    nx, ny, nz = int(10 * d), int(4 * d), int(4 * d)
+    cylinder = args.body == "cylinder"
+    if args.re is None:
+        args.re = 200.0 if cylinder else 300.0
+    half = 0.5 * args.length * d                        # the cylinder's half length
+    if cylinder:
+        nx, ny, nz = int(10 * d), int(5 * d), round(2 * half + 4 * d)
+    else:
+        nx, ny, nz = int(10 * d), int(4 * d), int(4 * d)
     xc, yc, zc = 2.5 * d, ny / 2, nz / 2
     tau = 3 * U * d / args.re + 0.5
     region = (xc - 1.5 * d, nx - 14)
@@ -113,12 +145,18 @@ def main():
         return np.sqrt((x - xc) ** 2 + (y - yc) ** 2 + (z - zc) ** 2)
 
     def pinned_on_device(x, y, z, out):
-        # distance < 0.85 d, by squares: with a whole diameter, the centres'
-        # offsets are multiples of 1/8 and their squared distances exact in f32
-        # as in f64, so either type picks the cells the host's f64 would.
-        _inside_sphere(x, y, z, xc, yc, zc, (0.85 * d) ** 2, out)
+        # Within 0.35 d of the body. The sphere's by squares: with a whole
+        # diameter, the centres' offsets are multiples of 1/8 and their squared
+        # distances exact in f32 as in f64, so either type picks the cells the
+        # host's f64 would.
+        if cylinder:
+            _near_cylinder(x, y, z, xc, yc, zc, 0.5 * d, half, 0.35 * d, out)
+        else:
+            _inside_sphere(x, y, z, xc, yc, zc, (0.85 * d) ** 2, out)
 
     def solid(x, y, z):
+        if cylinder:
+            return (np.hypot(x - xc, y - yc) < 0.5 * d) & (np.abs(z - zc) < half)
         return distance(x, y, z) < 0.5 * d
 
     state = {"paused": False, "ms": [], "remesh_ms": [], "contour_ms": [], "trace": [],
@@ -136,8 +174,10 @@ def main():
         s, _ = remesh(s, solid=solid)
         c, _ = s.centres()
         fluid = s.role != lb.SOLID
-        kick = 0.02 * U * np.exp(-((c[:, 0] - xc - d) ** 2 + (c[:, 1] - yc - 2) ** 2 +
-                                   (c[:, 2] - zc) ** 2) / d ** 2)
+        # A bump across the flow behind the body, off its axis: which way the wake
+        # breaks its symmetry. The cylinder's stronger: its shedding grows from it.
+        kick = (0.1 if cylinder else 0.02) * U * np.exp(
+            -((c[:, 0] - xc - d) ** 2 + (c[:, 1] - yc - 2) ** 2 + (c[:, 2] - zc) ** 2) / d ** 2)
         s.initialize(1.0, np.where(fluid, U, 0.0), np.where(fluid, kick, 0.0), 0.0)
         return s
 
@@ -148,7 +188,9 @@ def main():
           f"{tack.device(args.device)} in {solver.dtype}")
 
     window = rr.vtkRenderWindow(size=(1600, 940), off_screen_rendering=bool(args.check))
-    window.SetWindowName("Flow past a sphere (Tack LBM, D3Q27, adaptive octree)")
+    body = (f"a finite cylinder, length {args.length:g} diameters" if cylinder else
+            "a sphere")
+    window.SetWindowName(f"Flow past {body} (Tack LBM, D3Q27, adaptive octree)")
     above = rr.vtkRenderer(background=(1, 1, 1))
     above.SetViewport(0, 0.36, 1, 1)
     below = rr.vtkRenderer(background=(1, 1, 1))
@@ -158,13 +200,19 @@ def main():
     surface.GetProperty().SetColor(0.35, 0.6, 0.85)
     surface.GetProperty().SetSpecular(0.3)
     above.AddActor(surface)
-    ball = vtkSphereSource(center=(xc, yc, zc), radius=d / 2, theta_resolution=48,
-                           phi_resolution=48)
-    ball_mapper = rr.vtkPolyDataMapper()
-    ball_mapper.SetInputConnection(ball.GetOutputPort())
-    sphere = rr.vtkActor(mapper=ball_mapper)
-    sphere.GetProperty().SetColor(0.45, 0.45, 0.48)
-    above.AddActor(sphere)
+    if cylinder:                                # VTK's cylinder is along y: turned to z
+        shape = vtkCylinderSource(radius=d / 2, height=2 * half, resolution=64)
+    else:
+        shape = vtkSphereSource(center=(xc, yc, zc), radius=d / 2, theta_resolution=48,
+                                phi_resolution=48)
+    shape_mapper = rr.vtkPolyDataMapper()
+    shape_mapper.SetInputConnection(shape.GetOutputPort())
+    solid_actor = rr.vtkActor(mapper=shape_mapper)
+    solid_actor.GetProperty().SetColor(0.45, 0.45, 0.48)
+    if cylinder:
+        solid_actor.RotateX(90)
+        solid_actor.SetPosition(xc, yc, zc)
+    above.AddActor(solid_actor)
     box = vtkOutlineSource(bounds=(0, nx, 0, ny, 0, nz))
     box_mapper = rr.vtkPolyDataMapper()
     box_mapper.SetInputConnection(box.GetOutputPort())
@@ -176,8 +224,12 @@ def main():
         " below, the mid-plane's cells by vorticity magnitude, 0 to 3")
     status = text(above, 0.01, 0.02, 15)
     camera = above.GetActiveCamera()
-    camera.SetFocalPoint(nx * 0.5, ny / 2 + 0.06 * nx, nz / 2)
-    camera.SetPosition(nx * 0.5 - 0.22 * nx, ny / 2 + 0.45 * nx, nz / 2 + 0.68 * nx)
+    if cylinder:                                # from above the wake, toward one end
+        camera.SetFocalPoint(nx * 0.5, ny / 2, nz / 2)
+        camera.SetPosition(nx * 0.35, ny / 2 + 0.95 * nx, nz / 2 + 0.75 * nx)
+    else:
+        camera.SetFocalPoint(nx * 0.5, ny / 2 + 0.06 * nx, nz / 2)
+        camera.SetPosition(nx * 0.5 - 0.22 * nx, ny / 2 + 0.45 * nx, nz / 2 + 0.68 * nx)
     camera.SetViewUp(0, 1, 0)
     camera.SetViewAngle(30)
     slice_mapper = rr.vtkPolyDataMapper()
@@ -308,7 +360,8 @@ def main():
         grab.SetInput(window)
         grab.Update()
         writer = vtkPNGWriter()
-        writer.SetFileName(os.path.join(args.check, f"sphere_view_{state['solver'].steps}.png"))
+        writer.SetFileName(os.path.join(args.check,
+                                        f"{args.body}_view_{state['solver'].steps}.png"))
         writer.SetInputConnection(grab.GetOutputPort())
         writer.Write()
         print(f"step {state['solver'].steps}: {int(state['solver'].computational().sum())} "
