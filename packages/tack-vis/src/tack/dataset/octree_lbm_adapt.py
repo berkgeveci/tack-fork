@@ -82,9 +82,11 @@ def _beside(r, at, level, role, number, table, q, dim, f):
 
 
 @tack.kernel
-def _vorticity(nodes, rows, level, role, number, table, side, q, dim, f, out):
+def _vorticity(nodes, rows, level, role, number, table, side, lat, f, out):
     # |vorticity| at a computational cell, by differences with its neighbours
     # at its level (a refined one by its children's mean).
+    q = lat.Q
+    dim = lat.DIM
     for k in range(nodes.shape[0]):
         n = nodes[k]
         at = level[n]
@@ -375,9 +377,10 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
         for lv in range(octree.finest + 1):
             if len(solver.computed[lv]):
                 _vorticity(solver.computed[lv], solver.rows, octree.level, solver.role_array,
-                           solver.number, solver.table, solver.side, q, d, solver.f, measure)
+                           solver.number, solver.table, solver.side, solver.lattice, solver.f,
+                           measure)
                 _gradients(solver.computed[lv], solver.rows, octree.level, solver.role_array, lv,
-                           q, d, solver.f, solver.grad)
+                           solver.lattice, solver.f, solver.grad)
         pin = np.zeros(n, np.int32)
         if pinned is not None:
             pin[np.asarray(pinned(*centre.T), bool)] = 1

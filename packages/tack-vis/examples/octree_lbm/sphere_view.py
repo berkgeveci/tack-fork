@@ -4,7 +4,7 @@
 """Flow past a sphere in 3D, live in a VTK WebGPU window: the lattice Boltzmann
 prototype in D3Q27 (``tack.dataset.octree_lbm``) on an adaptive octree of three
 levels, the finest around the sphere and wherever the wake's vorticity is,
-steps on the CPU while VTK shows
+steps on the CPU or a GPU (``--device metal``) while VTK shows
 
 - above, the wake: a surface of constant vorticity magnitude, contoured on the
   solver's own octree by the study's octree contour (``octree_contour``),
@@ -20,7 +20,9 @@ across. The wake first turns oblique, then starts to shed, after about 2000
 steps; ``--start`` runs that many steps before the window opens.
 
     sphere_view.py [--re 300] [--diameter 8] [--steps 4] [--every 16] [--start 0]
-                   [--level 1.5] [--check OUTDIR]
+                   [--level 1.5] [--device cpu] [--check OUTDIR]
+
+On a device without f64 (Metal) the solver keeps its values in f32.
 
 Space pauses, r restarts, m shows or hides the cells' edges, q quits; drag
 rotates the wake (the plane below has its own camera). Run it on VTK's WebGPU
@@ -78,9 +80,10 @@ def main():
     parser.add_argument("--start", type=int, default=0, help="steps to run before showing")
     parser.add_argument("--level", type=float, default=1.5,
                         help="the surface's vorticity, in free-stream speed / diameter")
+    parser.add_argument("--device", default="cpu", help="cpu, metal, cuda, ...")
     parser.add_argument("--check", default=None, metavar="OUTDIR")
     args = parser.parse_args()
-    tack.set_default_device("cpu")
+    tack.set_default_device(args.device)
     d = args.diameter
     nx, ny, nz = int(10 * d), int(4 * d), int(4 * d)
     xc, yc, zc = 2.5 * d, ny / 2, nz / 2
@@ -118,7 +121,8 @@ def main():
     begin = time.perf_counter()
     solver = start_mesh()
     print(f"{int(solver.computational().sum())} cells on 3 levels to start, Re {args.re:g}, "
-          f"tau {tau:.4f} at level 0 ({time.perf_counter() - begin:.1f} s); Tack on the CPU")
+          f"tau {tau:.4f} at level 0 ({time.perf_counter() - begin:.1f} s); Tack on "
+          f"{tack.device(args.device)} in {solver.dtype}")
 
     window = rr.vtkRenderWindow(size=(1600, 940), off_screen_rendering=bool(args.check))
     window.SetWindowName("Flow past a sphere (Tack LBM, D3Q27, adaptive octree)")
@@ -220,7 +224,7 @@ def main():
             w = tack.zeros((s.octree.num_nodes,), s.dtype)
             for nodes in state["nodes"]:
                 _vorticity(nodes, s.rows, s.octree.level, s.role_array, s.number, s.table,
-                           s.side, s.q, s.dim, s.f, w)
+                           s.side, s.lattice, s.f, w)
         scaled = w.numpy() * d / U
         with s.octree.device:
             s.octree.fields["w"] = tack.array(scaled.astype(s.dtype.numpy_dtype), s.dtype)
