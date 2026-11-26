@@ -60,6 +60,7 @@ STMTS = {
     ir.IRParallelFor, ir.IRSequentialFor, ir.IRWhile, ir.IRBreak, ir.IRContinue,
     ir.IRIf, ir.IRArrayStore, ir.IRAtomicOp, ir.IRAssign, ir.IRReturn,
     ir.IRSharedAlloc, ir.IRLocalAlloc, ir.IRBarrier, ir.IRPrint, ir.IRCall,
+    ir.IRFunctionDef,
 }
 EFFECTS = (ir.IRArrayStore, ir.IRAtomicOp, ir.IRBlockReduce, ir.IRBarrier, ir.IRPrint)
 BINOPS = {'+', '-', '*', '/', '//', '%', '**', '&', '|', '^', '<<', '>>'}
@@ -280,6 +281,8 @@ def verify_ir(function: ir.IRFunction, stage: str):
         elif isinstance(node, (ir.IRSharedAlloc, ir.IRLocalAlloc)):
             bound.add(node.name)
             buffers.add(node.name)
+        elif isinstance(node, ir.IRFunctionDef):
+            bound.update(node.params)
     # Inlined array arguments can remain as pointer copies in the IR.
     changed = True
     while changed:

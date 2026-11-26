@@ -261,11 +261,36 @@ class IRCall(IRNode):
     extern = None
     #: An extern call's ``(result type, argument types)``, set by type annotation.
     extern_types = None
+    #: The device-class objects an extern call passes: ``(declared position,
+    #: {method: IRFunctionDef name})`` each. They are not among ``args``.
+    extern_objects = ()
 
     def __init__(self, func_name: str, args: list):
         self.func_name = func_name
         self.args = args
         self.dtype = None
+
+
+class IRFunctionDef(IRNode):
+    """A function defined inside the kernel, which C++ calls back (tack.cpp): a
+    device-class method as inlined for one call, with fresh names for its
+    parameters. A statement, placed before the one holding the call it
+    serves. Names its body reads besides its parameters and its own locals are
+    the kernel's (a template's synthetic parameters), captured by value where
+    it is emitted."""
+
+    #: The `IRCall` it serves, and ``(declared position, method name)`` there.
+    call = None
+    slot = None
+    #: Its types, from the C++ function's declaration (type annotation).
+    param_types = None
+    result_type = None
+
+    def __init__(self, name: str, params: list, body: list, result):
+        self.name = name
+        self.params = params    # names
+        self.body = body
+        self.result = result
 
 
 class IRAssign(IRNode):

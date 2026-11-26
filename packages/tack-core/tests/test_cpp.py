@@ -13,7 +13,7 @@ import pytest
 
 import tack
 import tack.cpp
-from tack.cpp import T, ptr
+from tack.cpp import T, obj, ptr
 
 _HEADER = """
 #pragma once
@@ -333,6 +333,210 @@ def test_a_storing_call_outside_the_parallel_loop_is_refused(mesh):
     a = tack.zeros(9, tack.f64)
     with pytest.raises(Exception, match="C\\+\\+ call that may store"):
         outside(a, tack.zeros(3, tack.i64), a)
+
+
+_CALLS_METHODS = """
+namespace demo {
+// Simpson's rule over any F with value(x), and Newton steps with value and slope.
+template <class F, class V> V integrate(const F& f, V a, V b, int n) {
+  V h = (b - a) / n, s = f.value(a) + f.value(b);
+  for (int k = 1; k < n; ++k) s += f.value(a + k * h) * (k % 2 ? 4 : 2);
+  return s * h / 3;
+}
+template <class F, class V> V newton(const F& f, V x, int steps) {
+  for (int k = 0; k < steps; ++k) x -= f.value(x) / f.slope(x);
+  return x;
+}
+template <class F> int visit(const F& f, int n) {
+  int s = 0;
+  for (int k = 0; k < n; ++k) s += f.mark(k);
+  return s;
+}
+}
+"""
+
+
+@tack.device_class
+class _Poly:
+    """A polynomial less a shift: an array, a runtime scalar and two methods."""
+
+    def __init__(self, coefficients, shift, dtype=tack.f64):
+        self.c = tack.array(np.asarray(coefficients, dtype=dtype.numpy_dtype))
+        self.shift = shift
+
+    @tack.func
+    def value(self, x):
+        r = 0.0 * x
+        for k in range(self.c.shape[0]):
+            r = r * x + self.c[k]
+        return r - self.shift
+
+    @tack.func
+    def slope(self, x):
+        r = 0.0 * x
+        n = self.c.shape[0]
+        for k in range(n - 1):
+            r = r * x + (n - 1 - k) * self.c[k]
+        return r
+
+
+@tack.device_class
+class _Scaled:
+    """A template holding a template, with a method that calls its."""
+
+    def __init__(self, base, factor):
+        self.base = base
+        self.factor = factor
+
+    @tack.func
+    def value(self, x):
+        return self.factor * self.base.value(x)
+
+
+@pytest.fixture(scope="module")
+def calls_methods():
+    lib = tack.cpp.Library(source=_CALLS_METHODS)
+    return (lib.function("demo::integrate", result=T,
+                         args=(obj(value=(T, (T,))), T, T, tack.i32)),
+            lib.function("demo::newton", result=T,
+                         args=(obj(value=(T, (T,)), slope=(T, (T,))), T, tack.i32)),
+            lib)
+
+
+_COEFFICIENTS = [1.0, 0.0, -2.0, 1.0]
+
+
+def _integral(a, b, shift):
+    antiderivative = np.polyint(np.poly1d(_COEFFICIENTS))
+    return antiderivative(b) - antiderivative(a) - shift * (b - a)
+
+
+@pytest.mark.parametrize("dtype", [tack.f32, tack.f64])
+def test_cpp_calls_a_device_classs_method(calls_methods, dtype):
+    integrate = calls_methods[0]
+
+    @tack.kernel
+    def integrals(f, a, b, out):
+        for i in range(out.shape[0]):
+            out[i] = integrate(f, a[i], b[i], 64)
+
+    np_type = dtype.numpy_dtype
+    a = np.linspace(0, 1, 100).astype(np_type)
+    b = (a + 1.5).astype(np_type)
+    poly = _Poly(_COEFFICIENTS, 0.5, dtype)
+    out = tack.zeros(100, dtype)
+    integrals(poly, tack.array(a), tack.array(b), out)
+    tolerance = 1e-13 if dtype is tack.f64 else 2e-5
+    np.testing.assert_allclose(out.numpy(), _integral(a, b, 0.5), rtol=tolerance)
+    # A runtime scalar of the object, read by the method C++ calls: no new variant.
+    poly.shift = 0.25
+    integrals(poly, tack.array(a), tack.array(b), out)
+    np.testing.assert_allclose(out.numpy(), _integral(a, b, 0.25), rtol=tolerance)
+
+
+def test_cpp_calls_two_methods_and_both_are_inlined(calls_methods, no_debug):
+    newton = calls_methods[1]
+
+    @tack.kernel
+    def roots(f, x0, out):
+        for i in range(out.shape[0]):
+            out[i] = newton(f, x0[i], 20)
+
+    poly = _Poly(_COEFFICIENTS, 0.25)
+    x0 = tack.array(np.linspace(1.2, 3, 50))
+    out = tack.zeros(50, tack.f64)
+    roots(poly, x0, out)
+    assert np.abs(np.polyval(_COEFFICIENTS, out.numpy()) - 0.25).max() < 1e-13
+    text = tack.inspect(roots, poly, x0, out, mode="optimized")
+    # No function of either side is left, called or defined.
+    assert "@tack_cpp_" not in text and "@tack_cb_" not in text
+
+
+def test_objects_held_by_objects_and_passed_through_device_functions(calls_methods):
+    integrate = calls_methods[0]
+
+    @tack.func
+    def area(f, a, b):
+        return integrate(f, a, b, 64)
+
+    @tack.kernel
+    def nested(f, a, b, out):
+        for i in range(out.shape[0]):
+            out[i] = area(f, a[i], b[i]) + integrate(f.base, a[i], b[i], 64)
+
+    a = np.linspace(0, 1, 20)
+    b = a + 1.5
+    out = tack.zeros(20, tack.f64)
+    nested(_Scaled(_Poly(_COEFFICIENTS, 0.5), 3.0), tack.array(a), tack.array(b), out)
+    np.testing.assert_allclose(out.numpy(), 4.0 * _integral(a, b, 0.5), rtol=1e-13)
+
+
+def test_a_method_cpp_calls_may_store_and_tack_counts_it(calls_methods):
+    visit = calls_methods[2].function("demo::visit", result=tack.i32,
+                                      args=(obj(mark=(tack.i32, (tack.i32,))), tack.i32))
+
+    @tack.device_class
+    class Rows:
+        def __init__(self, seen, width):
+            self.seen = seen
+            self.width = width
+            self.row = 0
+
+        @tack.func
+        def mark(self, k):
+            self.seen[self.row * self.width + k] = k + 1
+            return k
+
+    @tack.kernel
+    def fill(rows, out):
+        for i in range(out.shape[0]):
+            out[i] = visit(rows, 4)
+
+    seen = tack.zeros(4, tack.i32)
+    out = tack.zeros(1, tack.i32)
+    fill(Rows(seen, 4), out)
+    assert seen.numpy().tolist() == [1, 2, 3, 4] and out.numpy().tolist() == [6]
+    host = np.zeros(4, np.int32)
+    readonly = tack.array_from_ptr(host.ctypes.data, (4,), tack.i32)
+    with pytest.raises(ValueError, match="read-only"):
+        fill(Rows(readonly, 4), out)
+
+
+def test_objects_are_checked(calls_methods):
+    integrate = calls_methods[0]
+    plain = calls_methods[2].function("demo::integrate", result=T, args=(T, T, T, tack.i32))
+
+    @tack.device_class
+    class NoValue:
+        def __init__(self):
+            self.k = 1.0
+
+    @tack.device_class
+    class VectorValue:
+        def __init__(self):
+            self.k = 1.0
+
+        @tack.func
+        def value(self, x):
+            return tack.vec2(x, self.k)
+
+    @tack.kernel
+    def integrals(f, out):
+        for i in range(out.shape[0]):
+            out[i] = integrate(f, 0.0, 1.0, 8)
+
+    @tack.kernel
+    def undeclared(f, out):
+        for i in range(out.shape[0]):
+            out[i] = plain(f, 0.0, 1.0, 8)
+
+    out = tack.zeros(2, tack.f64)
+    with pytest.raises(Exception, match="has no @tack.func method 'value'"):
+        integrals(NoValue(), out)
+    with pytest.raises(Exception, match="returns a vector"):
+        integrals(VectorValue(), out)
+    with pytest.raises(Exception, match="does not make a tack.cpp.obj"):
+        undeclared(_Poly(_COEFFICIENTS, 0.0), out)
 
 
 _SCRIPT = """

@@ -809,13 +809,7 @@ class KernelTransformer(
             return self._inline_func_call(func_obj, node)
         extern = self._call_bindings.extern_func(node.func)
         if extern is not None:
-            # A C++ function (tack.cpp) on scalars; a vector passes its components.
-            args = []
-            for arg in self._visit_ordered(node.args):
-                args.extend(arg) if isinstance(arg, list) else args.append(arg)
-            call = ir.IRCall(func_name=extern.name, args=args)
-            call.extern = extern
-            return call
+            return self._visit_extern_call(node, extern)
         func_name = self._resolve_call_name(node)
 
         # A refusal the template rewrite left in a method body: raised only when
@@ -985,6 +979,44 @@ class KernelTransformer(
                 return obj_result
 
         raise NotImplementedError(f"Function call '{func_name}' not supported in kernels")
+
+    def _visit_extern_call(self, node, extern):
+        """A call of a C++ function (tack.cpp). A vector passes its components.
+        A device-class object, which the template rewrite replaced by its
+        methods' calls on fresh argument names, becomes one `IRFunctionDef`
+        per method: the method as inlined here, for C++ to call back."""
+        from tack.lang.template_rewrite import OBJECT_MARKER
+
+        def marker(arg):
+            return (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
+                    and arg.func.id == OBJECT_MARKER)
+        args = []
+        for arg in self._visit_ordered([a for a in node.args if not marker(a)]):
+            args.extend(arg) if isinstance(arg, list) else args.append(arg)
+        call = ir.IRCall(func_name=extern.name, args=args)
+        call.extern = extern
+        objects = []
+        for position, arg in enumerate(node.args):
+            if not marker(arg):
+                continue
+            defs = {}
+            for k in range(0, len(arg.args), 3):
+                method, names, inner = arg.args[k].value, arg.args[k + 1].value, arg.args[k + 2]
+                value, statements = self._visit_expression(inner)
+                if isinstance(value, list):
+                    raise self._source_error(
+                        node, f"{extern.name}()", f"calls the method '{method}', which "
+                        "returns a vector; a method C++ calls returns one scalar")
+                define = ir.IRFunctionDef(
+                    name=self._fresh_name(f"__tack_cb_{method}__"),
+                    params=[n for n in names.split(",") if n], body=statements, result=value)
+                define.call, define.slot = call, (position, method)
+                defs[method] = define.name
+                # After the arguments' own statements: they are typed first.
+                self._pre_stmts.append(define)
+            objects.append((position, defs))
+        call.extern_objects = tuple(objects)
+        return call
 
     def _math_call(self, node, func_name: str, args: list):
         """A math builtin on scalars, or on each component when given a vector."""

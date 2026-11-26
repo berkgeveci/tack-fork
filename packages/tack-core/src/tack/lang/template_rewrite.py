@@ -36,6 +36,10 @@ from tack.lang.ast_copy import copy_ast
 from tack.lang.func import Func
 from tack.lang.ir_names import fresh_name
 
+#: The call the rewrite leaves where a device-class object is passed to a C++
+#: function (tack.cpp): ``(method, "arg,names", method call)`` triples.
+OBJECT_MARKER = "__tack_cpp_object__"
+
 
 def _method_call_name(name):
     """Tag generated method calls so user bindings cannot collide with them."""
@@ -1058,6 +1062,9 @@ class _Specializer:
                 bound[position] = node
         if not bound:
             return call
+        extern = self._extern(call, funcdef, python_func)
+        if extern is not None:
+            return self._extern_call(call, extern, bound, roots)
         func = call.func
         while isinstance(func, ast.Attribute):
             func = func.value
@@ -1080,6 +1087,54 @@ class _Specializer:
         args += [ast.Name(id=n, ctx=ast.Load()) for n in added]
         return ast.copy_location(ast.Call(func=_method_call_name(name), args=args,
                                           keywords=call.keywords), call)
+
+    @staticmethod
+    def _extern(call, funcdef, python_func):
+        """The C++ function (tack.cpp) ``call`` calls, else None."""
+        import sys
+        if 'tack.cpp' not in sys.modules or getattr(call.func, '_tack_template_call', False):
+            return None
+        from tack.lang.call_bindings import CallBindings
+        return CallBindings(funcdef, python_func=python_func).extern_func(call.func)
+
+    def _extern_call(self, call, extern, bound, roots):
+        """A C++ function given device-class objects: each becomes a marker
+        holding, per method the function's declaration names, that method's call
+        on fresh argument names -- resolved as any method call is, so lowering
+        inlines it as the body of the function C++ calls back."""
+        from tack.cpp import Object
+        args = list(call.args)
+        for position in bound:
+            spec = extern.args[position] if position < len(extern.args) else None
+            if not isinstance(spec, Object):
+                raise TypeError(
+                    f"'{ast.unparse(call.func)}' is given the device-class object "
+                    f"'{ast.unparse(args[position])}' as argument {position + 1}, which "
+                    "its declaration does not make a tack.cpp.obj")
+            parts = []
+            for method, (_, params) in spec.methods.items():
+                names = []
+                for _ in params:
+                    names.append(fresh_name(f"__tack_cb_{method}", self.used_names))
+                inner = ast.Call(
+                    func=ast.Attribute(value=copy_ast(args[position]), attr=method,
+                                       ctx=ast.Load()),
+                    args=[ast.Name(id=n, ctx=ast.Load()) for n in names], keywords=[])
+                resolved = None
+                for root, owner in roots.items():
+                    chain = _chain(inner.func, root)
+                    if chain:
+                        resolved = _resolve_call(owner, inner, chain, root, owner.extra)
+                        break
+                if resolved is None:
+                    raise TypeError(
+                        f"'{ast.unparse(args[position])}' has no @tack.func method "
+                        f"'{method}', which '{ast.unparse(call.func)}' declares it calls")
+                parts += [ast.Constant(method), ast.Constant(",".join(names)), resolved]
+            args[position] = ast.Call(func=ast.Name(id=OBJECT_MARKER, ctx=ast.Load()),
+                                      args=parts, keywords=[])
+        new = ast.Call(func=call.func, args=args, keywords=[])
+        return ast.fix_missing_locations(ast.copy_location(new, call))
 
     def _callee(self, call, funcdef, python_func):
         """The callee's definition and Python function: a resolved method or copy,

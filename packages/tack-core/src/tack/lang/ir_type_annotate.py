@@ -48,6 +48,29 @@ _FLOAT_TYPES = (f32, f64)
 _ROUNDS_PER_LOCAL = 4
 
 
+def _type_extern_call(node, env, array_params):
+    """Type a call of a C++ function (tack.cpp) by its declaration. A scalar
+    converts to its parameter's type (a weak literal directly); an array is
+    passed as a pointer to its elements, of their type; a device-class object
+    is not among the arguments (`IRFunctionDef`)."""
+    from tack.cpp import Pointer
+    given = []
+    for arg in node.args:
+        if isinstance(arg, ir.IRName) and isinstance(env.get(arg.name), ScalarType) \
+                and (arg.name in array_params
+                     or arg.name in getattr(array_params, 'allocated', ())):
+            given.append(Pointer(env[arg.name]))
+        else:
+            given.append(_annotate_expr(arg, env, array_params))
+    result, declared = node.extern.bind(given)
+    for arg, t in zip(node.args, node.extern.passed(declared)):
+        if not isinstance(t, Pointer):
+            _adopt(arg, t)
+    node.extern_types = (result, declared)
+    node.dtype = result
+    node._literal = node._weak = False
+
+
 class _ArrayNames(set):
     """The array parameters' names, with the names of the arrays the kernel
     allocates (``allocated``), which read as their element type elsewhere."""
@@ -142,6 +165,8 @@ def _collect_pinned(stmts):
             out.update(getattr(node, 'dims', None) or ())
         elif isinstance(node, (ir.IRSharedAlloc, ir.IRLocalAlloc)):
             out.add(node.name)
+        elif isinstance(node, ir.IRFunctionDef):
+            out.update(node.params)
     return out
 
 
@@ -221,25 +246,7 @@ def _annotate_expr(node, env, array_params) -> ScalarType | None:
 
     if isinstance(node, ir.IRCall):
         if node.extern is not None:
-            # A C++ function (tack.cpp): its declaration types the call. A scalar
-            # converts to its parameter's type (a weak literal directly); an
-            # array is passed as a pointer to its elements, of their type.
-            from tack.cpp import Pointer
-            given = []
-            for k, arg in enumerate(node.args):
-                if isinstance(arg, ir.IRName) and isinstance(env.get(arg.name), ScalarType) \
-                        and (arg.name in array_params
-                             or arg.name in getattr(array_params, 'allocated', ())):
-                    given.append(Pointer(env[arg.name]))
-                else:
-                    given.append(_annotate_expr(arg, env, array_params))
-            result, declared = node.extern.bind(given)
-            for arg, t in zip(node.args, declared):
-                if not isinstance(t, Pointer):
-                    _adopt(arg, t)
-            node.extern_types = (result, declared)
-            node.dtype = result
-            node._literal = node._weak = False
+            _type_extern_call(node, env, array_params)
             return node.dtype
         # Annotate arguments
         arg_types = []
@@ -534,6 +541,24 @@ def _annotate_stmt(node, env, array_params, var_types=None, collected=None):
     if isinstance(node, ir.IRCall):
         # A call as a statement: a C++ function called for what it stores.
         _annotate_expr(node, env, array_params)
+        return
+
+    if isinstance(node, ir.IRFunctionDef):
+        # A method C++ calls back: typed by the C++ function's declaration, once
+        # the call it serves has fixed that declaration's T. The call's own
+        # arguments are evaluated before this statement, so they type here.
+        _type_extern_call(node.call, env, array_params)
+        position, method = node.slot
+        result, params = node.call.extern_types[1][position].methods[method]
+        if len(params) != len(node.params):
+            raise TypeError(f"{node.call.func_name}(): the method '{method}' takes "
+                            f"{len(node.params)} arguments, declared with {len(params)}")
+        for name, t in zip(node.params, params):
+            env[name] = t
+        _annotate_body(node.body, env, array_params, var_types, collected)
+        _annotate_expr(node.result, env, array_params)
+        _adopt(node.result, result)
+        node.param_types, node.result_type = tuple(params), result
         return
 
     if isinstance(node, (ir.IRBreak, ir.IRContinue, ir.IRBarrier)):

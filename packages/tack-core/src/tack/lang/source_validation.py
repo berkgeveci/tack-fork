@@ -113,6 +113,12 @@ class _SourceValidator(ast.NodeVisitor):
             self.reject(node, f"{name}() takes no arguments")
         if intrinsic and name == '__tack_refuse__':
             return              # the template rewrite's deferred error: its message
+        if intrinsic and name == '__tack_cpp_object__':
+            # The template rewrite's stand-in for an object passed to C++: per
+            # method its name, argument names and the method's call.
+            for arg in node.args[2::3]:
+                self.visit(arg)
+            return
         for arg in node.args:
             if intrinsic and name == 'print' and isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 continue

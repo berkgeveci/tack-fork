@@ -870,13 +870,13 @@ def _optimize_module(mod, target_machine):
     pm.run(mod, pb)
 
 
-def _link_cpp(mod, ir_func):
-    """Link the C++ a kernel calls (tack.cpp) into its parsed module, before the
-    optimizer, which inlines it. Nothing to do unless tack.cpp was imported."""
-    cpp = sys.modules.get("tack.cpp")
-    calls = cpp.uses(ir_func) if cpp is not None else ()
+def _link_cpp(mod, llvm_module):
+    """Link the C++ a kernel calls (tack.cpp), which the code generator recorded
+    on ``llvm_module``, into the parsed module ``mod``, before the optimizer,
+    which inlines it."""
+    calls = getattr(llvm_module, "tack_cpp", None)
     if calls:
-        cpp.link(mod, calls)
+        sys.modules["tack.cpp"].link(mod, calls)
 
 
 def _compile_kernel(ir_func: ir.IRFunction) -> CompiledKernel:
@@ -891,7 +891,7 @@ def _compile_kernel(ir_func: ir.IRFunction) -> CompiledKernel:
     mod = llvm.parse_assembly(llvm_ir_str)
     mod.verify()
 
-    _link_cpp(mod, ir_func)
+    _link_cpp(mod, llvm_module)
 
     # Run optimization passes (loop vectorization, unrolling, etc.)
     _optimize_module(mod, _create_target_machine())

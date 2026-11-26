@@ -80,6 +80,11 @@ class LLVMCodeGen:
         self._break_target: llvm_ir.Block | None = None
         self._continue_target: llvm_ir.Block | None = None
 
+        # Functions C++ calls back (IRFunctionDef), by name: (symbol, the names
+        # captured, their C types), and what to link (tack.cpp.link).
+        self._callbacks: dict = {}
+        self.module.tack_cpp = []
+
     def generate(self) -> llvm_ir.Module:
         """Generate LLVM IR for the kernel. Returns the LLVM module."""
         func = self.ir_func
@@ -185,6 +190,8 @@ class LLVMCodeGen:
         elif isinstance(node, ir.IRCall):
             # Standalone function call (expression statement)
             self._emit_expr(node)
+        elif isinstance(node, ir.IRFunctionDef):
+            self._emit_function_def(node)
         else:
             raise NotImplementedError(f"Cannot emit statement: {type(node).__name__}")
 
@@ -1231,6 +1238,63 @@ class LLVMCodeGen:
             "Use constant folding or resolve at call time."
         )
 
+    def _emit_function_def(self, node: ir.IRFunctionDef):
+        """A function C++ calls back: the method's own arguments, then the
+        values of the kernel's names its body reads, which the call passes
+        along and the C++ struct holds. Always inlined once linked."""
+        from tack.lang.ir_traversal import walk_ir
+        bound, captured = set(node.params), []
+        for n in walk_ir([*node.body, node.result]):
+            if isinstance(n, ir.IRAssign):
+                bound.add(n.target)
+            elif isinstance(n, ir.IRSequentialFor):
+                bound.add(n.var)
+            elif isinstance(n, (ir.IRSharedAlloc, ir.IRLocalAlloc)):
+                bound.add(n.name)
+            elif isinstance(n, ir.IRTextureSample):
+                raise NotImplementedError("a method C++ calls cannot sample a texture")
+        for n in walk_ir([*node.body, node.result]):
+            if isinstance(n, ir.IRName) and n.name not in bound and n.name not in captured:
+                captured.append(n.name)
+        # For their types; the call passes the values it finds there.
+        outer = [self._emit_name(ir.IRName(name)) for name in captured]
+
+        def c_type(t):
+            if isinstance(t, llvm_ir.PointerType):
+                return "void*"
+            if isinstance(t, llvm_ir.IntType):
+                return f"int{t.width}_t"
+            return "double" if isinstance(t, llvm_ir.DoubleType) else "float"
+
+        result = _llvm_type(node.result_type)
+        fn = llvm_ir.Function(self.module, llvm_ir.FunctionType(
+            result, [_llvm_type(t) for t in node.param_types] + [v.type for v in outer]),
+            name=f"tack_cb_{len(self._callbacks)}_{kernel_entry_name(self.ir_func.name)}")
+        fn.attributes.add("alwaysinline")
+        self._callbacks[node.name] = (fn.name, captured, [c_type(v.type) for v in outer])
+
+        saved = (self.builder, self._func, self._entry_block, self._locals, self._params,
+                 self._break_target, self._continue_target)
+        self._locals, self._params = {}, {}
+        self._break_target = self._continue_target = None
+        types = list(node.param_types) + [None] * len(captured)
+        for arg, name, dtype, value in zip(fn.args, node.params + captured, types,
+                                           [None] * len(node.params) + outer):
+            arg.name = name
+            self._params[name] = arg
+            if dtype in UNSIGNED_TYPES or (value is not None
+                                           and id(value) in self._unsigned_vals):
+                self._unsigned_vals.add(id(arg))
+        entry = fn.append_basic_block("entry")
+        self.builder = llvm_ir.IRBuilder(entry)
+        self._func, self._entry_block = fn, entry
+        self._emit_body(node.body)
+        value = self._coerce_to(self._emit_expr(node.result), result,
+                                target_unsigned=node.result_type in UNSIGNED_TYPES)
+        self.builder.ret(value)
+        (self.builder, self._func, self._entry_block, self._locals, self._params,
+         self._break_target, self._continue_target) = saved
+
     def _emit_call(self, node: ir.IRCall) -> llvm_ir.Value:
         """Emit a math builtin call, or a call of a C++ function (tack.cpp)."""
         args = [self._emit_expr(a) for a in node.args]
@@ -1242,7 +1306,8 @@ class LLVMCodeGen:
                 scalar = getattr(t, "dtype", t)
                 return _llvm_type(scalar).as_pointer() if scalar is not t else _llvm_type(t)
 
-            for k, (a, t) in enumerate(zip(args, declared)):
+            passed = node.extern.passed(declared)
+            for k, (a, t) in enumerate(zip(args, passed)):
                 if hasattr(t, "writes"):
                     if not isinstance(a.type, llvm_ir.PointerType):
                         raise TypeError(f"{node.func_name}(): argument {k + 1} must be "
@@ -1251,12 +1316,27 @@ class LLVMCodeGen:
                 else:
                     args[k] = self._coerce_to(a, _llvm_type(t),
                                               target_unsigned=t in UNSIGNED_TYPES)
-            symbol = node.extern.symbol(result, declared)
+            # A device-class object: what its methods' functions captured, which
+            # the instantiation puts in the struct the C++ receives.
+            objects, callbacks, tag = {}, [], ""
+            for position, defs in node.extern_objects:
+                methods = []
+                for method in declared[position].methods:
+                    name, captured, c_types = self._callbacks[defs[method]]
+                    args += [self._emit_name(ir.IRName(n)) for n in captured]
+                    methods.append((method, name, c_types))
+                    callbacks.append(name)
+                objects[position] = methods
+                tag = f"_{callbacks[0]}"
+            symbol = node.extern.symbol(result, declared, tag)
+            self.module.tack_cpp.append((node.extern.library,
+                                         node.extern.shim(result, declared, objects, tag),
+                                         [symbol, *callbacks]))
             try:
                 fn = self.module.get_global(symbol)
             except KeyError:
                 fn = llvm_ir.Function(self.module, llvm_ir.FunctionType(
-                    _llvm_type(result), [llvm_type(t) for t in declared]), name=symbol)
+                    _llvm_type(result), [a.type for a in args]), name=symbol)
             value = self.builder.call(fn, args, name="cpp")
             if result in UNSIGNED_TYPES:
                 self._unsigned_vals.add(id(value))

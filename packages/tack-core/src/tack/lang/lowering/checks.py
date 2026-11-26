@@ -113,6 +113,8 @@ class LoweringChecks:
                 bound.update(getattr(n, 'dims', None) or ())
             elif isinstance(n, (ir.IRSharedAlloc, ir.IRLocalAlloc)):
                 bound.add(n.name)
+            elif isinstance(n, ir.IRFunctionDef):
+                bound.update(n.params)
             elif isinstance(n, ir.IRName):
                 used.append(n.name)
             elif isinstance(n, (ir.IRDimSize, ir.IRTextureSample)):

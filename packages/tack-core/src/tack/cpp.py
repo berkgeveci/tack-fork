@@ -40,6 +40,19 @@ array wherever Tack asks what a kernel writes. Offsets and lengths are
 scalars of their own. A function with ``result=None`` returns nothing and is
 called as a statement. Debug mode checks none of what the C++ reads or writes.
 
+``obj(method=(result, args), ...)`` takes a ``@tack.device_class`` object,
+for a template parameter the C++ calls methods on::
+
+    integrate = lib.function("demo::integrate", result=T,
+                             args=(tack.cpp.obj(value=(T, (T,))), T, T))
+    ...
+        out[i] = integrate(field, a[i], b[i])     # field.value(x) is a @tack.func
+
+The C++ receives a struct Tack writes for the call, with one method per name
+declared, typed as declared (scalars), which calls the object's method;
+both are inlined, so the method's arithmetic ends up inside the C++ loop.
+The struct lasts for the call: the C++ must not keep it.
+
 The function is called from every worker thread, any number of times, so it
 must be safe to: no state of its own.
 """
@@ -54,7 +67,7 @@ from pathlib import Path
 
 from tack.lang.types import ScalarType, f32, f64
 
-__all__ = ["ExternFunc", "Library", "Pointer", "T", "ptr"]
+__all__ = ["ExternFunc", "Library", "Object", "Pointer", "T", "obj", "ptr"]
 
 
 class _TypeVariable:
@@ -104,6 +117,26 @@ class Pointer:
 def ptr(dtype, writes=False):
     """The type of an array argument; see the module's notes."""
     return Pointer(dtype, writes)
+
+
+class Object:
+    """A device-class argument: ``methods`` maps each method the C++ calls to
+    its ``(result type, argument types)``, scalar types or ``T``."""
+
+    def __init__(self, methods):
+        self.methods = {name: (result, tuple(args))
+                        for name, (result, args) in methods.items()}
+
+    def __repr__(self):
+        return f"tack.cpp.obj({self.methods!r})"
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def obj(**methods):
+    """The type of a device-class argument; see the module's notes."""
+    return Object(methods)
 
 
 def _c_type(t):
@@ -186,9 +219,14 @@ class ExternFunc:
             raise TypeError(f"{name}: the result {result!r} is not a scalar type, "
                             "tack.cpp.T or None")
         for t in args:
-            if not (scalar(t) or (isinstance(t, Pointer) and scalar(t.dtype))):
-                raise TypeError(f"{name}: {t!r} is not a scalar type, tack.cpp.T or "
-                                "a tack.cpp.ptr of one")
+            if isinstance(t, Object):
+                for method, (r, params) in t.methods.items():
+                    if not (scalar(r) and all(scalar(p) for p in params)):
+                        raise TypeError(f"{name}: the method '{method}' takes and "
+                                        "returns scalar types or tack.cpp.T")
+            elif not (scalar(t) or (isinstance(t, Pointer) and scalar(t.dtype))):
+                raise TypeError(f"{name}: {t!r} is not a scalar type, tack.cpp.T, "
+                                "a tack.cpp.ptr of one or a tack.cpp.obj")
         self.library = library
         self.name = name
         self.result = result
@@ -215,11 +253,12 @@ class ExternFunc:
         """``(result type, argument types)`` of a call given arguments of
         ``arg_types``: a scalar's type, or for an array a `Pointer` of its
         element type. A function without a result gives i32 (always 0)."""
-        if len(arg_types) != len(self.args):
-            raise TypeError(f"{self.name}() takes {len(self.args)} arguments "
+        passed = self.passed(self.args)
+        if len(arg_types) != len(passed):
+            raise TypeError(f"{self.name}() takes {len(passed)} arguments "
                             f"({len(arg_types)} given; a vector counts one per component)")
         pointed = set()
-        for k, (given, declared) in enumerate(zip(arg_types, self.args)):
+        for k, (given, declared) in enumerate(zip(arg_types, passed)):
             if isinstance(declared, Pointer) != isinstance(given, Pointer):
                 raise TypeError(
                     f"{self.name}(): argument {k + 1} is "
@@ -242,36 +281,77 @@ class ExternFunc:
             floating = pointed.pop()    # a pointer cannot convert, so it decides
         else:
             floating = f64 if any(given is f64 for given, declared
-                                  in zip(arg_types, self.args) if declared is T) else f32
+                                  in zip(arg_types, passed) if declared is T) else f32
 
         def concrete(t):
             if isinstance(t, Pointer):
                 return Pointer(concrete(t.dtype), t.writes)
+            if isinstance(t, Object):
+                return Object({name: (concrete(r), [concrete(p) for p in params])
+                               for name, (r, params) in t.methods.items()})
             return floating if t is T else t
         from tack.lang.types import i32
         return (i32 if self.result is None else concrete(self.result),
                 tuple(concrete(t) for t in self.args))
 
-    def symbol(self, result, args) -> str:
-        """The C symbol of the instantiation: by library content, so two
-        libraries (or two versions of one) never share it."""
-        text = "".join(c if c.isalnum() else "_" for c in self.name)
-        tag = hashlib.sha256(repr((self.library.fingerprint(), self.name)).encode())
-        types = "_".join(t.name for t in (result, *args))
-        return f"tack_cpp_{tag.hexdigest()[:12]}_{text}_{types}"
+    @staticmethod
+    def passed(args) -> tuple:
+        """The entries of ``args`` a call passes values for: all but objects."""
+        return tuple(t for t in args if not isinstance(t, Object))
 
-    def shim(self, result, args) -> str:
-        """The ``extern "C"`` function clang compiles: the instantiation."""
+    def symbol(self, result, args, tag="") -> str:
+        """The C symbol of the instantiation: by library content, so two
+        libraries (or two versions of one) never share it. ``tag`` tells apart
+        the instantiations of calls that pass objects, one per call."""
+        text = "".join(c if c.isalnum() else "_" for c in self.name)
+        digest = hashlib.sha256(repr((self.library.fingerprint(), self.name)).encode())
+        types = "_".join("obj" if isinstance(t, Object) else t.name for t in (result, *args))
+        return f"tack_cpp_{digest.hexdigest()[:12]}_{text}_{types}{tag}"
+
+    def shim(self, result, args, objects=None, tag="") -> str:
+        """The ``extern "C"`` function clang compiles: the instantiation.
+
+        ``objects`` gives, per declared position of an object, its methods as
+        ``(name, callback symbol, C types the callback takes after the
+        method's own arguments)``: the values Tack captured for it, which the
+        instantiation takes after the call's arguments and the object's
+        struct holds."""
+        objects = objects or {}
         floating = result if self.result is T else next(
             (getattr(a, "dtype", a) for a, declared in zip(args, self.args)
              if getattr(declared, "dtype", declared) is T), f32)
         target = self.name.replace("{T}", _C_TYPES[floating.name])
-        params = ", ".join(f"{_c_type(t)} a{k}" for k, t in enumerate(args))
-        names = ", ".join(f"a{k}" for k in range(len(args)))
-        body = (f"{target}({names}); return 0;" if self.result is None
-                else f"return {target}({names});")
-        return (f"__attribute__((always_inline)) {_C_TYPES[result.name]} "
-                f"{self.symbol(result, args)}({params}) {{ {body} }}")
+        symbol = self.symbol(result, args, tag)
+        lines, params, captures, names, setup = [], [], [], [], []
+        for k, t in enumerate(args):
+            if not isinstance(t, Object):
+                params.append(f"{_c_type(t)} a{k}")
+                names.append(f"a{k}")
+                continue
+            struct, fields, given, methods = f"{symbol}_o{k}", [], [], []
+            for m, (method, callback, captured) in enumerate(objects[k]):
+                r, takes = t.methods[method]
+                own = [f"{_c_type(p)} x{j}" for j, p in enumerate(takes)]
+                held = [f"m{m}c{j}" for j in range(len(captured))]
+                lines.append(f'extern "C" {_c_type(r)} {callback}('
+                             + ", ".join([*(_c_type(p) for p in takes), *captured]) + ");")
+                fields += [f"{c} {h};" for c, h in zip(captured, held)]
+                given += [f"o{k}{h}" for h in held]
+                captures += [f"{c} o{k}{h}" for c, h in zip(captured, held)]
+                methods.append(
+                    f"  __attribute__((always_inline)) {_c_type(r)} {method}("
+                    + ", ".join(own) + ") const { return " + callback + "("
+                    + ", ".join([*(f"x{j}" for j in range(len(takes))), *held]) + "); }")
+            lines.append("namespace { struct " + struct + " {\n  " + " ".join(fields) + "\n"
+                         + "\n".join(methods) + "\n}; }")
+            setup.append(f"{struct} o{k}{{{', '.join(given)}}};")
+            names.append(f"o{k}")
+        call = f"{target}({', '.join(names)})"
+        body = " ".join([*setup, f"{call}; return 0;" if self.result is None
+                         else f"return {call};"])
+        lines.append(f'extern "C" __attribute__((always_inline)) {_C_TYPES[result.name]} '
+                     f"{symbol}({', '.join(params + captures)}) {{ {body} }}")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -296,12 +376,11 @@ def clang() -> str:
     return _clang
 
 
-def _source(library, uses) -> str:
+def _source(library, shims) -> str:
     lines = ["#include <cstdint>"]
     lines += [f'#include "{h}"' for h in library.headers]
-    lines += [library.source, 'extern "C" {']
-    lines += sorted(func.shim(result, args) for func, result, args in uses)
-    lines.append("}")
+    lines.append(library.source)
+    lines += sorted(set(shims))
     return "\n".join(lines) + "\n"
 
 
@@ -327,28 +406,27 @@ def _compile(library, source) -> bytes:
     return found
 
 
-def uses(ir_func) -> list:
-    """The ``(function, result, argument types)`` a typed kernel calls."""
+def uses(ir_func) -> bool:
+    """Whether a kernel calls a C++ function."""
     from tack.lang import ir
     from tack.lang.ir_traversal import walk_ir
-    found = {}
-    for node in walk_ir(ir_func):
-        if isinstance(node, ir.IRCall) and node.extern is not None:
-            result, args = node.extern_types
-            found[node.extern.symbol(result, args)] = (node.extern, result, args)
-    return [found[k] for k in sorted(found)]
+    return any(isinstance(node, ir.IRCall) and node.extern is not None
+               for node in walk_ir(ir_func))
 
 
 def link(module, calls):
-    """Link what ``calls`` (`uses`) name into ``module``, an llvmlite module
-    not yet optimized, as internal functions the optimizer inlines."""
+    """Link the instantiations the code generator recorded, ``calls``
+    (``(library, shim source, symbols to make internal)`` each), into
+    ``module``, an llvmlite module not yet optimized: the optimizer inlines
+    them, and the kernel's functions they call back, into the kernel."""
     import llvmlite.binding as llvm
     by_library = {}
-    for func, result, args in calls:
-        by_library.setdefault(func.library.fingerprint(), (func.library, []))[1].append(
-            (func, result, args))
-    for library, group in by_library.values():
-        data = _compile(library, _source(library, group))
+    for library, shim, symbols in calls:
+        entry = by_library.setdefault(library.fingerprint(), (library, [], []))
+        entry[1].append(shim)
+        entry[2].extend(symbols)
+    for library, shims, symbols in by_library.values():
+        data = _compile(library, _source(library, shims))
         try:
             other = llvm.parse_bitcode(data)
         except RuntimeError as error:
@@ -359,7 +437,17 @@ def link(module, calls):
                 "in TACK_CLANG") from error
         other.triple = module.triple
         other.data_layout = module.data_layout
+        for symbol in set(symbols):
+            # Both sides were written here; a difference would run as a wild call.
+            try:
+                ours, theirs = module.get_function(symbol), other.get_function(symbol)
+            except NameError:
+                continue
+            if str(ours.global_value_type) != str(theirs.global_value_type):
+                raise RuntimeError(
+                    f"tack.cpp: {symbol} is {ours.global_value_type} in the kernel and "
+                    f"{theirs.global_value_type} in the C++ (a bug in Tack)")
         module.link_in(other)
-        for func, result, args in group:
+        for symbol in set(symbols):
             # Internal: once inlined, nothing is left of it.
-            module.get_function(func.symbol(result, args)).linkage = "internal"
+            module.get_function(symbol).linkage = "internal"
