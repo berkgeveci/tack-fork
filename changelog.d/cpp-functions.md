@@ -11,7 +11,9 @@
   and return a scalar, a vector or nothing. `__getitem__`,
   `__len__` and `__call__` are `operator[]`, `size()` and `operator()` there
   (`tack.cpp.indexable`), so a container template reads `tack.arrays`'
-  implicit arrays.
+  implicit arrays; with both, the struct has random-access iterators, and with
+  `__setitem__` (`indexable(..., writable=True)`) element references, so
+  `std::sort` sorts through a view.
   The call's types instantiate a template (`tack.cpp.T` is one floating type
   a call: its arrays' or scalars', the kernel's where only float literals are
   given, or fixed with `T=`/`.of()`); clang (`TACK_CLANG`, else `clang++`

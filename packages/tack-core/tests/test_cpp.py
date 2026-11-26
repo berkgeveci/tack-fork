@@ -688,6 +688,89 @@ def test_a_device_class_with_the_protocol_and_a_callable_one(generic):
     np.testing.assert_allclose(slope.numpy(), 6 * xs**2 + 2e-6, atol=1e-11)
 
 
+_ALGORITHMS = """
+#include <algorithm>
+namespace demo {
+template <class C, class V> V total(const C& c, V) {
+  V s = 0;
+  for (auto x : c) s += x;
+  return s;
+}
+template <class C, class V> V largest(const C& c, V) {
+  return *std::max_element(c.begin(), c.end());
+}
+template <class C> int sort_row(C& c, long long row, long long width) {
+  std::sort(c.begin() + row * width, c.begin() + (row + 1) * width);
+  return 0;
+}
+template <class C> int bump(C& c, long long i) {
+  c[i] += 1;
+  c[i] *= 2;
+  return 0;
+}
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def algorithms():
+    lib = tack.cpp.Library(source=_ALGORITHMS)
+    return (lib.function("demo::total", result=T, args=(indexable(T), T)),
+            lib.function("demo::largest", result=T, args=(indexable(T), T)),
+            lib.function("demo::sort_row", result=tack.i32,
+                         args=(indexable(T, writable=True), tack.i64, tack.i64)),
+            lib.function("demo::bump", result=tack.i32,
+                         args=(indexable(T, writable=True), tack.i64)))
+
+
+def test_containers_iterate_for_range_for_and_algorithms(algorithms):
+    total, largest = algorithms[:2]
+
+    @tack.kernel
+    def summary(c, out):
+        for i in range(out.shape[0]):
+            out[i] = total(c, out[i]) + largest(c, out[i])
+
+    out = tack.zeros(1, tack.f64)
+    summary(tack.arrays.CountingArray(10, 1.0, 1.0, dtype=tack.f64), out)
+    assert out.numpy()[0] == 55.0 + 10.0
+    values = np.random.default_rng(2).random(30)
+    summary(tack.arrays.Permutation(tack.array(np.arange(30)[::-1].copy()),
+                                    tack.array(values)), out)
+    assert out.numpy()[0] == pytest.approx(values.sum() + values.max(), rel=1e-14)
+
+
+def test_writable_containers_sort_and_update_in_place(algorithms):
+    """Element references assign through ``__setitem__``: std::sort sorts a
+    Tack array through a view, and compound assignment updates it."""
+    sort_row, bump = algorithms[2:]
+
+    @tack.kernel
+    def sort_rows(c, width, done):
+        for i in range(done.shape[0]):
+            done[i] = sort_row(c, i, width)
+
+    @tack.kernel
+    def bumps(c, done):
+        for i in range(done.shape[0]):
+            done[i] = bump(c, i)
+
+    rows, width = 40, 17
+    data = np.random.default_rng(3).random(rows * width)
+    a = tack.array(data)
+    sort_rows(tack.arrays.View(a, 0, rows * width), width, tack.zeros(rows, tack.i32))
+    np.testing.assert_array_equal(a.numpy().reshape(rows, width),
+                                  np.sort(data.reshape(rows, width), axis=1))
+    b = tack.array(np.arange(5.0))
+    bumps(tack.arrays.Strided(b, 1), tack.zeros(5, tack.i32))
+    np.testing.assert_array_equal(b.numpy(), (np.arange(5.0) + 1) * 2)
+    # The view's array is written, as Tack sees it: a read-only one is refused.
+    frozen = np.arange(5.0)
+    readonly = tack.array_from_ptr(frozen.ctypes.data, (5,), tack.f64)
+    with pytest.raises(ValueError, match="read-only"):
+        bumps(tack.arrays.View(readonly, 0, 5), tack.zeros(5, tack.i32))
+
+
 def test_a_missing_protocol_method_is_named(generic):
     window_mean = generic.function("demo::window_mean", result=T,
                                    args=(indexable(T), tack.i64, tack.i64, T))

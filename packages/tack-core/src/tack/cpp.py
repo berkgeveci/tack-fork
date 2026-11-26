@@ -66,8 +66,15 @@ The protocol methods take their C++ spellings: ``__getitem__`` is
 ``operator[]``, ``__len__`` is ``size()`` and ``__call__`` is ``operator()``,
 so a template written for any indexable container, or any callable, takes a
 device class that defines them, ``tack.arrays``' implicit arrays among them.
-``indexable(type)`` is the ``obj`` of a read-only container of scalars.
-Elements are read, never referenced: ``c[i]`` is a value.
+With both of the first two the struct has ``begin()`` and ``end()``,
+random-access iterators, for range-for loops and ``<algorithm>``.
+``indexable(type)`` is the ``obj`` of a container of scalars, read-only:
+``c[i]`` is a value. ``indexable(type, writable=True)`` declares
+``__setitem__`` too: then on a container that is not ``const``, ``c[i]`` is a
+reference to the element (a proxy object, as ``std::vector<bool>``'s:
+``auto x = c[i]`` holds the reference, not the value) that reads, assigns,
+updates (``+=`` and the like) and swaps, so ``std::sort`` sorts it, and every
+assignment is a call of ``__setitem__``.
 
 The function is called from every worker thread, any number of times, so it
 must be safe to: no state of its own.
@@ -182,16 +189,93 @@ def obj(**methods):
     return Object(methods)
 
 
-def indexable(dtype, index=None):
+def indexable(dtype, index=None, writable=False):
     """The type of a device-class argument the C++ indexes and measures:
     ``c[i]`` gives a ``dtype`` (a scalar type or ``T``) for an ``index`` (i64
-    unless given), and ``c.size()`` its length, an i64."""
+    unless given), and ``c.size()`` its length, an i64. If ``writable``,
+    ``c[i] = v`` calls the object's ``__setitem__``."""
     from tack.lang.types import i64
-    return Object({"__getitem__": (dtype, (index or i64,)), "__len__": (i64, ())})
+    methods = {"__getitem__": (dtype, (index or i64,)), "__len__": (i64, ())}
+    if writable:
+        methods["__setitem__"] = (None, (index or i64, dtype))
+    return Object(methods)
 
 
-#: How the C++ spells a protocol method.
-_CPP_METHODS = {"__getitem__": "operator[]", "__len__": "size", "__call__": "operator()"}
+#: How the C++ spells a protocol method. ``__setitem__`` is reached through
+#: the element reference ``operator[]`` gives (`_container`).
+_CPP_METHODS = {"__getitem__": "operator[]", "__len__": "size", "__call__": "operator()",
+                "__setitem__": "tack_setitem"}
+
+#: What every library's text is preceded by: the iterator of a container
+#: whose elements are reached by index (`_container`).
+_HELPERS = """
+#include <cstddef>
+#include <iterator>
+namespace tack_cpp {
+template <class C, class V, class R> struct iterator {
+  using iterator_category = std::random_access_iterator_tag;
+  using value_type = V;
+  using difference_type = std::ptrdiff_t;
+  using reference = R;
+  using pointer = void;
+  C* c;
+  difference_type i;
+  R operator*() const { return (*c)[i]; }
+  R operator[](difference_type n) const { return (*c)[i + n]; }
+  iterator& operator++() { ++i; return *this; }
+  iterator operator++(int) { iterator t = *this; ++i; return t; }
+  iterator& operator--() { --i; return *this; }
+  iterator operator--(int) { iterator t = *this; --i; return t; }
+  iterator& operator+=(difference_type n) { i += n; return *this; }
+  iterator& operator-=(difference_type n) { i -= n; return *this; }
+  friend iterator operator+(iterator a, difference_type n) { a.i += n; return a; }
+  friend iterator operator+(difference_type n, iterator a) { a.i += n; return a; }
+  friend iterator operator-(iterator a, difference_type n) { a.i -= n; return a; }
+  friend difference_type operator-(const iterator& a, const iterator& b) { return a.i - b.i; }
+  friend bool operator==(const iterator& a, const iterator& b) { return a.i == b.i; }
+  friend bool operator!=(const iterator& a, const iterator& b) { return a.i != b.i; }
+  friend bool operator<(const iterator& a, const iterator& b) { return a.i < b.i; }
+  friend bool operator>(const iterator& a, const iterator& b) { return a.i > b.i; }
+  friend bool operator<=(const iterator& a, const iterator& b) { return a.i <= b.i; }
+  friend bool operator>=(const iterator& a, const iterator& b) { return a.i >= b.i; }
+};
+}
+"""
+
+
+def _container(struct, methods) -> list:
+    """The members a struct with ``methods`` (name -> concrete ``(result,
+    arguments)``) adds to its own for the container protocol: iterators,
+    and with ``__setitem__`` element references."""
+    if "__getitem__" not in methods:
+        return []
+    value = _c_type(methods["__getitem__"][0])
+    index = _c_type(methods["__getitem__"][1][0])
+    sized = "__len__" in methods
+    ends = ("{ return {this, 0}; }", "{ return {this, std::ptrdiff_t(size())}; }")
+    reading = f"tack_cpp::iterator<const {struct}, {value}, {value}>"
+    lines = [f"  using value_type = {value};"]
+    if sized:
+        lines += [f"  {reading} begin() const {ends[0]}", f"  {reading} end() const {ends[1]}"]
+    if "__setitem__" not in methods:
+        return lines
+    updates = [f"    reference& operator{op}=({value} v) "
+               f"{{ return *this = {value}({value}(*this) {op} v); }}" for op in "+-*/"]
+    lines += [
+        "  struct reference {",
+        f"    const {struct}* s; {index} i;",
+        f"    operator {value}() const {{ return (*s)[i]; }}",
+        f"    reference& operator=({value} v) {{ s->tack_setitem(i, v); return *this; }}",
+        f"    reference& operator=(const reference& o) {{ return *this = {value}(o); }}",
+        *updates,
+        (f"    friend void swap(reference a, reference b) "
+         f"{{ {value} t = a; a = {value}(b); b = t; }}"),
+        "  };",
+        f"  reference operator[]({index} i) {{ return {{this, i}}; }}"]
+    if sized:
+        writing = f"tack_cpp::iterator<{struct}, {value}, reference>"
+        lines += [f"  {writing} begin() {ends[0]}", f"  {writing} end() {ends[1]}"]
+    return lines
 
 
 def _c_type(t):
@@ -447,6 +531,7 @@ class ExternFunc:
                 methods.append(
                     f"  __attribute__((always_inline)) {gives} "
                     f"{_CPP_METHODS.get(method, method)}({', '.join(own)}) const {{ {body} }}")
+            methods += _container(struct, t.methods)
             lines.append("namespace { struct " + struct + " {\n  " + " ".join(fields) + "\n"
                          + "\n".join(methods) + "\n}; }")
             setup.append(f"{struct} o{k}{{{', '.join(given)}}};")
@@ -484,7 +569,7 @@ def clang() -> str:
 def _prefix(library) -> str:
     """What every instantiation of ``library`` starts with: its headers and
     its own text. Parsed once per process (`_precompiled`)."""
-    lines = ["#include <array>", "#include <cstdint>"]
+    lines = ["#include <array>", "#include <cstdint>", _HELPERS]
     lines += [f'#include "{h}"' for h in library.headers]
     lines.append(library.source)
     return "\n".join(lines) + "\n"
