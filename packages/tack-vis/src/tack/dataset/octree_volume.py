@@ -574,7 +574,7 @@ class OctreeRenderer:
     frame (``tack_composite.composite``). ``amr_volume`` is the directory of the
     AMR volume modules (``tack_march``, ``tack_composite``, ``volume_tack``)."""
 
-    def __init__(self, octree, name, amr_volume, blend=1, macrocells=64, divide=-1):
+    def __init__(self, octree, name, amr_volume, blend=1, macrocells=64, divide=-1, balanced=0):
         if str(amr_volume) not in sys.path:
             sys.path.insert(0, str(amr_volume))
         import tack_composite
@@ -583,7 +583,10 @@ class OctreeRenderer:
 
         self._modules = (tack_march, tack_composite, volume_tack)
         self.octree = octree
-        self.tents = octree_tents(octree, name, blend)
+        # ``balanced``: the sampler for octrees whose neighbouring leaves differ by
+        # at most a level (``OctreeTents``); made once here, as replacing it after
+        # cost a second sampler (5 of a 94M-node octree's 9 s on Metal).
+        self.tents = OctreeTents(octree, name, blend, balanced=balanced)
         self.ranges = ranges(octree, name)
         self.grid, self.lows, self.highs, self.firsts, self.lasts = macro_ranges(
             octree, self.ranges, macrocells)
