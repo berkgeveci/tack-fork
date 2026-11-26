@@ -20,7 +20,7 @@ across. The wake first turns oblique, then starts to shed, after about 2000
 steps; ``--start`` runs that many steps before the window opens.
 
     sphere_view.py [--re 300] [--diameter 8] [--steps 4] [--every 16] [--start 0]
-                   [--level 1.5] [--device cpu] [--check OUTDIR]
+                   [--level 1.5] [--device cpu] [--dtype f32|f64] [--check OUTDIR]
 
 On a device without f64 (Metal) the solver keeps its values in f32.
 
@@ -45,6 +45,7 @@ from vtkmodules.vtkIOImage import vtkPNGWriter
 from vtkmodules.vtkRenderingCore import vtkTextActor, vtkWindowToImageFilter
 
 import tack
+from tack.algorithms import gather
 from tack.dataset import octree_contour
 from tack.dataset import octree_lbm as lb
 from tack.dataset.octree_lbm_adapt import _vorticity, adapt
@@ -81,9 +82,15 @@ def main():
     parser.add_argument("--level", type=float, default=1.5,
                         help="the surface's vorticity, in free-stream speed / diameter")
     parser.add_argument("--device", default="cpu", help="cpu, metal, cuda, ...")
+    parser.add_argument("--dtype", default=None, choices=("f32", "f64"),
+                        help="the solver's values (f32 on a GPU, f64 on the CPU by default)")
     parser.add_argument("--check", default=None, metavar="OUTDIR")
+    parser.add_argument("--check-frames", type=int, default=4,
+                        help="frames --check runs before its picture")
     args = parser.parse_args()
     tack.set_default_device(args.device)
+    dtype = {"f32": tack.f32, "f64": tack.f64}[args.dtype or
+                                                ("f64" if args.device == "cpu" else "f32")]
     d = args.diameter
     nx, ny, nz = int(10 * d), int(4 * d), int(4 * d)
     xc, yc, zc = 2.5 * d, ny / 2, nz / 2
@@ -107,7 +114,7 @@ def main():
 
     def start_mesh():
         s = lb.LBM(lb.uniform_mesh((nx, ny, nz), periodic=(False, True, True)), tau, inflow=U,
-                   regularized=True, sponge=(nx - 12, 0.1))
+                   regularized=True, sponge=(nx - 12, 0.1), dtype=dtype)
         for _ in range(2):
             s, _ = remesh(s)
         s, _ = remesh(s, solid=solid)
@@ -201,7 +208,11 @@ def main():
                                        np.hypot(c[:, 0] - xc - 2 * d, np.hypot(c[:, 1] - yc,
                                                                                c[:, 2] - zc)),
                                        np.inf)))
-        state.update(solver=s, plane=plane, values=values, cut=cut, probe=probe,
+        with s.octree.device:
+            cut_d = tack.array(cut.astype(np.int64))
+            probe_d = tack.array((probe * s.q + np.arange(s.q)).astype(np.int64))
+        state.update(solver=s, plane=plane, values=values, cut=cut_d, probe=probe_d,
+                     cells=int(s.computational().sum()),
                      solid=s.role[cut] == lb.SOLID,
                      nodes=[nodes for lv in range(s.finest + 1)
                             for nodes in (s.computed[lv], s.ghosts[lv]) if len(nodes)])
@@ -225,25 +236,25 @@ def main():
             for nodes in state["nodes"]:
                 _vorticity(nodes, s.rows, s.octree.level, s.role_array, s.number, s.table,
                            s.side, s.lattice, s.f, w)
-        scaled = w.numpy() * d / U
-        with s.octree.device:
-            s.octree.fields["w"] = tack.array(scaled.astype(s.dtype.numpy_dtype), s.dtype)
-        values = scaled[state["cut"]]
+            s.octree.fields["w"] = w
+            values = gather(w, state["cut"]).numpy() * d / U    # the plane's cells alone
         values[state["solid"]] = 0.0
         np.asarray(state["values"])[:] = values.astype(np.float32)
         state["values"].Modified()
         state["plane"].Modified()
         begin = time.perf_counter()
-        wake = octree_contour.contour(s.octree, "w", args.level)
+        wake = octree_contour.contour(s.octree, "w", args.level * U / d)
         points = np.asarray(wake.positions(), np.float64).reshape(-1, 3)
         surface_mapper.SetInputData(polydata(points, wake.topology.connectivity.numpy(), 3))
         state["contour_ms"].append(1000 * (time.perf_counter() - begin))
-        _, ux, uy, uz = s.moments()
-        state["trace"].append(uy[state["probe"]])
+        with s.octree.device:
+            f = gather(s.f, state["probe"]).numpy()             # the probe's values alone
+        o = np.arange(s.q)
+        state["trace"].append(np.dot(f, (o // 3) % 3 - 1) / f.sum())
         state["steps"].append(s.steps)
         st = strouhal()
         status.SetInput(
-            f"step {s.steps}   {int(s.computational().sum())} cells   Strouhal "
+            f"step {s.steps}   {state['cells']} cells   Strouhal "
             f"{'...' if st is None else f'{st:.3f}'}   "
             f"{np.median(state['ms'][-20:]) if state['ms'] else 0:.0f} ms a frame "
             f"({args.steps} steps; remesh "
@@ -278,7 +289,8 @@ def main():
     show()
     if args.check:
         os.makedirs(args.check, exist_ok=True)
-        for _ in range(4):
+        state["ms"], state["remesh_ms"], state["contour_ms"] = [], [], []
+        for _ in range(args.check_frames):
             advance()
         window.Render()
         grab = vtkWindowToImageFilter()
@@ -289,7 +301,8 @@ def main():
         writer.SetInputConnection(grab.GetOutputPort())
         writer.Write()
         print(f"step {state['solver'].steps}: {int(state['solver'].computational().sum())} "
-              f"cells; a frame {np.median(state['ms']):.0f} ms; a remesh "
+              f"cells; a frame {np.median(state['ms']):.0f} ms (mean {np.mean(state['ms']):.0f}, "
+              f"remeshes included); a remesh "
               f"{np.median(state['remesh_ms']):.0f} ms; the surface "
               f"{np.median(state['contour_ms']):.0f} ms")
         return

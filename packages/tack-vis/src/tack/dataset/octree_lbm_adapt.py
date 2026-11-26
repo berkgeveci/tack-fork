@@ -439,7 +439,7 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
             mesh.fields["role"] = tack.array(roles, tack.i32)
     new = lb.LBM(mesh, solver.tau, lid=solver.lid, inflow=solver.speed if solver.inflow else None,
                  centred=solver.centred, linear=solver.linear, regularized=solver.regularized,
-                 sponge=solver.sponge)
+                 sponge=solver.sponge, dtype=solver.dtype)
     with device:
         down = tack.array(np.array([taus[lv + 1] / (2 * taus[lv]) for lv in range(finest + 1)],
                                    dtype.numpy_dtype))

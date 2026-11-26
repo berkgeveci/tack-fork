@@ -78,12 +78,14 @@ the mesh (``lbm_mesh`` is NumPy and sets), 3D.
 import numpy as np
 
 import tack
+from tack.algorithms import argsort
 from tack.dataset.ghosts import Ghosts
 from tack.dataset.octree import OctreeDataSet, _compute_type
 from tack.dataset.octree_topology import (
     _child_neighbourhoods,
     _root_neighbourhoods,
     children,
+    grid_rows,
     refined_by_level,
 )
 
@@ -210,42 +212,16 @@ def uniform_mesh(shape, periodic=None, spacing=1.0, device=None):
     return octree
 
 
-def _root_cells_side(octree):
-    lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in octree.geometry())
-    return size[octree._level == 0, 0].max()
-
-
 def _rows(octree, periodic):
     """Every node's 3^d neighbourhood at its level, as ``neighbourhoods`` makes
     it, with the roots' rows wrapping along ``periodic`` axes."""
     d = octree.dimension
     span = 3 ** d
-    dims = [n - 1 for n in octree.roots.topology.point_dims] + [1]
-    nx, ny, nz = dims[0], dims[1], dims[2] if d == 3 else 1
-    roots = np.flatnonzero(octree._level == 0)
-    root_of = np.full(nx * ny * nz, -1, np.int64)
-    root_of[octree._tree[roots]] = roots
-    t = octree._tree[roots]
-    at = [t % nx, (t // nx) % ny, t // (nx * ny)]
-    size = [nx, ny, nz]
-    rows = np.empty((len(roots), span), np.int64)
-    for o in range(span):
-        step = [o % 3 - 1, (o // 3) % 3 - 1, o // 9 - 1 if d == 3 else 0]
-        inside = np.ones(len(t), bool)
-        index = []
-        for a in range(3):
-            v = at[a] + step[a]
-            if a < d and periodic[a]:
-                v = v % size[a]
-            else:
-                inside &= (v >= 0) & (v < size[a])
-            index.append(np.clip(v, 0, size[a] - 1))
-        rows[:, o] = np.where(inside, root_of[index[0] + nx * (index[1] + ny * index[2])], -1)
+    rows = grid_rows(octree, periodic)
     number, table = children(octree)
     with octree.device:
         out = tack.empty((octree.num_nodes * span,), tack.i32)
-        _root_neighbourhoods(tack.array(rows.reshape(-1).astype(np.int32), tack.i32), len(roots),
-                             span, out)
+        _root_neighbourhoods(rows, len(rows) // span, span, out)
         for nodes in reversed(refined_by_level(octree)):
             _child_neighbourhoods(nodes, number, table, octree.marks, int(Ghosts.REFINEDCELL), d,
                                   span, out)
@@ -714,6 +690,52 @@ def _parents_of_ghosts(nodes, number, table, parent, dim):
 
 
 @tack.kernel
+def _list_keys(role, level, rows, q, groups, key, counts):
+    # Node n's place among the solver's node lists, level * groups + group
+    # (``LBM.__init__``), and each place's count.
+    for n in range(role.shape[0]):
+        r = role[n]
+        g = 5                                   # solid
+        if r == 0:                              # real: 1 beside an interface cell
+            g = 0
+            for o in range(q):
+                m = rows[n * q + o]
+                if m >= 0:
+                    if role[m] == 1:
+                        g = 1
+        elif r == 1:                            # interface
+            g = 2
+        elif r == 2:                            # ghost
+            g = 3
+        elif r == 3:                            # refined
+            g = 4
+        k = level[n] * groups + g
+        key[n] = k
+        tack.atomic_add(counts, k, 1)
+
+
+@tack.kernel
+def _take(order, start, out):
+    for k in range(out.shape[0]):
+        out[k] = order[start + k]
+
+
+@tack.kernel
+def _centres(corner, sides, dimension, px, py, pz, side):
+    # Each node's centre and side from the octree's geometry.
+    for n in range(px.shape[0]):
+        c = corner[n]
+        h = sides[n]
+        px[n] = c[0] + 0.5 * h[0]
+        py[n] = c[1] + 0.5 * h[1]
+        z = c[2] * 0.0
+        if dimension == 3:
+            z = c[2] + 0.5 * h[2]
+        pz[n] = z
+        side[n] = h[0]
+
+
+@tack.kernel
 def _moments(f, rho, ux, uy, uz, lat):
     q = lat.Q
     dim = lat.DIM
@@ -739,10 +761,12 @@ class LBM:
     (each level's in proportion), damping what leaves by the outlet. One ``step`` is one step of
     level 0: ``2^l`` of level ``l``. Values are in lattice units of level 0: a
     root cell is 1 and so is its time step. ``centred`` and ``linear`` switch
-    the explosion's corrections off, for comparison."""
+    the explosion's corrections off, for comparison. ``dtype`` is what values
+    are kept in: f64 where the device has it by default (f32 is about twice as
+    fast on a GPU with f64, and the choice on most GPUs, whose f64 is slow)."""
 
     def __init__(self, octree, tau, lid=0.0, inflow=None, centred=True, linear=True,
-                 regularized=False, sponge=None):
+                 regularized=False, sponge=None, dtype=None):
         self.octree = octree
         self.dim = d = octree.dimension
         self.q = q = 3 ** d
@@ -754,7 +778,7 @@ class LBM:
         self.sponge = sponge
         self.finest = octree.finest
         device = octree.device
-        self.dtype = _compute_type(device, tack.f32)
+        self.dtype = dtype if dtype is not None else _compute_type(device, tack.f32)
         role = np.asarray(octree.fields["role"].numpy(), np.int64)
         level = octree._level
         self.role, self.levels = role, level
@@ -768,33 +792,40 @@ class LBM:
         self.number, self.table = children(octree)
         n = octree.num_nodes
         dims = [s - 1 for s in octree.roots.topology.point_dims]
-        side0 = float(_root_cells_side(octree))
+        corner, sides = octree.geometry()
+        side0 = float(sides[int(np.argmax(level == 0))][0])
         self.lengths = [dims[a] * side0 if a < d and periodic[a] else 0.0 for a in range(3)]
         self.walls = [0.0 if a >= d or periodic[a] else dims[a] * side0 for a in range(3)]
-        # The cells that need gradients: computational cells with an interface
-        # cell among their neighbours at their level (or one themselves).
-        rows = self.rows.numpy().reshape(-1, q)
-        near = role == INTERFACE
-        near_any = near | (np.where(rows >= 0, near[np.maximum(rows, 0)], False)).any(axis=1)
-        centre, side = self.centres()
-
-        def nodes(lv, *roles):
-            return tack.array(np.flatnonzero((level == lv) & np.isin(role, roles)).astype(np.int64))
-
+        levels = range(self.finest + 1)
         with device:
-            levels = range(self.finest + 1)
-            self.real = [nodes(lv, REAL) for lv in levels]
-            self.interface = [nodes(lv, INTERFACE) for lv in levels]
-            self.ghosts = [nodes(lv, GHOST) for lv in levels]
-            self.computed = [nodes(lv, REAL, INTERFACE) for lv in levels]
-            self.border = [tack.array(np.flatnonzero((level == lv) & np.isin(role, (REAL, INTERFACE))
-                                                     & near_any).astype(np.int64)) for lv in levels]
             self.role_array = tack.array(role.astype(np.int32), tack.i32)
-            positions = np.zeros((n, 3))
-            positions[:, :d] = centre
-            self.px, self.py, self.pz = (tack.array(positions[:, a].astype(self.dtype.numpy_dtype),
-                                                    self.dtype) for a in range(3))
-            self.side = tack.array(side.astype(self.dtype.numpy_dtype), self.dtype)
+            # The node lists, by a sort on (level, group): group 0 real leaves,
+            # 1 real leaves beside an interface cell (which need gradients, as
+            # interface cells do), 2 interface cells, 3 ghosts, 4 refined, 5
+            # solid; so real, computed and border cells are each one run.
+            key = tack.empty((n,), tack.i32)
+            groups = 8
+            counts = tack.zeros(((self.finest + 1) * groups,), tack.i32)
+            if n:
+                _list_keys(self.role_array, octree.level, self.rows, q, groups, key, counts)
+            order = argsort(key, index_dtype=tack.i64)
+            bounds = np.concatenate([[0], np.cumsum(counts.numpy())])
+
+            def run(lv, first, last):
+                lo, hi = int(bounds[lv * groups + first]), int(bounds[lv * groups + last + 1])
+                out = tack.empty((hi - lo,), tack.i64)
+                if hi > lo:
+                    _take(order, lo, out)
+                return out
+
+            self.real = [run(lv, 0, 1) for lv in levels]
+            self.interface = [run(lv, 2, 2) for lv in levels]
+            self.ghosts = [run(lv, 3, 3) for lv in levels]
+            self.computed = [run(lv, 0, 2) for lv in levels]
+            self.border = [run(lv, 1, 2) for lv in levels]
+            self.px, self.py, self.pz, self.side = (tack.empty((n,), self.dtype) for _ in range(4))
+            if n:
+                _centres(corner, sides, d, self.px, self.py, self.pz, self.side)
             self.grad = tack.zeros((n * q * d,), self.dtype)
             self.parent = tack.full((n,), -1, tack.i32)
             for lv in levels:

@@ -31,7 +31,7 @@ import numpy as np
 import tack
 from tack.dataset.ghosts import Ghosts
 
-__all__ = ["OctreeChildren", "OctreeFaces", "children", "face_neighbours", "faces",
+__all__ = ["OctreeChildren", "OctreeFaces", "children", "face_neighbours", "faces", "grid_rows",
            "lattice_boxes", "neighbourhoods", "nodes_per_level", "parents", "refined_by_level",
            "root_rows", "subtree_ends"]
 
@@ -137,6 +137,46 @@ def _descend(p, c, dimension, marks, refined, number, table):
         if (marks[p] & refined) != 0:
             p = table[(number[p] - 1) * (1 << dimension) + c]
     return p
+
+
+@tack.kernel
+def _root_map(roots, tree, root_of):
+    for k in range(roots.shape[0]):
+        root_of[tree[roots[k]]] = roots[k]
+
+
+@tack.kernel
+def _grid_rows(roots, tree, root_of, nx, ny, nz, wx, wy, wz, dimension, span, rows):
+    # Each root's 3^d neighbours on the roots' grid (x fastest), wrapping along
+    # the axes w marks, -1 beyond the grid or where no tree has nodes.
+    for k in range(roots.shape[0]):
+        t = tree[roots[k]]
+        x = t % nx
+        y = (t // nx) % ny
+        z = t // (nx * ny)
+        for o in range(span):
+            a = x + o % 3 - 1
+            b = y + (o // 3) % 3 - 1
+            c = z
+            if dimension == 3:
+                c = z + o // 9 - 1
+            inside = 1
+            if wx == 1:
+                a = (a + nx) % nx
+            elif a < 0 or a >= nx:
+                inside = 0
+            if wy == 1:
+                b = (b + ny) % ny
+            elif b < 0 or b >= ny:
+                inside = 0
+            if wz == 1:
+                c = (c + nz) % nz
+            elif c < 0 or c >= nz:
+                inside = 0
+            r = -1
+            if inside == 1:
+                r = root_of[a + nx * (b + ny * c)]
+            rows[k * span + o] = r
 
 
 @tack.kernel
@@ -413,25 +453,28 @@ def root_rows(octree):
     middle), -1 beyond the roots' grid or where no tree has nodes; a device i32
     array, made once an octree. The descent starts from these rows."""
     cached = getattr(octree, "_root_rows", None)
-    if cached is not None:
-        return cached
+    if cached is None:
+        cached = octree._root_rows = grid_rows(octree)
+    return cached
+
+
+def grid_rows(octree, periodic=None):
+    """``root_rows``, made on the device, wrapping across the roots' grid along
+    the axes ``periodic`` (d booleans) marks; not cached."""
     d = octree.dimension
-    dims = np.array(([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3])
-    roots = np.flatnonzero(octree._level == 0)
-    root_of = np.full(int(dims.prod()), -1, np.int64)
-    root_of[octree._tree[roots]] = roots
-    t = octree._tree[roots]
-    at = np.stack([t % dims[0], (t // dims[0]) % dims[1], t // (dims[0] * dims[1])], axis=1)
-    offsets = np.stack(np.meshgrid(*([np.arange(-1, 2)] * d + [np.zeros(1, np.int64)] * (3 - d)),
-                                   indexing="ij"), axis=-1).reshape(-1, 3)
-    offsets = offsets[np.lexsort(offsets.T)]                         # x fastest
-    q = at[:, None, :] + offsets[None, :, :]
-    inside = ((q >= 0) & (q < dims)).all(axis=2)
-    q = np.clip(q, 0, dims - 1)
-    rows = np.where(inside, root_of[q[..., 0] + dims[0] * (q[..., 1] + dims[1] * q[..., 2])], -1)
+    span = 3 ** d
+    nx, ny, nz = ([n - 1 for n in octree.roots.topology.point_dims] + [1])[:3]
+    wrap = [int(bool(p)) for p in (tuple(periodic) if periodic is not None else ())]
+    wrap = [*wrap, 0, 0, 0][:3]
+    roots = np.flatnonzero(octree._level == 0).astype(np.int64)
     with octree.device:
-        octree._root_rows = tack.array(rows.reshape(-1).astype(np.int32), tack.i32)
-    return octree._root_rows
+        rows = tack.empty((len(roots) * span,), tack.i32)
+        if len(roots):
+            roots_d = tack.array(roots, tack.i64)
+            root_of = tack.full((nx * ny * nz,), -1, tack.i32)
+            _root_map(roots_d, octree.tree, root_of)
+            _grid_rows(roots_d, octree.tree, root_of, nx, ny, nz, *wrap, d, span, rows)
+    return rows
 
 
 def _searched_subtree_ends(octree):
