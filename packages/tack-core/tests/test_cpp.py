@@ -12,8 +12,9 @@ import numpy as np
 import pytest
 
 import tack
+import tack.arrays
 import tack.cpp
-from tack.cpp import T, obj, ptr
+from tack.cpp import T, indexable, obj, ptr
 
 _HEADER = """
 #pragma once
@@ -537,6 +538,135 @@ def test_objects_are_checked(calls_methods):
         integrals(VectorValue(), out)
     with pytest.raises(Exception, match="does not make a tack.cpp.obj"):
         undeclared(_Poly(_COEFFICIENTS, 0.0), out)
+
+
+_GENERIC = """
+namespace demo {
+// For any container with size() and operator[]: the mean of a window, clipped.
+template <class C> auto window(const C& c, long long at, long long half) {
+  decltype(c[0] + 0) s = 0;
+  long long n = 0;
+  for (long long k = at - half; k <= at + half; ++k)
+    if (k >= 0 && k < (long long)c.size()) { s += c[k]; ++n; }
+  return s / n;
+}
+template <class C, class V> V window_mean(const C& c, long long at, long long half, V) {
+  return window(c, at, half);
+}
+// For any callable: a central difference.
+template <class F, class V> V derivative(const F& f, V x, V h) {
+  return (f(x + h) - f(x - h)) / (2 * h);
+}
+}
+"""
+
+
+def _window_means(values, half):
+    return np.array([values[max(0, i - half):i + half + 1].mean()
+                     for i in range(len(values))])
+
+
+@pytest.fixture(scope="module")
+def generic():
+    return tack.cpp.Library(source=_GENERIC)
+
+
+def test_a_container_template_takes_implicit_arrays(generic):
+    """`__getitem__` is ``operator[]`` and `__len__` is ``size()``, so a template
+    for any indexable container reads tack.arrays' implicit arrays, composed ones
+    too, and each kind compiles to its own arithmetic."""
+    window_mean = generic.function("demo::window_mean", result=T,
+                                   args=(indexable(T), tack.i64, tack.i64, T))
+
+    @tack.kernel
+    def smooth(c, out, half):
+        for i in range(out.shape[0]):
+            out[i] = window_mean(c, i, half, out[i])
+
+    n = 200
+    values = np.random.default_rng(0).random(n)
+    reverse = np.arange(n)[::-1].copy()
+    cases = [
+        (tack.arrays.CountingArray(n, 0.0, 1.0, dtype=tack.f64), np.arange(n, dtype=float)),
+        (tack.arrays.ConstantArray(2.5, n), np.full(n, 2.5)),
+        (tack.arrays.Permutation(tack.array(reverse), tack.array(values)), values[::-1]),
+        (tack.arrays.Permutation(tack.array(reverse),
+                                 tack.arrays.CountingArray(n, 1.0, 0.5, dtype=tack.f64)),
+         (1.0 + 0.5 * np.arange(n))[::-1]),
+    ]
+    for array, host in cases:
+        out = tack.zeros(n, tack.f64)
+        smooth(array, out, 3)
+        np.testing.assert_allclose(out.numpy(), _window_means(host, 3), rtol=1e-14)
+
+
+def test_a_device_class_with_the_protocol_and_a_callable_one(generic):
+    window_mean = generic.function("demo::window_mean", result=T,
+                                   args=(indexable(T, index=tack.i32), tack.i64, tack.i64, T))
+    derivative = generic.function("demo::derivative", result=T,
+                                  args=(obj(__call__=(T, (T,))), T, T))
+
+    @tack.device_class
+    class Squares:
+        def __init__(self, n):
+            self.n = n
+
+        @tack.func
+        def __getitem__(self, k):
+            return tack.f32(k * k)
+
+        @tack.func
+        def __len__(self):
+            return self.n
+
+    @tack.device_class
+    class Cubic:
+        def __init__(self, k):
+            self.k = k
+
+        @tack.func
+        def __call__(self, x):
+            return self.k * x * x * x
+
+    @tack.kernel
+    def smooth(c, out):
+        for i in range(out.shape[0]):
+            out[i] = window_mean(c, i, 2, out[i])
+
+    @tack.kernel
+    def slopes(f, x, out):
+        for i in range(out.shape[0]):
+            out[i] = derivative(f, x[i], 1e-3)
+
+    out = tack.zeros(20, tack.f32)
+    smooth(Squares(20), out)
+    np.testing.assert_allclose(out.numpy(), _window_means(np.arange(20.0) ** 2, 2), rtol=1e-6)
+    xs = np.linspace(-1, 1, 50)
+    slope = tack.zeros(50, tack.f64)
+    slopes(Cubic(2.0), tack.array(xs), slope)
+    np.testing.assert_allclose(slope.numpy(), 6 * xs**2 + 2e-6, atol=1e-11)
+
+
+def test_a_missing_protocol_method_is_named(generic):
+    window_mean = generic.function("demo::window_mean", result=T,
+                                   args=(indexable(T), tack.i64, tack.i64, T))
+
+    @tack.device_class
+    class NoLength:
+        def __init__(self):
+            self.k = 1.0
+
+        @tack.func
+        def __getitem__(self, k):
+            return self.k
+
+    @tack.kernel
+    def smooth(c, out):
+        for i in range(out.shape[0]):
+            out[i] = window_mean(c, i, 2, out[i])
+
+    with pytest.raises(Exception, match="has no @tack.func method '__len__'"):
+        smooth(NoLength(), tack.zeros(4, tack.f64))
 
 
 def _eigen():

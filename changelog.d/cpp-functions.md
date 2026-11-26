@@ -6,7 +6,10 @@
   unless `writes=True`, which Tack counts as a store). A `@tack.device_class`
   object passes for a template parameter the C++ calls methods on
   (`tack.cpp.obj(method=(result, args))`): the C++ receives a struct whose
-  methods call the object's `@tack.func` methods, inlined into it.
+  methods call the object's `@tack.func` methods, inlined into it. `__getitem__`,
+  `__len__` and `__call__` are `operator[]`, `size()` and `operator()` there
+  (`tack.cpp.indexable`), so a container template reads `tack.arrays`'
+  implicit arrays.
   The call's types instantiate a template; clang (`TACK_CLANG`, else `clang++`
   on the path, needed only where such a kernel is compiled) writes LLVM bitcode
   that is linked into the kernel before it is optimized, so the library's code

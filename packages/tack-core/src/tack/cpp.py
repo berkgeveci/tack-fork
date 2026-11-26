@@ -53,6 +53,13 @@ declared, typed as declared (scalars), which calls the object's method;
 both are inlined, so the method's arithmetic ends up inside the C++ loop.
 The struct lasts for the call: the C++ must not keep it.
 
+The protocol methods take their C++ spellings: ``__getitem__`` is
+``operator[]``, ``__len__`` is ``size()`` and ``__call__`` is ``operator()``,
+so a template written for any indexable container, or any callable, takes a
+device class that defines them, ``tack.arrays``' implicit arrays among them.
+``indexable(type)`` is the ``obj`` of a read-only container of scalars.
+Elements are read, never referenced: ``c[i]`` is a value.
+
 The function is called from every worker thread, any number of times, so it
 must be safe to: no state of its own.
 """
@@ -67,7 +74,7 @@ from pathlib import Path
 
 from tack.lang.types import ScalarType, f32, f64
 
-__all__ = ["ExternFunc", "Library", "Object", "Pointer", "T", "obj", "ptr"]
+__all__ = ["ExternFunc", "Library", "Object", "Pointer", "T", "indexable", "obj", "ptr"]
 
 
 class _TypeVariable:
@@ -137,6 +144,18 @@ class Object:
 def obj(**methods):
     """The type of a device-class argument; see the module's notes."""
     return Object(methods)
+
+
+def indexable(dtype, index=None):
+    """The type of a device-class argument the C++ indexes and measures:
+    ``c[i]`` gives a ``dtype`` (a scalar type or ``T``) for an ``index`` (i64
+    unless given), and ``c.size()`` its length, an i64."""
+    from tack.lang.types import i64
+    return Object({"__getitem__": (dtype, (index or i64,)), "__len__": (i64, ())})
+
+
+#: How the C++ spells a protocol method.
+_CPP_METHODS = {"__getitem__": "operator[]", "__len__": "size", "__call__": "operator()"}
 
 
 def _c_type(t):
@@ -339,7 +358,8 @@ class ExternFunc:
                 given += [f"o{k}{h}" for h in held]
                 captures += [f"{c} o{k}{h}" for c, h in zip(captured, held)]
                 methods.append(
-                    f"  __attribute__((always_inline)) {_c_type(r)} {method}("
+                    f"  __attribute__((always_inline)) {_c_type(r)} "
+                    f"{_CPP_METHODS.get(method, method)}("
                     + ", ".join(own) + ") const { return " + callback + "("
                     + ", ".join([*(f"x{j}" for j in range(len(takes))), *held]) + "); }")
             lines.append("namespace { struct " + struct + " {\n  " + " ".join(fields) + "\n"
