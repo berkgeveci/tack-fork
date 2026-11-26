@@ -376,30 +376,82 @@ def clang() -> str:
     return _clang
 
 
-def _source(library, shims) -> str:
+def _prefix(library) -> str:
+    """What every instantiation of ``library`` starts with: its headers and
+    its own text. Parsed once per process (`_precompiled`)."""
     lines = ["#include <cstdint>"]
     lines += [f'#include "{h}"' for h in library.headers]
     lines.append(library.source)
-    lines += sorted(set(shims))
     return "\n".join(lines) + "\n"
 
 
+def _source(shims) -> str:
+    return "\n".join(sorted(set(shims))) + "\n"
+
+
+def _command(library) -> list:
+    return [clang(), *_FLAGS, *library.flags, *(f"-I{d}" for d in library.include_dirs)]
+
+
+_folder = None
+_headers = {}       # library and command -> its precompiled header's path, or None
+_build_lock = threading.Lock()
+
+
+def _scratch() -> Path:
+    """This process's directory for precompiled headers, removed at exit."""
+    global _folder
+    if _folder is None:
+        import atexit
+        _folder = Path(tempfile.mkdtemp(prefix="tack-cpp-"))
+        atexit.register(shutil.rmtree, _folder, ignore_errors=True)
+    return _folder
+
+
+def _precompiled(library, command):
+    """The path of ``library``'s precompiled header, built on first use, or
+    None if clang would not build one (the instantiation then includes the
+    text, and reports what is wrong with it). A library such as Eigen takes a
+    second to parse; without this every kernel that calls it would pay that
+    again, where with it an instantiation costs a third as much."""
+    key = hashlib.sha256(repr((command, library.fingerprint())).encode()).hexdigest()
+    with _build_lock:
+        if key not in _headers:
+            header = _scratch() / f"{key[:16]}.h"
+            header.write_text(_prefix(library))
+            out = header.with_suffix(".pch")
+            done = subprocess.run([*command, "-x", "c++-header", str(header), "-o", str(out)],
+                                  capture_output=True, text=True)
+            _headers[key] = out if done.returncode == 0 else None
+        return _headers[key]
+
+
 def _compile(library, source) -> bytes:
-    command = [clang(), *_FLAGS, *library.flags]
-    command += [f"-I{d}" for d in library.include_dirs]
+    """The bitcode of ``source`` (instantiations) after ``library``'s prefix."""
+    command = _command(library)
     key = hashlib.sha256(repr((command, source, library.fingerprint())).encode()).hexdigest()
     with _lock:
         found = _bitcode.get(key)
     if found is not None:
         return found
+    header = _precompiled(library, command)
     with tempfile.TemporaryDirectory(prefix="tack-cpp-") as folder:
         src, out = Path(folder) / "shim.cpp", Path(folder) / "shim.bc"
-        src.write_text(source)
-        done = subprocess.run([*command, "-c", "-emit-llvm", str(src), "-o", str(out)],
-                              capture_output=True, text=True)
-        if done.returncode != 0:
-            raise RuntimeError(f"clang could not compile the C++ a kernel calls:\n"
-                               f"{done.stderr}\n--- the source ---\n{source}")
+        done = None
+        if header is not None:
+            src.write_text(source)
+            done = subprocess.run([*command, "-include-pch", str(header), "-c", "-emit-llvm",
+                                   str(src), "-o", str(out)], capture_output=True, text=True)
+        if done is None or done.returncode != 0:
+            # Without the precompiled header: the whole text, whose errors
+            # clang then reports against what the user wrote.
+            whole = _prefix(library) + source
+            src.write_text(whole)
+            done = subprocess.run([*command, "-c", "-emit-llvm", str(src), "-o", str(out)],
+                                  capture_output=True, text=True)
+            if done.returncode != 0:
+                raise RuntimeError(f"clang could not compile the C++ a kernel calls:\n"
+                                   f"{done.stderr}\n--- the source ---\n{whole}")
         found = out.read_bytes()
     with _lock:
         _bitcode[key] = found
@@ -426,7 +478,7 @@ def link(module, calls):
         entry[1].append(shim)
         entry[2].extend(symbols)
     for library, shims, symbols in by_library.values():
-        data = _compile(library, _source(library, shims))
+        data = _compile(library, _source(shims))
         try:
             other = llvm.parse_bitcode(data)
         except RuntimeError as error:

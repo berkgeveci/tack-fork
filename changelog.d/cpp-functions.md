@@ -11,4 +11,5 @@
   on the path, needed only where such a kernel is compiled) writes LLVM bitcode
   that is linked into the kernel before it is optimized, so the library's code
   is inlined and vectorized with the loop and stored with the variant in the
-  disk cache.
+  disk cache. A library is parsed once a process, into a precompiled header
+  its instantiations are compiled against.

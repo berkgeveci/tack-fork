@@ -588,6 +588,55 @@ template <class V> void eigenvalues(const V* a, long long i, V* out) {
     np.testing.assert_allclose(twice.numpy(), 2 * want, atol=1e-12)
 
 
+def test_a_library_is_parsed_once_for_all_its_instantiations(monkeypatch):
+    """The library's text goes into one precompiled header a process; each
+    kernel's instantiation is compiled against it."""
+    real = subprocess.run
+    runs = []
+
+    def run(command, **kwargs):
+        runs.append("header" if "c++-header" in command else
+                    "with header" if "-include-pch" in command else "whole")
+        return real(command, **kwargs)
+
+    monkeypatch.setattr(tack.cpp.subprocess, "run", run)
+    lib = tack.cpp.Library(source="template <class V> V cube(V x) { return x * x * x; }")
+    cube = lib.function("cube", result=T, args=(T,))
+
+    @tack.kernel
+    def cubes(x):
+        for i in range(x.shape[0]):
+            x[i] = cube(x[i])
+
+    @tack.kernel
+    def sixth_powers(x):
+        for i in range(x.shape[0]):
+            x[i] = cube(cube(x[i]) * 1.0) / cube(x[i])
+
+    for dtype in (tack.f32, tack.f64):
+        x = tack.full(4, 2.0, dtype)
+        cubes(x)
+        sixth_powers(x)
+        assert x.numpy().tolist() == [8.0 ** 6] * 4     # (2^3)^9 / (2^3)^3
+    # One header; the f32 and the f64 instantiation once each, shared by both kernels.
+    assert runs == ["header", "with header", "with header"]
+
+
+def test_an_error_in_the_librarys_own_text_is_clangs_message():
+    """No precompiled header can be built, so the whole text is compiled and
+    clang's error names the user's line."""
+    broken = tack.cpp.Library(source="template <class V> V f(V x) { return x + ; }")
+    f = broken.function("f", result=T, args=(T,))
+
+    @tack.kernel
+    def apply(x):
+        for i in range(x.shape[0]):
+            x[i] = f(x[i])
+
+    with pytest.raises(Exception, match="expected expression"):
+        apply(tack.zeros(4, tack.f32))
+
+
 _SCRIPT = """
 import sys, numpy as np, tack, tack.cpp
 lib = tack.cpp.Library(headers=["demo.h"], include_dirs=[sys.argv[1]])
