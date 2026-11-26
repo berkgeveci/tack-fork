@@ -148,3 +148,25 @@ def test_macrocell_ranges_bound_the_leaves_reaching_them():
         inside = (lo <= a).all(axis=1) & (lo + side >= b).all(axis=1) & visible
         if inside.any():                             # the leaf holding the cell is counted
             assert lows[m] <= phi[inside].min() + 1e-6
+
+
+def test_corner_interpolation_is_the_tents_at_the_corners():
+    octree = _octree((5, 4, 4), depth=4)
+    c = octree.centers() + np.asarray(octree.origin)
+    octree.fields = {"phi": tack.array(_smooth(octree, c), tack.f32)}
+    fast = ov.octree_tents(octree, "phi", blend=2)
+    exact = ov.octree_tents(octree, "phi", blend=1)
+    # At each leaf's centre the trilinear value is the mean of its corners, which
+    # are the exact tents a hair inside each corner.
+    leaves = np.flatnonzero(octree.is_leaf)[:2000]
+    centres = (c[leaves]).astype(np.float32)
+    ps = tack.array(centres, tack.vec3(tack.f32))
+    values, sizes = tack.empty((len(leaves),), tack.f32), tack.empty((len(leaves),), tack.f32)
+    _sample_points(fast, ps, octree.finest + 1, values, sizes)
+    corners = np.asarray(fast.corners.numpy()).reshape(-1, 8)[leaves]
+    np.testing.assert_allclose(values.numpy(), corners.mean(axis=1), rtol=1e-5, atol=1e-6)
+    lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in octree.geometry())
+    q = lo[leaves] + size[leaves] * [0.001, 0.001, 0.999] + np.asarray(octree.origin)
+    _sample_points(exact, tack.array(q.astype(np.float32), tack.vec3(tack.f32)), octree.finest + 1,
+                   values, sizes)
+    np.testing.assert_allclose(values.numpy(), corners[:, 4], rtol=1e-4, atol=1e-5)

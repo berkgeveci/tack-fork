@@ -16,7 +16,10 @@ blended into VTK's frame), written for an octree.
   ``REFINED`` (descend) on a refined node, ``HIDDEN`` (nothing here) on a hidden
   leaf -- one load a node, as the AMR sampler marks them.
 - **Reconstruction.** ``blend=0``: the leaf's value, piecewise constant, exactly
-  what ``probe`` gives. ``blend=1``: the AMR sampler's tents: every visible
+  what ``probe`` gives. ``blend=2``: trilinear in each leaf's eight corner
+  values, the tents evaluated there once (one descent and two cache lines a
+  sample; a crack where a fine leaf's corner hangs on a coarse face).
+  ``blend=1``: the AMR sampler's tents: every visible
   leaf is a tent its own size wide about its centre, and the value is the
   weighted mean of the tents reaching the point. The cells of level ``l``
   whose tents reach the point are the eight around it on level ``l``'s
@@ -76,7 +79,7 @@ class OctreeTents:
     """An octree as the march's sampler: ``sample(p, first, stop)``, the value at
     ``p`` and the size of the leaf there."""
 
-    def __init__(self, octree, name, blend=1):
+    def __init__(self, octree, name, blend=1, balanced=0):
         if octree.dimension != 3:
             raise ValueError("the volume sampler takes a 3D octree")
         number, table = children(octree)
@@ -104,6 +107,22 @@ class OctreeTents:
         self.coarse = float(min(sizes[0]))
         self.finest = float(min(sizes[0]) / (1 << octree.finest))
         self.blend = int(blend)
+        #: ``blend=2``: each leaf's eight corner values (x fastest), the exact
+        #: tents evaluated there once, and a sample is trilinear in them: one
+        #: descent and two cache lines a sample, at the price of a crack where a
+        #: fine leaf's corner hangs on a coarse face.
+        self.corners = tack.empty((1,), tack.f32)
+        if int(blend) == 2:
+            exact = OctreeTents(octree, name, blend=1, balanced=balanced)
+            with octree.device:
+                lo, size = octree.geometry()
+                self.corners = tack.empty((max(octree.num_nodes, 1) * 8,), tack.f32)
+                if octree.num_nodes:
+                    _corner_values(exact, lo, size, octree.marks, int(Ghosts.REFINEDCELL),
+                                   octree.finest + 1, self.corners)
+        #: Whether neighbouring leaves differ by at most one level (xRAGE, RAMSES):
+        #: then no tent finer than one level below the leaf reaches a point.
+        self.balanced = int(balanced)
         #: What ``OctreeRenderer`` needs beside the sampler.
         self.bounds = tuple(float(v) for v in np.stack([
             [axes[a][0] + origin[a] for a in range(3)],
@@ -124,6 +143,7 @@ class OctreeTents:
         fz = min(max(rz - tack.f32(tk), 0.0), 0.999999)
         n = self.roots[ti + self.nx * (tj + self.ny * tk)]
         size = self.coarse
+        depth = 0
         while n >= 0 and self.values[n] == REFINED:
             jx = 1 if fx >= 0.5 else 0
             jy = 1 if fy >= 0.5 else 0
@@ -132,8 +152,12 @@ class OctreeTents:
             fy = 2.0 * fy - tack.f32(jy)
             fz = 2.0 * fz - tack.f32(jz)
             size = 0.5 * size
+            depth += 1
             n = self.table[(self.number[n] - 1) * 8 + jx + 2 * jy + 4 * jz]
-        return n, size
+        # The point's position in the leaf, 0 to 1 along each axis, and how far it
+        # is from the nearest face, in units of the leaf's side.
+        inside = min(fx, 1.0 - fx, fy, 1.0 - fy, fz, 1.0 - fz)
+        return n, size, depth, inside, fx, fy, fz
 
     @tack.func
     def node_at(self, level, i, j, k):
@@ -157,16 +181,33 @@ class OctreeTents:
 
     @tack.func
     def sample(self, p, first, stop):
-        n, size = self.leaf_at(p)
+        n, size, depth, inside, fx, fy, fz = self.leaf_at(p)
         value = 0.0
         if n >= 0:
             v = self.values[n]
             if v > ACTIVE:
                 value = v
-        if self.blend == 1 and stop > first:
+        last = stop
+        if n >= 0:
+            # A finer leaf's tent reaches half its size beyond its face, so none
+            # reaches a point deeper inside the leaf than half the finest cell;
+            # in a balanced tree no neighbour is more than one level finer.
+            if inside > 0.25:
+                last = min(last, depth + 1)
+            if self.balanced == 1:
+                last = min(last, depth + 2)
+        if self.blend == 2 and n >= 0:
+            # Trilinear in the leaf's corner values (the tents, once, at its corners).
+            c = n * 8
+            v00 = self.corners[c] * (1.0 - fx) + self.corners[c + 1] * fx
+            v10 = self.corners[c + 2] * (1.0 - fx) + self.corners[c + 3] * fx
+            v01 = self.corners[c + 4] * (1.0 - fx) + self.corners[c + 5] * fx
+            v11 = self.corners[c + 6] * (1.0 - fx) + self.corners[c + 7] * fx
+            value = (v00 * (1.0 - fy) + v10 * fy) * (1.0 - fz) + (v01 * (1.0 - fy) + v11 * fy) * fz
+        if self.blend == 1 and last > first:
             num = 0.0
             den = 0.0
-            for wide in range(first, stop):
+            for wide in range(first, last):
                 level = tack.i32(wide)
                 # Level's lattice: cell sides, and the point in cell-centre units.
                 hx = self.sx / tack.f32(1 << level)
@@ -193,6 +234,20 @@ class OctreeTents:
             if den > 0.0:
                 value = num / den
         return value, size
+
+
+@tack.kernel
+def _corner_values(exact, lo, size, marks, refined, stop, out):
+    # A leaf's corners, nudged inward by a thousandth of the leaf so the point
+    # lies in it: the exact tents there.
+    for n in range(marks.shape[0]):
+        if (marks[n] & refined) == 0:
+            for c in range(8):
+                q = lo[n] + size[n] * tack.vec3(0.001 + 0.998 * tack.f32(c & 1),
+                                                0.001 + 0.998 * tack.f32((c >> 1) & 1),
+                                                0.001 + 0.998 * tack.f32((c >> 2) & 1))
+                v, s = exact.sample(q, 0, stop)
+                out[n * 8 + c] = v
 
 
 def octree_tents(octree, name, blend=1):
