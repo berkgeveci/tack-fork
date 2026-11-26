@@ -589,6 +589,12 @@ class OctreeRenderer:
             octree, self.ranges, macrocells)
         self.bounds = self.tents.bounds
         self.cell = self.tents.finest
+        #: The field's range over the visible leaves.
+        with octree.device:
+            lows = self.ranges.lo.numpy()
+            highs = self.ranges.hi.numpy()
+        held = lows <= highs
+        self.range = (float(lows[held].min()), float(highs[held].max())) if held.any() else (0.0, 1.0)
         #: The divided macrocells (``divide`` the shift, -1 for none).
         self.divide = int(divide)
         self.sub = sub_ranges(octree, self.tents, self.ranges, self.grid, self.lasts, self.lows,
@@ -603,14 +609,16 @@ class OctreeRenderer:
         return np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32)
 
     def render(self, camera, size, table, lo, hi, depth=None, sample_distance=0.5,
-               unit_distance=1.0, min_step=0.0, jitter=0.0):
+               unit_distance=1.0, min_step=0.0, jitter=0.0, aspect=None, **_):
         """The volume seen by ``camera`` (a ``vtkCamera``) at ``size`` (w, h):
         ``(h, w, 4)`` f32, premultiplied, row 0 at the top; as
-        ``tack_composite.TackRenderer.render``. ``timings`` holds the parts."""
+        ``tack_composite.TackRenderer.render`` (``aspect``: the viewport's width
+        over its height where ``size`` is a smaller picture of it). ``timings``
+        holds the parts."""
         import time
 
         out = self._march(camera, size, table, lo, hi, depth, sample_distance, unit_distance,
-                          min_step, jitter)
+                          min_step, jitter, aspect)
         t = time.perf_counter()
         with self.octree.device:
             picture = out.numpy().reshape(size[1], size[0], 4)
@@ -618,7 +626,7 @@ class OctreeRenderer:
         return picture
 
     def render_over(self, frame, camera, size, table, lo, hi, depth=None, sample_distance=0.5,
-                    unit_distance=1.0, min_step=0.0, jitter=0.0):
+                    unit_distance=1.0, min_step=0.0, jitter=0.0, aspect=None):
         """The volume blended over ``frame`` (``(h, w, 4)`` u8, row 0 at the top, the
         colour VTK drew) on the device: ``(h, w, 4)`` u8. The volume's RGBA never
         comes to the host; ``timings["blend_ms"]`` is the upload, the kernel
@@ -626,7 +634,7 @@ class OctreeRenderer:
         import time
 
         out = self._march(camera, size, table, lo, hi, depth, sample_distance, unit_distance,
-                          min_step, jitter)
+                          min_step, jitter, aspect)
         t = time.perf_counter()
         with self.octree.device:
             colour = tack.array(np.ascontiguousarray(frame, np.uint8).reshape(-1), tack.u8)
@@ -637,7 +645,7 @@ class OctreeRenderer:
         return picture
 
     def _march(self, camera, size, table, lo, hi, depth, sample_distance, unit_distance,
-               min_step, jitter):
+               min_step, jitter, aspect=None):
         """The march: the volume's premultiplied RGBA, a device array of ``w * h``."""
         import time
 
@@ -645,7 +653,7 @@ class OctreeRenderer:
         t0 = time.perf_counter()
         w, h = size
         count = w * h
-        m = np.array([[camera.GetCompositeProjectionTransformMatrix(w / h, 0, 1)
+        m = np.array([[camera.GetCompositeProjectionTransformMatrix(aspect or w / h, 0, 1)
                        .GetElement(i, j) for j in range(4)] for i in range(4)])
         f32 = np.float32
         with self.octree.device:
