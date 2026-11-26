@@ -42,7 +42,10 @@ def _solver(refine=_square, finest=1):
 
 def _check_mesh(s):
     """2:1 across faces and corners, real leaves' neighbours at their level hold
-    values, interface cells have four ghosts."""
+    values, interface cells have four ghosts, and the rows a remesh renumbered
+    are the rows made from the roots."""
+    periodic = tuple(getattr(s.octree, "periodic", (False,) * s.dim))
+    assert np.array_equal(s.rows.numpy(), lb._rows(s.octree, periodic).numpy())
     role, level = s.role, s.levels
     rows = s.rows.numpy().reshape(-1, 9)
     for n in np.flatnonzero(role == lb.REAL):

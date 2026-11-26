@@ -47,8 +47,17 @@ import tack
 from tack.algorithms import exclusive_scan
 from tack.dataset import octree_lbm as lb
 from tack.dataset.ghosts import Ghosts
-from tack.dataset.octree import OctreeDataSet
+from tack.dataset.octree import OctreeDataSet, _unkey
 from tack.dataset.octree_lbm import _feq, _gradients, _moments_at, _slope
+from tack.dataset.octree_topology import (
+    _OX,
+    _OY,
+    _OZ,
+    _descend,
+    _octant,
+    _parent_offset,
+    children,
+)
 
 __all__ = ["adapt"]
 
@@ -303,6 +312,54 @@ def _place_ghosts(count, start, tree, level, key, marks, refined, solid, dim, ou
                 logical[t] = tack.i32(n)
 
 
+@tack.kernel
+def _mesh_rows(rows, count, start, tree, level, key, nx, ny, nz, q, dim, out):
+    # The final mesh's rows from the logical octree's (``_place_ghosts``' order):
+    # each node's entries renumbered (``start``), and an entry that was a coarser
+    # leaf and is now an interface cell (``count`` > 1) replaced by its ghost
+    # holding the place, the cell's position wrapped across periodic axes.
+    for n in range(count.shape[0]):
+        p = start[n]
+        lx = level[n]
+        i, j, m = _unkey(key[n], lx, dim)
+        t = tack.i32(tree[n])
+        ci = ((t % nx) << lx) + tack.i32(i)
+        cj = (((t // nx) % ny) << lx) + tack.i32(j)
+        ck = ((t // (nx * ny)) << lx) + tack.i32(m)
+        wx = nx << lx
+        wy = ny << lx
+        wz = nz << lx
+        for o in range(q):
+            r = rows[n * q + o]
+            e = tack.i64(-1)
+            if r >= 0:
+                e = start[r]
+                lr = level[r]
+                if count[r] > 1 and lr < lx:
+                    s = lx - lr - 1
+                    b = (((ci + _OX[o] + wx) % wx) >> s) & 1
+                    b = b + 2 * ((((cj + _OY[o] + wy) % wy) >> s) & 1)
+                    if dim == 3:
+                        b = b + 4 * ((((ck + _OZ[o] + wz) % wz) >> s) & 1)
+                    e = e + 1 + b
+            out[p * q + o] = tack.i32(e)
+
+
+@tack.kernel
+def _ghost_rows(count, start, marks, refined, number, table, q, dim, rows):
+    # The ghosts' rows from their interface cell's (as ``_child_neighbourhoods``):
+    # the ghosts of logical node n are the nodes after its own.
+    for n in range(count.shape[0]):
+        if count[n] > 1:
+            p = start[n]
+            for j in range(1 << dim):
+                c = p + 1 + j
+                for o in range(q):
+                    rows[c * q + o] = _descend(rows[p * q + _parent_offset(j, o, dim)],
+                                               _octant(j, o, dim), dim, marks, refined, number,
+                                               table)
+
+
 @tack.func
 def _rescaled(o, f, at, scale, q, dim):
     # Value o of the q at ``at`` with its non-equilibrium part times scale.
@@ -450,6 +507,14 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
     mesh = OctreeDataSet(octree.roots, tree2, lev2, key2, fields={"role": role2}, _ordered=True,
                          _adopt=True)
     mesh.periodic = periodic
+    # The mesh's rows from the logical octree's, not made again from its roots:
+    # renumbered, and the ghosts' from their interface cells'.
+    nx, ny, nz = ([s - 1 for s in octree.roots.topology.point_dims] + [1])[:3]
+    with device:
+        mesh_rows = tack.empty((final * q,), tack.i32)
+        number2, table2 = children(mesh)
+        _mesh_rows(rows, count2, start2, tree, lev, key, nx, ny, nz, q, d, mesh_rows)
+        _ghost_rows(count2, start2, mesh.marks, refined_mark, number2, table2, q, d, mesh_rows)
     if solid is not None:
         roles = role2.numpy()
         lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in mesh.geometry())
@@ -462,7 +527,7 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
             mesh.fields["role"] = tack.array(roles, tack.i32)
     new = lb.LBM(mesh, solver.tau, lid=solver.lid, inflow=solver.speed if solver.inflow else None,
                  centred=solver.centred, linear=solver.linear, regularized=solver.regularized,
-                 sponge=solver.sponge, dtype=solver.dtype)
+                 sponge=solver.sponge, dtype=solver.dtype, rows=mesh_rows)
     with device:
         down = tack.array(np.array([taus[lv + 1] / (2 * taus[lv]) for lv in range(finest + 1)],
                                    dtype.numpy_dtype))

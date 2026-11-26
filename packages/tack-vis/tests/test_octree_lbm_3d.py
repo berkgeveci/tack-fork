@@ -116,6 +116,8 @@ def test_three_levels_and_remeshes_conserve_mass_and_momentum():
     for _ in range(3):
         m0, p0 = s.mass(), np.array(s.momentum())
         s, _ = adapt(s, 0.003, 0.0015, finest=2)
+        # The rows the remesh renumbered are the rows made from the roots.
+        assert np.array_equal(s.rows.numpy(), lb._rows(s.octree, s.octree.periodic).numpy())
         assert abs(s.mass() - m0) < 1e-13 * m0
         assert np.abs(np.array(s.momentum()) - p0).max() < 1e-13
         s.step(3)
