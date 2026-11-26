@@ -148,3 +148,30 @@ def test_a_uniform_flow_stays_uniform_across_levels():
     keep = s.computational()
     for v, expected in ((rho, 1.0), (ux, 0.05), (uy, -0.02), (uz, 0.03)):
         assert np.abs(v[keep] - expected).max() < 1e-13
+
+
+def test_filling_ghosts_between_steps_changes_nothing_the_solver_computes():
+    # A display fills the ghosts from their parents before every frame; the
+    # solver must step exactly as if it had not.
+    a, b = (_refined(_corner, 2, regularized=True) for _ in range(2))
+    for s in (a, b):
+        c, _ = s.centres()
+        s.initialize(*_field(c))
+    for _ in range(4):
+        a.step(2)
+        b.fill_ghosts()
+        b.step(2)
+    keep = a.computational()
+    fa, fb = (s.f.numpy().reshape(-1, 27)[keep] for s in (a, b))
+    assert np.array_equal(fa, fb)
+    # The ghosts now hold their parents' values, linear in the parents' gradients:
+    # a uniform flow's ghosts are the flow.
+    s = _refined(_corner, 2)
+    s.initialize(1.0, 0.05, -0.02, 0.03)
+    s.step(3)
+    s.fill_ghosts()
+    rho, ux, uy, uz = s.moments()
+    ghosts = s.role == lb.GHOST
+    assert ghosts.any()
+    for v, expected in ((rho, 1.0), (ux, 0.05), (uy, -0.02), (uz, 0.03)):
+        assert np.abs(v[ghosts] - expected).max() < 1e-13

@@ -445,12 +445,9 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
         scratch = tack.empty((final * q,), dtype)
         _transfer(role2, mapped, src, how, solver.f, solver.grad, solver.number, solver.table,
                   octree.level, down, upward, q, d, scratch, new.f)
-        # Ghosts from their parents, as the next step's explosion would (the
-        # solver reads none before that, but whoever looks at the state does).
-        for lv in range(new.finest + 1):
-            if len(new.interface[lv]):
-                lb._explode(new.interface[lv], new.number, new.table, new.f, new.grad, new.out, q,
-                            d)
+    # Ghosts from their parents, as the next step's explosion would (the solver
+    # reads none before that, but whoever looks at the state does).
+    new.fill_ghosts()
     new.steps = solver.steps
     wanted = want.numpy()
     stats = {"refined": int(((wanted == 1) & np.isin(role, (lb.REAL, lb.INTERFACE))).sum()),

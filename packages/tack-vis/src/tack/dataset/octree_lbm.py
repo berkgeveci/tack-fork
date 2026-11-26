@@ -819,6 +819,26 @@ class LBM:
         times its substeps."""
         return sum(len(c) << lv for lv, c in enumerate(self.computed))
 
+    def fill_ghosts(self):
+        """Give every ghost its parent's values, linear in the parent's gradient
+        (as the next step's explosion will, without its half-step lead), for
+        whatever looks at the state between steps: the vorticity, a contour.
+        Between steps the solver itself reads no ghost, gradient or ``out``
+        value before writing it, so this changes nothing it computes. Coarse
+        levels first, since a finer interface cell's gradient may read the
+        ghosts beside it."""
+        q, d = self.q, self.dim
+        with self.octree.device:
+            self.out.fill(0.0)
+            for lv in range(self.finest):
+                if not len(self.interface[lv]):
+                    continue
+                if self.linear:
+                    _gradients(self.interface[lv], self.rows, self.octree.level,
+                               self.role_array, lv, q, d, self.f, self.grad)
+                _explode(self.interface[lv], self.number, self.table, self.f, self.grad,
+                         self.out, q, d)
+
     # -- stepping -------------------------------------------------------------
 
     def step(self, count=1):

@@ -8,7 +8,8 @@ steps on the CPU while VTK shows
 
 - above, the wake: a surface of constant vorticity magnitude, contoured on the
   solver's own octree by the study's octree contour (``octree_contour``),
-  ghosts and all;
+  ghosts and all (filled from their parents before every frame, so the
+  surface does not change with where the frame falls in the solver's cycle);
 - below, the mid-plane: the cells it cuts, coloured by vorticity magnitude,
   their edges showing the levels as they follow the wake.
 
@@ -214,6 +215,7 @@ def main():
 
     def show():
         s = state["solver"]
+        s.fill_ghosts()           # ghosts from their parents, the same on every frame
         with s.octree.device:
             w = tack.zeros((s.octree.num_nodes,), s.dtype)
             for nodes in state["nodes"]:
