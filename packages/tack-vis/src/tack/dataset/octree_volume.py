@@ -556,6 +556,18 @@ def sub_ranges(octree, tents, r, grid, lasts, lows, highs, shift=2):
 # -- the renderer ------------------------------------------------------------------------
 
 
+@tack.kernel
+def _blend(volume, frame, out):
+    # The volume (premultiplied RGBA) over the frame's 8-bit colour, 8-bit RGBA
+    # out, as tack_composite.composite blends on the host.
+    for k in range(volume.shape[0]):
+        v = volume[k]
+        for c in range(3):
+            x = v[c] + (1.0 - v[3]) * tack.f32(frame[4 * k + c]) * (1.0 / 255.0)
+            out[4 * k + c] = tack.u8(min(max(x, 0.0), 1.0) * 255.0 + 0.5)
+        out[4 * k + 3] = tack.u8(255)
+
+
 class OctreeRenderer:
     """An octree's cell field ``name`` as a volume Tack renders with the AMR work's
     march: ``render`` gives the picture as premultiplied RGBA, to blend into a
@@ -595,6 +607,38 @@ class OctreeRenderer:
         """The volume seen by ``camera`` (a ``vtkCamera``) at ``size`` (w, h):
         ``(h, w, 4)`` f32, premultiplied, row 0 at the top; as
         ``tack_composite.TackRenderer.render``. ``timings`` holds the parts."""
+        import time
+
+        out = self._march(camera, size, table, lo, hi, depth, sample_distance, unit_distance,
+                          min_step, jitter)
+        t = time.perf_counter()
+        with self.octree.device:
+            picture = out.numpy().reshape(size[1], size[0], 4)
+        self.timings["read_ms"] = 1000 * (time.perf_counter() - t)
+        return picture
+
+    def render_over(self, frame, camera, size, table, lo, hi, depth=None, sample_distance=0.5,
+                    unit_distance=1.0, min_step=0.0, jitter=0.0):
+        """The volume blended over ``frame`` (``(h, w, 4)`` u8, row 0 at the top, the
+        colour VTK drew) on the device: ``(h, w, 4)`` u8. The volume's RGBA never
+        comes to the host; ``timings["blend_ms"]`` is the upload, the kernel
+        and the read."""
+        import time
+
+        out = self._march(camera, size, table, lo, hi, depth, sample_distance, unit_distance,
+                          min_step, jitter)
+        t = time.perf_counter()
+        with self.octree.device:
+            colour = tack.array(np.ascontiguousarray(frame, np.uint8).reshape(-1), tack.u8)
+            blended = tack.empty((len(colour),), tack.u8)
+            _blend(out, colour, blended)
+            picture = blended.numpy().reshape(size[1], size[0], 4)
+        self.timings["blend_ms"] = 1000 * (time.perf_counter() - t)
+        return picture
+
+    def _march(self, camera, size, table, lo, hi, depth, sample_distance, unit_distance,
+               min_step, jitter):
+        """The march: the volume's premultiplied RGBA, a device array of ``w * h``."""
         import time
 
         tack_march, tack_composite, volume_tack = self._modules
@@ -642,7 +686,5 @@ class OctreeRenderer:
                              float(jitter), int(w), near, asked, out)
             tack.sync()
             t2 = time.perf_counter()
-            picture = out.numpy().reshape(h, w, 4)
-        self.timings = {"rays_ms": 1000 * (t1 - t0), "march_ms": 1000 * (t2 - t1),
-                        "read_ms": 1000 * (time.perf_counter() - t2)}
-        return picture
+        self.timings = {"rays_ms": 1000 * (t1 - t0), "march_ms": 1000 * (t2 - t1)}
+        return out
