@@ -425,11 +425,11 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
         role2, mapped = (tack.empty((final,), tack.i32) for _ in range(2))
         _place_ghosts(count2, start2, tree, lev, key, logical.marks, refined_mark, solid_flag, d,
                       tree2, lev2, key2, role2, mapped)
-    roles = role2.numpy()
-    mesh = OctreeDataSet(octree.roots, tree2, lev2, key2, fields={"role": roles}, _ordered=True,
+    mesh = OctreeDataSet(octree.roots, tree2, lev2, key2, fields={"role": role2}, _ordered=True,
                          _adopt=True)
     mesh.periodic = periodic
     if solid is not None:
+        roles = role2.numpy()
         lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in mesh.geometry())
         inside = np.asarray(solid(*(lo[:, :d] + 0.5 * size[:, :d]).T), bool) & (roles != lb.REFINED)
         if (inside & (roles != lb.SOLID) & ((roles != lb.REAL) | (mesh._level != mesh.finest))).any():

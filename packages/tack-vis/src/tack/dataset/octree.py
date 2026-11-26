@@ -73,6 +73,21 @@ def _node_geometry(tree, level, key, root_lo, root_size, dimension, one, lo, siz
 
 
 @tack.kernel
+def _leaf_marks(tree, level, key, dimension, refined, count, marks):
+    # `_leaves` on the device for ``count`` nodes in pre-order: a node is
+    # refined when the next node is its child, and its mark is then
+    # ``refined``. The count is a scalar: a shape read in the body would be
+    # compiled in, a variant a mesh size.
+    for n in range(count):
+        mark = 0
+        if n + 1 < count:
+            if tree[n + 1] == tree[n] and level[n + 1] == level[n] + 1 and \
+                    (key[n + 1] >> tack.u64(dimension)) == key[n]:
+                mark = refined
+        marks[n] = tack.u8(mark)
+
+
+@tack.kernel
 def _leaf_corners(leaf, tree, level, key, nx, ny, dimension, finest, ci, cj, ck):
     # Each leaf's 2^d corners on the lattice of the finest level over every root
     # cell (root t's lower corner at (tx, ty, tz) * 2^finest): corner v of leaf
@@ -278,7 +293,13 @@ class OctreeDataSet:
         if not len(tree) == len(level) == len(key):
             raise ValueError("tree, level and key give each node: one of each per node")
         d = self.dimension
-        if len(level) and (level.min() < 0 or level.max() > MAX_LEVEL[d]):
+        # Adopted nodes in pre-order come from a filter that made them on the
+        # device (`octree_lbm_adapt.adapt`): they are not checked again on the
+        # host, and their marks are made there (at 1.9M nodes, ~60 ms a mesh).
+        trusted = _adopt and _ordered and mask is None
+        if trusted:
+            pass
+        elif len(level) and (level.min() < 0 or level.max() > MAX_LEVEL[d]):
             raise ValueError(f"levels run from 0 to {MAX_LEVEL[d]} in {d}D")
         if len(tree) and (tree.min() < 0 or tree.max() >= roots.num_cells):
             raise ValueError(f"trees are the roots' cells, 0 to {roots.num_cells - 1}")
@@ -295,8 +316,9 @@ class OctreeDataSet:
             order = _preorder(tree, level, key, d)
             self._tree, self._level, self._key = tree[order], level[order], key[order]
             _check_ancestors(self._tree, self._level, self._key, d)
-        leaf = _leaves(self._tree, self._level, self._key, d)
-        marks = np.where(leaf, 0, Ghosts.REFINEDCELL).astype(np.uint8)
+        if not trusted:
+            leaf = _leaves(self._tree, self._level, self._key, d)
+            marks = np.where(leaf, 0, Ghosts.REFINEDCELL).astype(np.uint8)
         if mask is not None:
             mask = np.asarray(arrays.to_host(mask) if isinstance(mask, tack.Array) else mask
                               ).reshape(-1)
@@ -309,10 +331,20 @@ class OctreeDataSet:
                 self.tree = tack.array(self._tree, tack.i64)
                 self.level = tack.array(self._level.astype(np.int32), tack.i32)
                 self.key = tack.array(self._key, tack.u64)
-            self.marks = tack.array(marks, tack.u8)
+            if trusted:
+                self.marks = tack.empty((len(order),), tack.u8)
+                if len(order):
+                    _leaf_marks(self.tree, self.level, self.key, d, int(Ghosts.REFINEDCELL),
+                                len(order), self.marks)
+            else:
+                self.marks = tack.array(marks, tack.u8)
         self.fields = {}
         for name, values in (fields or {}).items():
-            self.fields[name] = _reordered(values, order, device, len(order), name)
+            if trusted and isinstance(values, tack.Array) and values.device == device and \
+                    values.shape == (len(order),):
+                self.fields[name] = values            # handed over, as tree, level and key
+            else:
+                self.fields[name] = _reordered(values, order, device, len(order), name)
         unknown = set(units or {}) - set(self.fields)
         if unknown:
             raise KeyError(f"units for fields not given: {', '.join(map(repr, sorted(unknown)))}")
