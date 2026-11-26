@@ -860,15 +860,19 @@ class LBM:
             self.f = tack.zeros((n * q,), self.dtype)
             self.out = tack.zeros((n * q,), self.dtype)
         self.steps = 0
+        self._centres = None
 
     # -- state ----------------------------------------------------------------
 
     def centres(self):
-        """Each node's centre and side, host arrays ``(n, d)`` and ``(n,)``."""
-        lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in
-                    self.octree.geometry())
-        d = self.dim
-        return lo[:, :d] + 0.5 * size[:, :d], size[:, 0]
+        """Each node's centre and side, host arrays ``(n, d)`` and ``(n,)``, read
+        once (the mesh is the solver's for good); not to be written."""
+        if self._centres is None:
+            lo, size = (np.asarray(a.numpy(), np.float64).reshape(-1, 3) for a in
+                        self.octree.geometry())
+            d = self.dim
+            self._centres = (lo[:, :d] + 0.5 * size[:, :d], size[:, 0])
+        return self._centres
 
     def initialize(self, rho, ux, uy, uz=0.0):
         """Every node at equilibrium for its density and velocity (one value a
@@ -900,7 +904,7 @@ class LBM:
 
     def computational(self):
         """Which nodes are cells of the solution: real leaves and interface cells."""
-        return np.isin(self.role, (REAL, INTERFACE))
+        return (self.role == REAL) | (self.role == INTERFACE)
 
     def mass(self):
         """The total mass: density times volume over the computational cells."""

@@ -364,9 +364,10 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
     n = octree.num_nodes
     centre, _ = solver.centres()
     xlo, xhi = region if region is not None else (-np.inf, np.inf)
-    leaves = np.flatnonzero(np.isin(role, (lb.REAL, lb.INTERFACE))).astype(np.int64)
+    computational = solver.computational()
+    leaves = np.flatnonzero(computational).astype(np.int64)
     refined_nodes = np.flatnonzero(role == lb.REFINED).astype(np.int64)
-    parents_of = np.flatnonzero(np.isin(role, (lb.REFINED, lb.INTERFACE))).astype(np.int64)
+    parents_of = np.flatnonzero((role == lb.REFINED) | (role == lb.INTERFACE)).astype(np.int64)
     taus = [0.5 + (1 << lv) * (solver.tau - 0.5) for lv in range(finest + 2)]
     holes = 5 if d == 2 else 14
     device = octree.device
@@ -454,7 +455,7 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
     new.fill_ghosts()
     new.steps = solver.steps
     wanted = want.numpy()
-    stats = {"refined": int(((wanted == 1) & np.isin(role, (lb.REAL, lb.INTERFACE))).sum()),
+    stats = {"refined": int(((wanted == 1) & computational).sum()),
              "merged": int(merge.numpy().sum()), "cells": int(new.computational().sum()),
              "rounds": rounds, "ms": 1000 * (time.perf_counter() - begin)}
     return new, stats
