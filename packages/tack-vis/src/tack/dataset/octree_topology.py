@@ -101,18 +101,29 @@ def _holder(gi, gj, gk, nx, ny, nz, finest, dimension, tree, carried, level, cou
     return found
 
 
+# Offset o's components in a row of 3^d (x fastest), as 32-bit tables: o % 3 - 1,
+# (o // 3) % 3 - 1, o // 9 - 1. A GPU has no integer division (Metal emulates
+# 64-bit division, the loops' indices being 64-bit), and these run for every
+# entry of every row: on an M1 Max a remesh's rows at 1.9M nodes took about 50
+# ms in these kernels with the divisions.
+_OX = tack.constant(tuple(o % 3 - 1 for o in range(27)), tack.i32)
+_OY = tack.constant(tuple((o // 3) % 3 - 1 for o in range(27)), tack.i32)
+_OZ = tack.constant(tuple(o // 9 - 1 for o in range(27)), tack.i32)
+
+
 @tack.func
 def _parent_offset(j, o, dimension):
     # Child j's (its octant's bits, x lowest) neighbour at offset o is in its
     # parent's neighbour at this offset of the parent's row: the child lattice
     # position (u) of the neighbour is -1..2 along each axis, in the parent's
     # neighbour at its half (-1, 0, 0, 1).
-    ux = (j & 1) + o % 3 - 1
-    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
-    po = (ux + 2) // 2 + 3 * ((uy + 2) // 2)
+    # (u + 2 is 1 to 4, so halving it is a shift.)
+    ux = tack.i32(j & 1) + _OX[o]
+    uy = tack.i32((j >> 1) & 1) + _OY[o]
+    po = ((ux + 2) >> 1) + 3 * ((uy + 2) >> 1)
     if dimension == 3:
-        uz = ((j >> 2) & 1) + o // 9 - 1
-        po = po + 9 * ((uz + 2) // 2)
+        uz = tack.i32((j >> 2) & 1) + _OZ[o]
+        po = po + 9 * ((uz + 2) >> 1)
     return po
 
 
@@ -120,11 +131,11 @@ def _parent_offset(j, o, dimension):
 def _octant(j, o, dimension):
     # ...and, when that neighbour is refined, at this octant of it: the child
     # lattice position's parity.
-    ux = (j & 1) + o % 3 - 1
-    uy = ((j >> 1) & 1) + (o // 3) % 3 - 1
+    ux = tack.i32(j & 1) + _OX[o]
+    uy = tack.i32((j >> 1) & 1) + _OY[o]
     c = ((ux + 2) & 1) + 2 * ((uy + 2) & 1)
     if dimension == 3:
-        uz = ((j >> 2) & 1) + o // 9 - 1
+        uz = tack.i32((j >> 2) & 1) + _OZ[o]
         c = c + 4 * ((uz + 2) & 1)
     return c
 
@@ -150,16 +161,16 @@ def _grid_rows(roots, tree, root_of, nx, ny, nz, wx, wy, wz, dimension, span, ro
     # Each root's 3^d neighbours on the roots' grid (x fastest), wrapping along
     # the axes w marks, -1 beyond the grid or where no tree has nodes.
     for k in range(roots.shape[0]):
-        t = tree[roots[k]]
+        t = tack.i32(tree[roots[k]])            # a root's index: 32 bits, a division each
         x = t % nx
         y = (t // nx) % ny
         z = t // (nx * ny)
         for o in range(span):
-            a = x + o % 3 - 1
-            b = y + (o // 3) % 3 - 1
+            a = x + _OX[o]
+            b = y + _OY[o]
             c = z
             if dimension == 3:
-                c = z + o // 9 - 1
+                c = z + _OZ[o]
             inside = 1
             if wx == 1:
                 a = (a + nx) % nx
@@ -180,9 +191,9 @@ def _grid_rows(roots, tree, root_of, nx, ny, nz, wx, wy, wz, dimension, span, ro
 
 
 @tack.kernel
-def _root_neighbourhoods(rows, count, span, out):
+def _root_neighbourhoods(rows, count, span, centre, out):
     for k in range(count):
-        n = rows[k * span + span // 2]
+        n = rows[k * span + centre]
         for o in range(span):
             out[n * span + o] = rows[k * span + o]
 
@@ -217,7 +228,7 @@ def neighbourhoods(octree):
         out = tack.empty((n * span,), tack.i32)
         if n:
             rows = root_rows(octree)
-            _root_neighbourhoods(rows, len(rows) // span, span, out)
+            _root_neighbourhoods(rows, len(rows) // span, span, span // 2, out)
             for nodes in reversed(refined_by_level(octree)):
                 _child_neighbourhoods(nodes, number, table, octree.marks,
                                       int(Ghosts.REFINEDCELL), d, span, out)

@@ -221,7 +221,7 @@ def _rows(octree, periodic):
     number, table = children(octree)
     with octree.device:
         out = tack.empty((octree.num_nodes * span,), tack.i32)
-        _root_neighbourhoods(rows, len(rows) // span, span, out)
+        _root_neighbourhoods(rows, len(rows) // span, span, span // 2, out)
         for nodes in reversed(refined_by_level(octree)):
             _child_neighbourhoods(nodes, number, table, octree.marks, int(Ghosts.REFINEDCELL), d,
                                   span, out)
@@ -795,7 +795,7 @@ class LBM:
     fast on a GPU with f64, and the choice on most GPUs, whose f64 is slow)."""
 
     def __init__(self, octree, tau, lid=0.0, inflow=None, centred=True, linear=True,
-                 regularized=False, sponge=None, dtype=None):
+                 regularized=False, sponge=None, dtype=None, rows=None):
         self.octree = octree
         self.dim = d = octree.dimension
         self.q = q = 3 ** d
@@ -817,7 +817,9 @@ class LBM:
         self.centred = centred
         self.linear = linear
         periodic = tuple(getattr(octree, "periodic", (False,) * d))
-        self.rows = _rows(octree, periodic)
+        # ``rows``: the mesh's rows made elsewhere (a remesh renumbers its logical
+        # octree's), as ``_rows`` would make them.
+        self.rows = rows if rows is not None else _rows(octree, periodic)
         self.number, self.table = children(octree)
         n = octree.num_nodes
         dims = [s - 1 for s in octree.roots.topology.point_dims]
