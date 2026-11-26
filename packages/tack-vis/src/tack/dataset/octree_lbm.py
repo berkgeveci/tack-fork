@@ -65,6 +65,12 @@ where a wall crosses two interface layers (three levels or more) about
 1e-9 of the mass is lost a step, since the rule would have to recurse
 through the levels. Periodic axes wrap the roots' rows.
 
+**Obstacles and open sides.** ``SOLID`` leaves (``lbm_mesh(solid=)``, at the
+finest level) bounce packets back at their faces, a staircase. With
+``inflow``, the left side is an equilibrium inlet and the right side a
+zero-gradient outlet; keep interfaces off both, which the wall rule does not
+cover.
+
 Not here yet: refining and coarsening during the solve, the device's side of
 the mesh (``lbm_mesh`` is NumPy and sets), 3D.
 """
@@ -81,9 +87,9 @@ from tack.dataset.octree_topology import (
     refined_by_level,
 )
 
-__all__ = ["GHOST", "INTERFACE", "LBM2D", "REAL", "REFINED", "lbm_mesh"]
+__all__ = ["GHOST", "INTERFACE", "LBM2D", "REAL", "REFINED", "SOLID", "lbm_mesh"]
 
-REAL, INTERFACE, GHOST, REFINED = 0, 1, 2, 3
+REAL, INTERFACE, GHOST, REFINED, SOLID = 0, 1, 2, 3, 4
 _AROUND = [(a, b) for b in (-1, 0, 1) for a in (-1, 0, 1) if (a, b) != (0, 0)]
 
 
@@ -98,12 +104,15 @@ def _morton(i, j, level):
     return key
 
 
-def lbm_mesh(shape, refine, finest, periodic=(True, True), spacing=1.0, device=None):
+def lbm_mesh(shape, refine, finest, periodic=(True, True), spacing=1.0, solid=None,
+             device=None):
     """A quadtree for ``LBM2D``: ``shape`` root cells of side ``spacing``, each leaf
     at level ``l < finest`` split while ``refine(x, y, side)`` (its centre and
     side) says so, then 2:1 balanced across faces and corners (``periodic``
-    axes wrapping) and given its interface layer. The nodes' roles are the
-    field ``"role"``."""
+    axes wrapping) and given its interface layer. Leaves whose centre
+    ``solid(x, y)`` holds are ``SOLID`` (an obstacle, staircased): they must be
+    at the finest level, and so must the cells around them. The nodes' roles
+    are the field ``"role"``."""
     nx, ny = shape
     leaves = [set() for _ in range(finest + 2)]
     leaves[0] = {(i, j) for j in range(ny) for i in range(nx)}
@@ -164,6 +173,14 @@ def lbm_mesh(shape, refine, finest, periodic=(True, True), spacing=1.0, device=N
             cells += [(level, 2 * i + s, 2 * j + t, GHOST) for i, j in interface[level - 1]
                       for s in (0, 1) for t in (0, 1)]
     level, i, j, role = (np.array(v, np.int64) for v in zip(*cells))
+    if solid is not None:
+        h = spacing / (1 << level)
+        inside = np.array([bool(solid(x, y)) for x, y in zip((i + 0.5) * h, (j + 0.5) * h)])
+        inside &= role != REFINED                     # refined nodes hold nothing
+        if (inside & ((role != REAL) | (level != finest))).any():
+            raise ValueError("solid cells must be real leaves at the finest level: refine "
+                             "around the obstacle")
+        role[inside] = SOLID
     tree = (i >> level) + nx * (j >> level)
     mask = (np.int64(1) << level) - 1
     key = _morton(i & mask, j & mask, level)
@@ -309,17 +326,26 @@ def _source(n, d, x, y, rows, role, px, py, side, lx, ly, f, grad, half):
 
 
 @tack.func
-def _wall(n, o, finest, rows, role, px, py, side, lx, ly, width, height, f, grad, half, lid):
-    # Halfway bounce-back of direction o at node n, whose upstream neighbour is
-    # beyond a wall: the opposite value, with the lid's momentum at the top
-    # wall. A diagonal at a level with finer ones takes what its four quarters
-    # get over two steps of the next level (a diagonal retraces its line, into
-    # the neighbours along the wall), as the ghosts there do: the plain rule
-    # would keep packets the ghosts take.
+def _wall(n, o, finest, rows, role, px, py, side, lx, ly, width, height, f, grad, half, lid,
+          inflow, speed):
+    # Direction o at node n, whose upstream neighbour is beyond the domain.
+    # With ``inflow``, the left side is an inlet (equilibrium at density 1 and
+    # ``speed`` along x) and the right an outlet (the cell's own value: zero
+    # gradient). Elsewhere a wall: halfway bounce-back, the opposite value,
+    # with the lid's momentum at the top wall. A diagonal at a level with finer
+    # ones takes what its four quarters get over two steps of the next level
+    # (a diagonal retraces its line, into the neighbours along the wall), as
+    # the ghosts there do: the plain rule would keep packets the ghosts take.
     cx = o % 3 - 1
     cy = o // 3 - 1
     v = f[n * 9 + 8 - o]
-    if cx == 0 or cy == 0 or finest == 1:
+    upstream = px[n] - cx * side[n]
+    if inflow == 1 and width > 0.0 and upstream < 0.0:
+        cu = 3.0 * cx * speed
+        v = _weight(cx, cy) * (1.0 + cu + 0.5 * cu * cu - 1.5 * speed * speed)
+    elif inflow == 1 and width > 0.0 and upstream > width:
+        v = f[n * 9 + o]
+    elif cx == 0 or cy == 0 or finest == 1:
         if cy == -1 and rows[n * 9 + 7] < 0:
             v = v + 6.0 * _weight(cx, cy) * cx * lid
     else:
@@ -348,21 +374,27 @@ def _wall(n, o, finest, rows, role, px, py, side, lx, ly, width, height, f, grad
 
 
 @tack.kernel
-def _pull(nodes, rows, role, finest, px, py, side, lx, ly, width, height, f, grad, out, lid):
+def _pull(nodes, rows, role, finest, px, py, side, lx, ly, width, height, f, grad, out, lid,
+          inflow, speed):
+    # A real leaf's pull: from the node upstream at its level, bouncing back
+    # from a solid one, or from beyond the domain (``_wall``).
     for k in range(nodes.shape[0]):
         n = nodes[k]
         for o in range(9):
             q = rows[n * 9 + 8 - o]
             if q >= 0:
-                out[n * 9 + o] = f[q * 9 + o]
+                if role[q] == 4:
+                    out[n * 9 + o] = f[n * 9 + 8 - o]
+                else:
+                    out[n * 9 + o] = f[q * 9 + o]
             else:
                 out[n * 9 + o] = _wall(n, o, finest, rows, role, px, py, side, lx, ly, width,
-                                       height, f, grad, out, lid)
+                                       height, f, grad, out, lid, inflow, speed)
 
 
 @tack.kernel
 def _pull_ghosts(nodes, parent, rows, level, role, at, finest, second, px, py, side, lx, ly, width,
-                 height, f, grad, out, lid):
+                 height, f, grad, out, lid, inflow, speed):
     # A ghost's pull: from the node upstream at its level; from a coarser cell
     # upstream, that cell's value at the first substep and, at the second, the
     # value of the cell two fine steps upstream, the parent's upstream
@@ -377,7 +409,9 @@ def _pull_ghosts(nodes, parent, rows, level, role, at, finest, second, px, py, s
             q = rows[n * 9 + 8 - o]
             if q < 0:
                 out[n * 9 + o] = _wall(n, o, finest, rows, role, px, py, side, lx, ly, width,
-                                       height, f, grad, out, lid)
+                                       height, f, grad, out, lid, inflow, speed)
+            elif role[q] == 4:
+                out[n * 9 + o] = f[n * 9 + 8 - o]
             elif level[q] == at:
                 out[n * 9 + o] = f[q * 9 + o]
             elif second == 0:
@@ -402,7 +436,7 @@ def _usable(q, level, role, at):
     # A neighbour to difference with: a node at the level that holds values.
     use = 0
     if q >= 0:
-        if level[q] == at and role[q] != 3:
+        if level[q] == at and role[q] < 3:
             use = 1
     return use
 
@@ -539,13 +573,18 @@ def _moments(f, rho, ux, uy):
 
 class LBM2D:
     """D2Q9 BGK on ``octree`` (from ``lbm_mesh``) with relaxation time ``tau`` at
-    level 0 and a lid moving at ``lid`` (lattice units) on the top wall. One
-    ``step`` is one step of level 0: ``2^l`` of level ``l``. Values are in
-    lattice units of level 0: a root cell is 1 and so is its time step."""
+    level 0, a lid moving at ``lid`` (lattice units) on the top wall, and, with
+    ``inflow`` (a speed along x), an inlet on the left side and an outlet on
+    the right. One ``step`` is one step of level 0: ``2^l`` of level ``l``.
+    Values are in lattice units of level 0: a root cell is 1 and so is its time
+    step. ``centred`` and ``linear`` switch the explosion's corrections off,
+    for comparison."""
 
-    def __init__(self, octree, tau, lid=0.0, centred=True, linear=True):
+    def __init__(self, octree, tau, lid=0.0, inflow=None, centred=True, linear=True):
         self.octree = octree
         self.lid = float(lid)
+        self.inflow = 0 if inflow is None else 1
+        self.speed = 0.0 if inflow is None else float(inflow)
         self.finest = octree.finest
         device = octree.device
         self.dtype = _compute_type(device, tack.f32)
@@ -676,12 +715,12 @@ class LBM2D:
         if len(self.real[lv]):
             _pull(self.real[lv], self.rows, self.role_array, finest, self.px, self.py, self.side,
                   self.lengths[0], self.lengths[1], self.walls[0], self.walls[1], f, self.grad, out,
-                  self.lid)
+                  self.lid, self.inflow, self.speed)
         if len(self.ghosts[lv]):
             _pull_ghosts(self.ghosts[lv], self.parent, self.rows, self.octree.level,
                          self.role_array, lv, finest, second, self.px, self.py, self.side,
                          self.lengths[0], self.lengths[1], self.walls[0], self.walls[1], f,
-                         self.grad, out, self.lid)
+                         self.grad, out, self.lid, self.inflow, self.speed)
         if len(self.interface[lv]):
             _coalesce(self.interface[lv], self.number, self.table, f, out)
         for nodes in (self.real[lv], self.ghosts[lv], self.interface[lv]):

@@ -50,7 +50,7 @@ def exact(c, n, nu, t):
 
 class Vorticity:
     """Vorticity at the computational cells from their neighbours at their level
-    (central differences, one-sided beside a refined node)."""
+    (central differences, one-sided beside a refined node or a solid)."""
 
     def __init__(self, solver):
         rows = solver.rows.numpy().reshape(-1, 9)
@@ -61,9 +61,9 @@ class Vorticity:
         for lo, hi in ((3, 5), (1, 7)):              # west/east, south/north
             a, b = rows[self.keep, lo], rows[self.keep, hi]
             use_a = (a >= 0) & (level[np.maximum(a, 0)] == level[self.keep]) & \
-                (role[np.maximum(a, 0)] != lb.REFINED)
+                (role[np.maximum(a, 0)] <= lb.GHOST)
             use_b = (b >= 0) & (level[np.maximum(b, 0)] == level[self.keep]) & \
-                (role[np.maximum(b, 0)] != lb.REFINED)
+                (role[np.maximum(b, 0)] <= lb.GHOST)
             self.pairs.append((np.maximum(a, 0), np.maximum(b, 0), use_a, use_b))
 
     def __call__(self, ux, uy):
