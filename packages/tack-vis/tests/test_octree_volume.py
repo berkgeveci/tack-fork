@@ -170,3 +170,24 @@ def test_corner_interpolation_is_the_tents_at_the_corners():
     _sample_points(exact, tack.array(q.astype(np.float32), tack.vec3(tack.f32)), octree.finest + 1,
                    values, sizes)
     np.testing.assert_allclose(values.numpy(), corners[:, 4], rtol=1e-4, atol=1e-5)
+
+
+def test_the_balanced_corner_kernel_is_the_tents_at_the_corners():
+    # A tree refined to a blob is 2:1 balanced where _octree's random one is not:
+    # a uniform grid refined once in a box.
+    from test_octrees import ramses_like
+
+    import tack.dataset as td
+    roots, levels, centres, rho, _ = ramses_like(d=3, trees=(3, 2, 2), levelmin=2, levelmax=3)
+    octree = td.OctreeDataSet.from_cells(roots, levels, centres, fields={"rho": rho})
+    from tack.dataset.octree_topology import face_neighbours
+    faces = face_neighbours(octree).numpy().reshape(-1, 6)
+    leaves = np.flatnonzero(octree.is_leaf)
+    across = faces[leaves]
+    held = across >= 0
+    assert (np.abs(octree._level[across[held]] - np.repeat(octree._level[leaves], 6)[held.reshape(-1)]) <= 1).all()
+    fast = ov.OctreeTents(octree, "rho", blend=2, balanced=1)
+    slow = ov.OctreeTents(octree, "rho", blend=2, balanced=0)
+    a = np.asarray(fast.corners.numpy()).reshape(-1, 8)[leaves]
+    b = np.asarray(slow.corners.numpy()).reshape(-1, 8)[leaves]
+    np.testing.assert_allclose(a, b, rtol=2e-3, atol=2e-3)       # the slow form samples a hair inside

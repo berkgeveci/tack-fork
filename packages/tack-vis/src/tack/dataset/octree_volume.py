@@ -115,9 +115,14 @@ class OctreeTents:
         if int(blend) == 2:
             exact = OctreeTents(octree, name, blend=1, balanced=balanced)
             with octree.device:
-                lo, size = octree.geometry()
                 self.corners = tack.empty((max(octree.num_nodes, 1) * 8,), tack.f32)
-                if octree.num_nodes:
+                if octree.num_nodes and int(balanced) == 1:
+                    nx, ny = self.nx, self.ny
+                    _corner_values_balanced(exact, octree.tree, octree.level, octree.key,
+                                            octree.marks, int(Ghosts.REFINEDCELL), nx, ny,
+                                            self.corners)
+                elif octree.num_nodes:
+                    lo, size = octree.geometry()
                     _corner_values(exact, lo, size, octree.marks, int(Ghosts.REFINEDCELL),
                                    octree.finest + 1, self.corners)
         #: Whether neighbouring leaves differ by at most one level (xRAGE, RAMSES):
@@ -180,6 +185,92 @@ class OctreeTents:
         return n
 
     @tack.func
+    def holder_at(self, level, i, j, k):
+        """The node holding lattice cell ``(i, j, k)`` of ``level``: the node of that
+        level there, or the coarser leaf holding it, and its depth; -1 beyond
+        the roots."""
+        n = tack.i32(-1)
+        d = 0
+        ti = i >> level
+        tj = j >> level
+        tk = k >> level
+        if i >= 0 and j >= 0 and k >= 0 and ti < self.nx and tj < self.ny and tk < self.nz:
+            n = self.roots[ti + self.nx * (tj + self.ny * tk)]
+            left = level
+            while n >= 0 and left > 0 and self.values[n] == REFINED:
+                left -= 1
+                d += 1
+                n = self.table[(self.number[n] - 1) * 8 + ((i >> left) & 1) +
+                               2 * ((j >> left) & 1) + 4 * ((k >> left) & 1)]
+        return n, d
+
+    @tack.func
+    def corner_value(self, n, depth, i, j, k, c):
+        """The tents at corner ``c`` (x the lowest bit) of leaf ``n`` at ``depth``,
+        whose lattice cell at that depth is ``(i, j, k)``, in a balanced tree:
+        the leaf and its seven neighbours toward the corner at its level, each
+        a leaf's tent at the corner with its own box, a refined one's leaves
+        down the chain of cells at the corner, each weighing an eighth."""
+        f = tack.f32(1 << depth)
+        hx = self.sx / f
+        hy = self.sy / f
+        hz = self.sz / f
+        vx = self.ox + tack.f32(i + (c & 1)) * hx
+        vy = self.oy + tack.f32(j + ((c >> 1) & 1)) * hy
+        vz = self.oz + tack.f32(k + ((c >> 2) & 1)) * hz
+        num = 0.0
+        den = 0.0
+        seen = tack.local_array(tack.i32, 8)
+        count = 0
+        for s in range(8):
+            # The level-depth cell around the corner in octant s.
+            qi = i + (c & 1) - 1 + (s & 1)
+            qj = j + ((c >> 1) & 1) - 1 + ((s >> 1) & 1)
+            qk = k + ((c >> 2) & 1) - 1 + ((s >> 2) & 1)
+            q, dq = self.holder_at(depth, qi, qj, qk)
+            if q >= 0:
+                new = 1
+                for t in range(count):
+                    if seen[t] == q:
+                        new = 0
+                if new == 1:
+                    seen[count] = q
+                    count += 1
+                    u = self.values[q]
+                    if u == REFINED:
+                        # Down the chain of cells at the corner: the child in the
+                        # octant facing the corner, 7 - s.
+                        m = q
+                        while m >= 0 and self.values[m] == REFINED:
+                            m = self.table[(self.number[m] - 1) * 8 + (7 - s)]
+                        if m >= 0:
+                            u = self.values[m]
+                            if u > ACTIVE:
+                                num += 0.125 * u
+                                den += 0.125
+                    elif u > ACTIVE:
+                        g = tack.f32(1 << dq)
+                        ax = self.sx / g
+                        ay = self.sy / g
+                        az = self.sz / g
+                        # q's box from the cell's centre, which lies in it.
+                        px = self.ox + (tack.f32(qi) + 0.5) * hx
+                        py = self.oy + (tack.f32(qj) + 0.5) * hy
+                        pz = self.oz + (tack.f32(qk) + 0.5) * hz
+                        lx = self.ox + floor((px - self.ox) / ax) * ax
+                        ly = self.oy + floor((py - self.oy) / ay) * ay
+                        lz = self.oz + floor((pz - self.oz) / az) * az
+                        w = max(1.0 - abs(vx - lx - 0.5 * ax) / ax, 0.0) * \
+                            max(1.0 - abs(vy - ly - 0.5 * ay) / ay, 0.0) * \
+                            max(1.0 - abs(vz - lz - 0.5 * az) / az, 0.0)
+                        num += w * u
+                        den += w
+        out = 0.0
+        if den > 0.0:
+            out = num / den
+        return out
+
+    @tack.func
     def sample(self, p, first, stop):
         n, size, depth, inside, fx, fy, fz = self.leaf_at(p)
         value = 0.0
@@ -237,6 +328,21 @@ class OctreeTents:
 
 
 @tack.kernel
+def _corner_values_balanced(tents, tree, level, key, marks, refined, nx, ny, out):
+    # Each leaf's eight corners by corner_value, from its lattice cell.
+    for n in range(marks.shape[0]):
+        if (marks[n] & refined) == 0:
+            lv = level[n]
+            i, j, m = _unkey(key[n], lv, 3)
+            t = tree[n]
+            ci = ((t % nx) << lv) + tack.i32(i)
+            cj = (((t // nx) % ny) << lv) + tack.i32(j)
+            ck = ((t // (nx * ny)) << lv) + tack.i32(m)
+            for c in range(8):
+                out[n * 8 + c] = tents.corner_value(n, lv, ci, cj, ck, c)
+
+
+@tack.kernel
 def _corner_values(exact, lo, size, marks, refined, stop, out):
     # A leaf's corners, nudged inward by a thousandth of the leaf so the point
     # lies in it: the exact tents there.
@@ -270,7 +376,9 @@ def _macro_ranges(tree, level, key, marks, refined, lo, hi, llo, lhi, nx, ny, nz
             i, j, m = _unkey(key[n], lv, 3)
             t = tree[n]
             span = 1 << (depth - lv)
-            reach = max(span >> 1, 1)      # a finer leaf's tent reaches less than one cell
+            # A leaf's neighbours shape its corner values, so its values reach a
+            # whole neighbour into it, and a finer leaf's less than one cell.
+            reach = max(span, 1)
             gx = nx << depth
             gy = ny << depth
             gz = nz << depth
@@ -355,9 +463,11 @@ def macro_ranges(octree, r, most=64):
 @tack.kernel
 def _sub_holders(divided, gx, gy, depth, shift, roots, nx, ny, number, table, values, lo, hi, lows,
                  highs):
-    # Each cell of each divided macrocell: the range of the node holding it (the
-    # node at the cells' level, or the coarser leaf), by a descent from the
-    # root cell. Cells are x fastest within a macrocell.
+    # Each cell of each divided macrocell: the range of the values a sample in
+    # it can take -- the node holding it (the node at the cells' level, or the
+    # coarser leaf) and the holders of the 26 lattice cells around that node at
+    # its own level, since a leaf's neighbours shape its corner values. Cells
+    # are x fastest within a macrocell.
     for e in range(lows.shape[0]):
         across = 1 << shift
         k = e >> (3 * shift)
@@ -366,70 +476,47 @@ def _sub_holders(divided, gx, gy, depth, shift, roots, nx, ny, number, table, va
         mi = m % gx
         mj = (m // gx) % gy
         mk = m // (gx * gy)
-        # The cell's lattice coordinates at level depth + shift, and its root cell.
-        ci = (mi << shift) + (local & (across - 1))
-        cj = (mj << shift) + ((local >> shift) & (across - 1))
-        ck = (mk << shift) + (local >> (2 * shift))
         level = depth + shift
-        n = roots[(ci >> level) + nx * ((cj >> level) + ny * (ck >> level))]
-        d = level
-        while n >= 0 and d > 0 and values[n] == REFINED:
-            d -= 1
-            n = table[(number[n] - 1) * 8 + ((ci >> d) & 1) + 2 * ((cj >> d) & 1) +
-                      4 * ((ck >> d) & 1)]
-        lows[e] = 3.0e38
-        highs[e] = -3.0e38
-        if n >= 0:
-            lows[e] = lo[n]
-            highs[e] = hi[n]
-
-
-@tack.kernel
-def _sub_widen(lows, highs, index, gx, gy, gz, shift, macro_lows, macro_highs, out_lows,
-               out_highs):
-    # Each cell's range over itself and its 26 neighbours (a value inside a leaf
-    # is within its neighbours' values): a neighbour in an undivided macrocell
-    # counts as that macrocell's whole range.
-    for e in range(out_lows.shape[0]):
-        across = 1 << shift
-        k = e >> (3 * shift)
-        local = e & ((1 << (3 * shift)) - 1)
-        m = index_of(index, k)
-        mi = m % gx
-        mj = (m // gx) % gy
-        mk = m // (gx * gy)
         ci = (mi << shift) + (local & (across - 1))
         cj = (mj << shift) + ((local >> shift) & (across - 1))
         ck = (mk << shift) + (local >> (2 * shift))
-        a = lows[e]
-        b = highs[e]
-        for dz in range(-1, 2):
-            for dy in range(-1, 2):
-                for dx in range(-1, 2):
-                    qi = ci + dx
-                    qj = cj + dy
-                    qk = ck + dz
-                    if qi >= 0 and qj >= 0 and qk >= 0 and qi < (gx << shift) and \
-                            qj < (gy << shift) and qk < (gz << shift):
-                        q = (qi >> shift) + gx * ((qj >> shift) + gy * (qk >> shift))
-                        j = index[q]
-                        if j >= 0:
-                            f = (j << (3 * shift)) + (qi & (across - 1)) + \
-                                ((qj & (across - 1)) << shift) + ((qk & (across - 1)) << (2 * shift))
-                            a = min(a, lows[f])
-                            b = max(b, highs[f])
-                        else:
-                            a = min(a, macro_lows[q])
-                            b = max(b, macro_highs[q])
-        out_lows[e] = a
-        out_highs[e] = b
-
-
-@tack.func
-def index_of(index, k):
-    # The macrocell of divided cell k: index holds, after the macrocells' own
-    # entries, the divided ones' macrocells (appended by sub_ranges).
-    return index[index.shape[0] - index[index.shape[0] - 1] + k]
+        a = 3.0e38
+        b = -3.0e38
+        n = tack.i32(-1)
+        d = 0
+        if ci >= 0:
+            # The holder: the descent from the root cell, stopping at a leaf.
+            n = roots[(ci >> level) + nx * ((cj >> level) + ny * (ck >> level))]
+            left = level
+            while n >= 0 and left > 0 and values[n] == REFINED:
+                left -= 1
+                d += 1
+                n = table[(number[n] - 1) * 8 + ((ci >> left) & 1) + 2 * ((cj >> left) & 1) +
+                          4 * ((ck >> left) & 1)]
+        if n >= 0:
+            # The holder's cell at its level, and the 27 around it.
+            hi_ = ci >> (level - d)
+            hj = cj >> (level - d)
+            hk = ck >> (level - d)
+            for dz in range(-1, 2):
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        qi = hi_ + dx
+                        qj = hj + dy
+                        qk = hk + dz
+                        if qi >= 0 and qj >= 0 and qk >= 0 and (qi >> d) < nx and \
+                                (qj >> d) < ny and (qk >> d) < (roots.shape[0] // (nx * ny)):
+                            q = roots[(qi >> d) + nx * ((qj >> d) + ny * (qk >> d))]
+                            left = d
+                            while q >= 0 and left > 0 and values[q] == REFINED:
+                                left -= 1
+                                q = table[(number[q] - 1) * 8 + ((qi >> left) & 1) +
+                                          2 * ((qj >> left) & 1) + 4 * ((qk >> left) & 1)]
+                            if q >= 0 and lo[q] <= hi[q]:
+                                a = min(a, lo[q])
+                                b = max(b, hi[q])
+        lows[e] = a
+        highs[e] = b
 
 
 def sub_ranges(octree, tents, r, grid, lasts, lows, highs, shift=2):
@@ -444,13 +531,15 @@ def sub_ranges(octree, tents, r, grid, lasts, lows, highs, shift=2):
         depth += 1
     finest = np.asarray(lasts.numpy())
     divided = np.flatnonzero(finest >= depth + shift + 1)
+    # The march's word holds a divided macrocell's index + 1 above bit 14 of a
+    # signed i32: 2^17 - 1 at most (its session caps sub_grids the same).
+    most = (1 << 17) - 1
+    if len(divided) > most:
+        divided = divided[:most]
     index = np.full(len(finest), -1, np.int32)
     index[divided] = np.arange(len(divided), dtype=np.int32)
     count = max(len(divided), 1) << (3 * shift)
-    # One array: the index, then the divided macrocells, then how many of them.
-    packed = np.concatenate([index, divided.astype(np.int32), [np.int32(len(divided) + 1)]])
     with octree.device:
-        index_dev = tack.array(packed, tack.i32)
         divided_dev = tack.array(divided.astype(np.int32) if len(divided) else np.zeros(1, np.int32),
                                  tack.i32)
         a, b = tack.empty((count,), tack.f32), tack.empty((count,), tack.f32)
@@ -459,10 +548,7 @@ def sub_ranges(octree, tents, r, grid, lasts, lows, highs, shift=2):
         if len(divided):
             _sub_holders(divided_dev, gx, gy, depth, shift, tents.roots, nx, ny, tents.number,
                          tents.table, tents.values, lo, hi, a, b)
-            sub_lows, sub_highs = tack.empty((count,), tack.f32), tack.empty((count,), tack.f32)
-            _sub_widen(a, b, index_dev, gx, gy, gz, shift, lows, highs, sub_lows, sub_highs)
-        else:
-            sub_lows, sub_highs = a, b
+        sub_lows, sub_highs = a, b
     return {"index": index, "lows": sub_lows, "highs": sub_highs, "shift": int(shift),
             "count": len(divided)}
 
