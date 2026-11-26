@@ -377,10 +377,8 @@ class OctreeDataSet:
         keys, made once."""
         if self._geometry is None:
             dtype = _compute_type(self.device, self.roots.dtype)
-            lo, size = _root_cells(self.roots)
+            root_lo, root_size = _device_root_cells(self.roots, dtype)
             with self.device:
-                root_lo = tack.array(lo.astype(dtype.numpy_dtype), tack.vec3(dtype))
-                root_size = tack.array(size.astype(dtype.numpy_dtype), tack.vec3(dtype))
                 corner = tack.empty((self.num_nodes,), tack.vec3(dtype))
                 sides = tack.empty((self.num_nodes,), tack.vec3(dtype))
                 if self.num_nodes:
@@ -862,6 +860,23 @@ def _root_axes(roots):
                 for a in range(len(dims))]
     return [np.asarray(arrays.to_host(axis), np.float64).reshape(-1)
             for axis in (coordinates.x, coordinates.y, coordinates.z)[:len(dims)]]
+
+
+def _device_root_cells(roots, dtype):
+    """`_root_cells` on the roots' device in ``dtype``, as two vec3 arrays, kept on
+    the roots for as long as their coordinates are the same object: every octree
+    on these roots (each of an adapting solver's meshes) shares them, instead of
+    building and uploading every root cell again (24 ms and 31 MB at 655k roots)."""
+    coordinates, device = roots.geometry.values, roots.device
+    kept = getattr(roots, "_octree_root_cells", None)
+    if kept is not None and kept[0] is coordinates and kept[1] == (device, dtype):
+        return kept[2]
+    lo, size = _root_cells(roots)
+    with device:
+        cells = (tack.array(lo.astype(dtype.numpy_dtype), tack.vec3(dtype)),
+                 tack.array(size.astype(dtype.numpy_dtype), tack.vec3(dtype)))
+    roots._octree_root_cells = (coordinates, (device, dtype), cells)
+    return cells
 
 
 def _root_cells(roots):
