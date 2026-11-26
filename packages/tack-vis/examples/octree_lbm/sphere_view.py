@@ -53,6 +53,18 @@ from tack.dataset.octree_lbm_adapt import adapt
 U = 0.1                                    # free-stream speed, lattice units of level 0
 
 
+@tack.kernel
+def _inside_sphere(x, y, z, xc, yc, zc, r2, out):
+    # 1 where a centre is within the sphere of squared radius r2: the pinned
+    # cells, picked on the device (adapt's pinned_on_device).
+    for n in range(out.shape[0]):
+        dx = x[n] - xc
+        dy = y[n] - yc
+        dz = z[n] - zc
+        if dx * dx + dy * dy + dz * dz < r2:
+            out[n] = 1
+
+
 def text(renderer, x, y, size):
     actor = vtkTextActor()
     actor.GetTextProperty().SetColor(0.1, 0.1, 0.1)
@@ -100,8 +112,11 @@ def main():
     def distance(x, y, z):
         return np.sqrt((x - xc) ** 2 + (y - yc) ** 2 + (z - zc) ** 2)
 
-    def pinned(x, y, z):
-        return distance(x, y, z) < 0.85 * d
+    def pinned_on_device(x, y, z, out):
+        # distance < 0.85 d, by squares: with a whole diameter, the centres'
+        # offsets are multiples of 1/8 and their squared distances exact in f32
+        # as in f64, so either type picks the cells the host's f64 would.
+        _inside_sphere(x, y, z, xc, yc, zc, (0.85 * d) ** 2, out)
 
     def solid(x, y, z):
         return distance(x, y, z) < 0.5 * d
@@ -110,7 +125,8 @@ def main():
              "steps": []}
 
     def remesh(s, **extra):
-        return adapt(s, 0.01, 0.005, finest=2, pinned=pinned, region=region, **extra)
+        return adapt(s, 0.01, 0.005, finest=2, pinned_on_device=pinned_on_device, region=region,
+                     **extra)
 
     def start_mesh():
         s = lb.LBM(lb.uniform_mesh((nx, ny, nz), periodic=(False, True, True)), tau, inflow=U,

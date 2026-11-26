@@ -353,13 +353,19 @@ def _transfer(role, logical, src, how, old_f, old_grad, old_number, old_table, o
                     f[m * q + o] = _rescaled(o, scratch, m * q, down[old_level[n]], q, dim)
 
 
-def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=None, solid=None):
+def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=None, solid=None,
+          pinned_on_device=None):
     """A new solver on ``solver``'s mesh adapted to the flow, with its solution
     moved over (call between steps). A leaf refines where ``|vorticity| h``
     (lattice units of level 0) is above ``refine_above`` and its siblings and it
     merge where twice that is below ``coarsen_below``; ``finest`` caps the
     levels (the current finest by default); ``pinned(x, y[, z])`` (vectorized)
-    picks cells that go to the finest level and stay; refinement keeps inside
+    picks cells that go to the finest level and stay, on the host's f64 centres;
+    ``pinned_on_device(x, y, z, out)`` instead picks them on the device, without
+    reading the centres back: given the solver's centres as device arrays (its
+    type) and ``out``, i32 zeros, it sets ``out`` to 1 at the pinned nodes (by a
+    kernel; at 1.9M nodes ~85 ms of NumPy and read-back a remesh, the first time
+    the solver's centres are asked for); refinement keeps inside
     ``region = (xlo, xhi)``; ``solid(x, y[, z])`` (vectorized) makes the real
     leaves at the finest level whose centres it holds ``SOLID`` (any other
     leaf it holds is an error: pin around the obstacle first). Returns the new
@@ -370,7 +376,8 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
     finest = octree.finest if finest is None else int(finest)
     role, level = solver.role, solver.levels
     n = octree.num_nodes
-    centre, _ = solver.centres()
+    if pinned is not None and pinned_on_device is not None:
+        raise ValueError("pinned or pinned_on_device, not both")
     xlo, xhi = region if region is not None else (-np.inf, np.inf)
     computational = solver.computational()
     leaves = np.flatnonzero(computational).astype(np.int64)
@@ -389,12 +396,19 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
                        solver.table, solver.side, solver.lattice, solver.f, measure)
             _gradients(leaves_d, solver.rows, octree.level, solver.role_array, -1,
                        solver.lattice, solver.f, solver.grad)
-        pin = np.zeros(n, np.int32)
-        if pinned is not None:
-            pin[np.asarray(pinned(*centre.T), bool)] = 1
+        if pinned_on_device is not None:
+            pin = tack.zeros((n,), tack.i32)
+            if n:
+                pinned_on_device(solver.px, solver.py, solver.pz, pin)
+        else:
+            host_pin = np.zeros(n, np.int32)
+            if pinned is not None:
+                centre, _ = solver.centres()
+                host_pin[np.asarray(pinned(*centre.T), bool)] = 1
+            pin = tack.array(host_pin)
         want = tack.zeros((n,), tack.i32)
         if len(leaves):
-            _mark(leaves_d, measure, octree.level, solver.side, solver.px, tack.array(pin),
+            _mark(leaves_d, measure, octree.level, solver.side, solver.px, pin,
                   finest, float(refine_above), float(coarsen_below), float(xlo), float(xhi), want)
         changed = tack.zeros((1,), tack.i32)
         rounds = 0

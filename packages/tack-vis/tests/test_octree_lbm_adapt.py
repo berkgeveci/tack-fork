@@ -8,6 +8,7 @@ and momentum, and the meshes they make are balanced and layered."""
 import numpy as np
 import pytest
 
+import tack
 from tack.dataset import octree_lbm as lb
 from tack.dataset.octree_lbm_adapt import adapt
 
@@ -94,6 +95,36 @@ def test_balance_ripples_out_from_a_deep_refinement():
         _check_mesh(s)
     assert s.octree.finest == 3
     assert stats["rounds"] > 1
+
+
+@tack.kernel
+def _corner_on_device(x, y, z, cx, cy, half, out):
+    for n in range(out.shape[0]):
+        if abs(x[n] - cx) < half and abs(y[n] - cy) < half:
+            out[n] = 1
+
+
+def test_pinning_on_the_device_makes_the_meshes_pinning_on_the_host_does():
+    # pinned_on_device, a kernel over the solver's centres on the device, picks
+    # the cells the host's pinned does: the same remeshes give the same meshes.
+    def corner(x, y):
+        return (np.abs(x - 10.3) < 0.6) & (np.abs(y - 20.7) < 0.6)
+
+    def corner_on_device(x, y, z, out):
+        _corner_on_device(x, y, z, 10.3, 20.7, 0.6, out)
+
+    host = device = _solver(lambda x, y, h: False, 0)
+    for _ in range(3):
+        host, a = adapt(host, refine_above=1e9, coarsen_below=-1.0, finest=3, pinned=corner)
+        device, b = adapt(device, refine_above=1e9, coarsen_below=-1.0, finest=3,
+                          pinned_on_device=corner_on_device)
+        _check_mesh(device)
+        assert a["refined"] == b["refined"] and a["cells"] == b["cells"]
+        assert np.array_equal(host.octree._key, device.octree._key)
+        assert np.array_equal(host.role, device.role)
+    assert device.octree.finest == 3
+    with pytest.raises(ValueError, match="not both"):
+        adapt(device, 1e9, -1.0, pinned=corner, pinned_on_device=corner_on_device)
 
 
 def test_a_uniform_flow_stays_uniform_through_remeshes():
