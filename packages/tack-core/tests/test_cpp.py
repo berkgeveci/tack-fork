@@ -539,6 +539,55 @@ def test_objects_are_checked(calls_methods):
         undeclared(_Poly(_COEFFICIENTS, 0.0), out)
 
 
+def _eigen():
+    """Eigen's include directory, if it is installed where it usually is."""
+    import pathlib
+    for folder in ("/opt/homebrew/include/eigen3", "/usr/include/eigen3",
+                   "/usr/local/include/eigen3"):
+        if pathlib.Path(folder, "Eigen", "Dense").is_file():
+            return folder
+    return None
+
+
+@pytest.mark.skipif(_eigen() is None, reason="Eigen is not installed")
+def test_a_real_library_eigen_through_pointers_in_two_kernels():
+    """Eigen's closed-form eigenvalues of symmetric 3x3 matrices, mapped over
+    Tack's arrays. The solver is too large to inline, so each kernel keeps its
+    own internal copy: two kernels in one process must not share or clash."""
+    lib = tack.cpp.Library(include_dirs=[_eigen()], flags=["-DNDEBUG"], source="""
+#include <Eigen/Dense>
+template <class V> void eigenvalues(const V* a, long long i, V* out) {
+  Eigen::Map<const Eigen::Matrix<V, 3, 3, Eigen::RowMajor>> m(a + 9 * i);
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<V, 3, 3>> solver;
+  solver.computeDirect(m, Eigen::EigenvaluesOnly);
+  Eigen::Map<Eigen::Matrix<V, 3, 1>>(out + 3 * i) = solver.eigenvalues();
+}""")
+    eigenvalues = lib.function("eigenvalues", result=None,
+                               args=(ptr(T), tack.i64, ptr(T, writes=True)))
+
+    @tack.kernel
+    def spectrum(a, out):
+        for i in range(out.shape[0]):
+            eigenvalues(a, i, out)
+
+    @tack.kernel
+    def doubled(a, out):
+        for i in range(out.shape[0]):
+            eigenvalues(a, i, out)
+            out[i] = out[i] * 2.0
+
+    g = np.random.default_rng(1).standard_normal((300, 3, 3))
+    sym = (g + g.transpose(0, 2, 1)) / 2
+    a = tack.array(sym, dtype=tack.mat(3, 3, tack.f64))
+    out, twice = (tack.zeros(300, tack.vec(3, tack.f64)) for _ in range(2))
+    spectrum(a, out)
+    doubled(a, twice)
+    spectrum(a, out)
+    want = np.linalg.eigvalsh(sym)
+    np.testing.assert_allclose(out.numpy(), want, atol=1e-12)
+    np.testing.assert_allclose(twice.numpy(), 2 * want, atol=1e-12)
+
+
 _SCRIPT = """
 import sys, numpy as np, tack, tack.cpp
 lib = tack.cpp.Library(headers=["demo.h"], include_dirs=[sys.argv[1]])

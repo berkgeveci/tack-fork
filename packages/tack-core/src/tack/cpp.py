@@ -447,7 +447,15 @@ def link(module, calls):
                 raise RuntimeError(
                     f"tack.cpp: {symbol} is {ours.global_value_type} in the kernel and "
                     f"{theirs.global_value_type} in the C++ (a bug in Tack)")
+        # Everything the C++ defines becomes internal to this kernel's module:
+        # once inlined nothing is left of it, and what is not inlined (a large
+        # template function, a static table) must not meet another kernel's
+        # copy of the same name in the JIT's one symbol table.
+        defined = [f.name for f in other.functions if not f.is_declaration]
+        defined += [g.name for g in other.global_variables if not g.is_declaration]
         module.link_in(other)
-        for symbol in set(symbols):
-            # Internal: once inlined, nothing is left of it.
-            module.get_function(symbol).linkage = "internal"
+        for symbol in {*symbols, *defined}:
+            try:
+                module.get_function(symbol).linkage = "internal"
+            except NameError:
+                module.get_global_variable(symbol).linkage = "internal"
