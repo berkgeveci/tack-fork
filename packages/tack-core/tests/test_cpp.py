@@ -212,6 +212,27 @@ def test_wrong_argument_count_and_python_calls_are_refused(lib):
         damped(1.0, 2.0)
 
 
+def test_private_definitions_of_the_library_link():
+    """A switch clang turns into a private lookup table: already local, the link
+    may rename it, and Tack must not look for it to make it internal."""
+    lib = tack.cpp.Library(source="""
+template <class V> V weight(int k) {
+  switch (k) { case 0: return V(0.5); case 1: return V(1.5); case 2: return V(2.5);
+               case 3: return V(4.0); case 4: return V(8.5); default: return V(0); }
+}""")
+    weight = lib.function("weight<{T}>", result=T, args=(tack.i32,))
+
+    @tack.kernel
+    def weights(out):
+        for i in range(out.shape[0]):
+            out[i] = weight(i)
+
+    for dtype in (tack.f32, tack.f64):
+        out = tack.zeros(6, dtype)
+        weights(out)
+        assert out.numpy().tolist() == [0.5, 1.5, 2.5, 4.0, 8.5, 0.0]
+
+
 def test_a_compile_error_shows_clangs_message():
     broken = tack.cpp.Library(source="template <class V> V f(V x) { return x.nope(); }")
     f = broken.function("f", result=T, args=(T,))

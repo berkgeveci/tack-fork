@@ -821,8 +821,13 @@ def link(module, calls):
         # once inlined nothing is left of it, and what is not inlined (a large
         # template function, a static table) must not meet another kernel's
         # copy of the same name in the JIT's one symbol table.
-        defined = [f.name for f in other.functions if not f.is_declaration]
-        defined += [g.name for g in other.global_variables if not g.is_declaration]
+        # (A private one, such as a switch's table, is local already, and the
+        # link may rename it.)
+        local = (llvm.Linkage.private, llvm.Linkage.internal)
+        defined = [f.name for f in other.functions
+                   if not f.is_declaration and f.linkage not in local]
+        defined += [g.name for g in other.global_variables
+                    if not g.is_declaration and g.linkage not in local]
         module.link_in(other)
         for symbol in {*symbols, *defined}:
             try:
