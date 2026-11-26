@@ -4,7 +4,6 @@
 """Kernels that call C++ (tack.cpp): templates instantiated by the call's types,
 compiled by clang to bitcode and inlined into the kernel."""
 
-import shutil
 import subprocess
 import sys
 
@@ -44,10 +43,9 @@ inline int twice(int k) { return 2 * k; }
 
 def _readable_clang():
     """Whether there is a clang whose bitcode llvmlite reads."""
-    import os
 
     import llvmlite.binding as llvm
-    clang = shutil.which(os.environ.get("TACK_CLANG") or "clang++")
+    clang = tack.cpp._find_clang()
     if clang is None:
         return False
     done = subprocess.run([clang, "-x", "c++", "-c", "-emit-llvm", "-", "-o", "-"],
@@ -1075,17 +1073,17 @@ def test_disk_cache_needs_no_clang_and_notices_a_changed_header(tmp_path):
     code, out, err = run()
     assert code == 0, err
     assert out == ["2.0", "0"]
-    code, out, err = run(TACK_CLANG="/no/such/clang++")
+    code, out, err = run(TACK_CLANGXX="/no/such/clang++")
     assert code == 0, err
     assert out == ["2.0", "1"]
     os.utime(header)            # touched, not changed
-    code, out, err = run(TACK_CLANG="/no/such/clang++")
+    code, out, err = run(TACK_CLANGXX="/no/such/clang++")
     assert code == 0, err
     assert out == ["2.0", "1"]
     header.write_text('#include "factor.h"\n'
                       "namespace demo { template <class V> V scale(V x) "
                       "{ return 3 * FACTOR * x; } }")
-    code, out, err = run(TACK_CLANG="/no/such/clang++")
+    code, out, err = run(TACK_CLANGXX="/no/such/clang++")
     assert code != 0 and "needs clang" in err
     code, out, err = run()
     assert out == ["3.0", "0"]
@@ -1094,5 +1092,5 @@ def test_disk_cache_needs_no_clang_and_notices_a_changed_header(tmp_path):
     code, out, err = run()
     assert code == 0, err
     assert out == ["6.0", "0"]
-    code, out, err = run(TACK_CLANG="/no/such/clang++")
+    code, out, err = run(TACK_CLANGXX="/no/such/clang++")
     assert out == ["6.0", "1"]

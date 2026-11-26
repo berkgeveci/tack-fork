@@ -16,8 +16,9 @@
   `std::sort` sorts through a view.
   The call's types instantiate a template (`tack.cpp.T` is one floating type
   a call: its arrays' or scalars', the kernel's where only float literals are
-  given, or fixed with `T=`/`.of()`); clang (`TACK_CLANG`, else `clang++`
-  on the path, needed only where such a kernel is compiled) writes LLVM bitcode
+  given, or fixed with `T=`/`.of()`); clang (`TACK_CLANGXX`, else the `clang++`
+  beside `TACK_CLANG`, else on the path, as the host checks find theirs; needed
+  only where such a kernel is compiled) writes LLVM bitcode
   that is linked into the kernel before it is optimized, so the library's code
   is inlined and vectorized with the loop and stored with the variant in the
   disk cache. A library is parsed once a process, into a precompiled header

@@ -23,8 +23,9 @@ module before LLVM optimizes it. The library's code is inlined into the
 loop, vectorized with it, and stored with the variant in the disk cache: a
 process that finds the variant there needs no clang.
 
-clang is found as ``TACK_CLANG``, else ``clang++`` on the path, and is needed
-only where such a kernel is compiled. Its LLVM must not be newer than
+The C++ compiler is clang, found as the tests' host checks find theirs:
+``TACK_CLANGXX``, else the ``clang++`` beside ``TACK_CLANG``, else ``clang++`` on
+the path. It is needed only where such a kernel is compiled. Its LLVM must not be newer than
 llvmlite's, which reads bitcode of its own version and older.
 
 ``T`` is one floating type per call. An array given for a ``ptr(T)`` decides
@@ -553,15 +554,27 @@ _bitcode = {}       # shim source and flags -> bitcode
 _clang = None
 
 
+def _find_clang():
+    """Where clang++ is, or None: ``TACK_CLANGXX``; else the ``clang++`` beside
+    ``TACK_CLANG`` (the C driver, ``clang-14`` giving ``clang++-14``); else
+    ``clang++`` on the path. A named compiler that is not there is not looked
+    for elsewhere."""
+    named = os.environ.get("TACK_CLANGXX")
+    if not named and os.environ.get("TACK_CLANG"):
+        c = Path(os.environ["TACK_CLANG"])
+        named = str(c.with_name(c.name.replace("clang", "clang++", 1)))
+    return shutil.which(named or "clang++")
+
+
 def clang() -> str:
     """The compiler, or an error saying how to name one."""
     global _clang
     if _clang is None:
-        found = shutil.which(os.environ.get("TACK_CLANG") or "clang++")
+        found = _find_clang()
         if not found:
             raise RuntimeError(
                 "a kernel calls a C++ function (tack.cpp), which needs clang to compile "
-                "it: put clang++ on the path or name one in TACK_CLANG")
+                "it: put clang++ on the path or name one in TACK_CLANGXX")
         _clang = found
     return _clang
 
@@ -665,7 +678,7 @@ _versions = {}
 
 def _clang_version():
     """The version clang reports, or None where there is none."""
-    found = shutil.which(os.environ.get("TACK_CLANG") or "clang++")
+    found = _find_clang()
     if found is None:
         return None
     if found not in _versions:
@@ -791,7 +804,7 @@ def link(module, calls):
             raise RuntimeError(
                 f"llvmlite (LLVM {version}) cannot read the bitcode {clang()} wrote: "
                 f"{error}. Name a clang of LLVM {llvm.llvm_version_info[0]} or older "
-                "in TACK_CLANG") from error
+                "in TACK_CLANGXX") from error
         other.triple = module.triple
         other.data_layout = module.data_layout
         for symbol in set(symbols):
