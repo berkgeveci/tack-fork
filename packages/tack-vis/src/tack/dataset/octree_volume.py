@@ -54,7 +54,7 @@ from tack.dataset.octree import _root_axes, _root_cells, _unkey
 from tack.dataset.octree_contour import _child_ranges, _leaf_ranges, ranges, subtree_ends
 from tack.dataset.octree_topology import children, refined_by_level
 
-__all__ = ["OctreeRenderer", "OctreeTents", "macro_ranges", "octree_tents"]
+__all__ = ["OctreeRenderer", "OctreeTents", "corner_values", "macro_ranges", "octree_tents"]
 
 #: A refined node's value (descend), a hidden leaf's (nothing), and what a visible
 #: leaf's value is above.
@@ -79,7 +79,7 @@ class OctreeTents:
     """An octree as the march's sampler: ``sample(p, first, stop)``, the value at
     ``p`` and the size of the leaf there."""
 
-    def __init__(self, octree, name, blend=1, balanced=0, chunk=None):
+    def __init__(self, octree, name, blend=1, balanced=0, chunk=None, corners=None):
         if octree.dimension != 3:
             raise ValueError("the volume sampler takes a 3D octree")
         number, table = children(octree)
@@ -112,24 +112,16 @@ class OctreeTents:
         #: descent and two cache lines a sample, at the price of a crack where a
         #: fine leaf's corner hangs on a coarse face.
         self.corners = tack.empty((1,), tack.f32)
-        if int(blend) == 2:
+        if int(blend) == 2 and corners is not None:
+            # Made elsewhere (``corner_values``, two fields' in one pass).
+            self.corners = corners
+        elif int(blend) == 2 and int(balanced) == 1:
+            self.corners = corner_values(octree, name, chunk=chunk)
+        elif int(blend) == 2:
             exact = OctreeTents(octree, name, blend=1, balanced=balanced)
             with octree.device:
                 self.corners = tack.empty((max(octree.num_nodes, 1) * 8,), tack.f32)
-                if octree.num_nodes and int(balanced) == 1:
-                    # ``chunk`` nodes a launch, each waited for: a launch of the
-                    # whole octree held the GPU for seconds (2.2 s at 78M nodes on
-                    # an M1 Max), and a viewer's frames queued behind it.
-                    nx, ny = self.nx, self.ny
-                    n = octree.num_nodes
-                    step = n if chunk is None else max(int(chunk), 1)
-                    for start in range(0, n, step):
-                        _corner_values_balanced(exact, octree.tree, octree.level, octree.key,
-                                                octree.marks, int(Ghosts.REFINEDCELL), nx, ny,
-                                                start, min(step, n - start), self.corners)
-                        if chunk is not None:
-                            tack.sync()
-                elif octree.num_nodes:
+                if octree.num_nodes:
                     lo, size = octree.geometry()
                     _corner_values(exact, lo, size, octree.marks, int(Ghosts.REFINEDCELL),
                                    octree.finest + 1, self.corners)
@@ -213,72 +205,6 @@ class OctreeTents:
         return n, d
 
     @tack.func
-    def corner_value(self, n, depth, i, j, k, c):
-        """The tents at corner ``c`` (x the lowest bit) of leaf ``n`` at ``depth``,
-        whose lattice cell at that depth is ``(i, j, k)``, in a balanced tree:
-        the leaf and its seven neighbours toward the corner at its level, each
-        a leaf's tent at the corner with its own box, a refined one's leaves
-        down the chain of cells at the corner, each weighing an eighth."""
-        f = tack.f32(1 << depth)
-        hx = self.sx / f
-        hy = self.sy / f
-        hz = self.sz / f
-        vx = self.ox + tack.f32(i + (c & 1)) * hx
-        vy = self.oy + tack.f32(j + ((c >> 1) & 1)) * hy
-        vz = self.oz + tack.f32(k + ((c >> 2) & 1)) * hz
-        num = 0.0
-        den = 0.0
-        seen = tack.local_array(tack.i32, 8)
-        count = 0
-        for s in range(8):
-            # The level-depth cell around the corner in octant s.
-            qi = i + (c & 1) - 1 + (s & 1)
-            qj = j + ((c >> 1) & 1) - 1 + ((s >> 1) & 1)
-            qk = k + ((c >> 2) & 1) - 1 + ((s >> 2) & 1)
-            q, dq = self.holder_at(depth, qi, qj, qk)
-            if q >= 0:
-                new = 1
-                for t in range(count):
-                    if seen[t] == q:
-                        new = 0
-                if new == 1:
-                    seen[count] = q
-                    count += 1
-                    u = self.values[q]
-                    if u == REFINED:
-                        # Down the chain of cells at the corner: the child in the
-                        # octant facing the corner, 7 - s.
-                        m = q
-                        while m >= 0 and self.values[m] == REFINED:
-                            m = self.table[(self.number[m] - 1) * 8 + (7 - s)]
-                        if m >= 0:
-                            u = self.values[m]
-                            if u > ACTIVE:
-                                num += 0.125 * u
-                                den += 0.125
-                    elif u > ACTIVE:
-                        g = tack.f32(1 << dq)
-                        ax = self.sx / g
-                        ay = self.sy / g
-                        az = self.sz / g
-                        # q's box from the cell's centre, which lies in it.
-                        px = self.ox + (tack.f32(qi) + 0.5) * hx
-                        py = self.oy + (tack.f32(qj) + 0.5) * hy
-                        pz = self.oz + (tack.f32(qk) + 0.5) * hz
-                        lx = self.ox + floor((px - self.ox) / ax) * ax
-                        ly = self.oy + floor((py - self.oy) / ay) * ay
-                        lz = self.oz + floor((pz - self.oz) / az) * az
-                        w = max(1.0 - abs(vx - lx - 0.5 * ax) / ax, 0.0) * \
-                            max(1.0 - abs(vy - ly - 0.5 * ay) / ay, 0.0) * \
-                            max(1.0 - abs(vz - lz - 0.5 * az) / az, 0.0)
-                        num += w * u
-                        den += w
-        out = 0.0
-        if den > 0.0:
-            out = num / den
-        return out
-
-    @tack.func
     def sample(self, p, first, stop):
         n, size, depth, inside, fx, fy, fz = self.leaf_at(p)
         value = 0.0
@@ -336,8 +262,15 @@ class OctreeTents:
 
 
 @tack.kernel
-def _corner_values_balanced(tents, tree, level, key, marks, refined, nx, ny, first, count, out):
-    # Each leaf's eight corners by corner_value, from its lattice cell: the nodes
+def _corner_leaves(tents, values_b, tree, level, key, marks, refined, nx, ny, first, count, two,
+                   out_a, out_b):
+    # Each leaf's eight corners, the tents there in a balanced tree: at a corner,
+    # the eight cells of the leaf's level around it (among the leaf's 27
+    # neighbours, each found once by a descent), each a leaf's tent with its own
+    # box, a refined one's leaves down the chain of cells at the corner, each
+    # weighing an eighth; a coarser leaf holding several cells counted once. For
+    # the field of ``tents`` and, with ``two``, ``values_b`` (``_node_values`` of
+    # another field): the same cells and weights, sums of their own. The nodes
     # first .. first + count.
     for k in range(count):
         n = first + k
@@ -348,8 +281,122 @@ def _corner_values_balanced(tents, tree, level, key, marks, refined, nx, ny, fir
             ci = ((t % nx) << lv) + tack.i32(i)
             cj = (((t // nx) % ny) << lv) + tack.i32(j)
             ck = ((t // (nx * ny)) << lv) + tack.i32(m)
+            near = tack.local_array(tack.i32, 27)
+            for o in range(27):
+                # The node of level lv there, or the coarser leaf holding it.
+                h, _ = tents.holder_at(lv, ci + o % 3 - 1, cj + (o // 3) % 3 - 1,
+                                       ck + o // 9 - 1)
+                near[o] = h
+            f = tack.f32(1 << lv)
+            hx = tents.sx / f
+            hy = tents.sy / f
+            hz = tents.sz / f
             for c in range(8):
-                out[n * 8 + c] = tents.corner_value(n, lv, ci, cj, ck, c)
+                cx = c & 1
+                cy = (c >> 1) & 1
+                cz = (c >> 2) & 1
+                vx = tents.ox + tack.f32(ci + cx) * hx
+                vy = tents.oy + tack.f32(cj + cy) * hy
+                vz = tents.oz + tack.f32(ck + cz) * hz
+                num = 0.0
+                den = 0.0
+                num_b = 0.0
+                den_b = 0.0
+                for s in range(8):
+                    sx = s & 1
+                    sy = (s >> 1) & 1
+                    sz = (s >> 2) & 1
+                    q = near[cx + sx + 3 * (cy + sy) + 9 * (cz + sz)]
+                    if q >= 0:
+                        # Counted once: a coarser leaf holds several of the cells.
+                        new = 1
+                        for e in range(s):
+                            if near[cx + (e & 1) + 3 * (cy + ((e >> 1) & 1)) +
+                                    9 * (cz + ((e >> 2) & 1))] == q:
+                                new = 0
+                        if new == 1:
+                            u = tents.values[q]
+                            if u == REFINED:
+                                # Down the chain of cells at the corner: the child in
+                                # the octant facing the corner, 7 - s.
+                                d = q
+                                while d >= 0 and tents.values[d] == REFINED:
+                                    d = tents.table[(tents.number[d] - 1) * 8 + (7 - s)]
+                                if d >= 0:
+                                    u = tents.values[d]
+                                    if u > ACTIVE:
+                                        num += 0.125 * u
+                                        den += 0.125
+                                    if two == 1:
+                                        ub = values_b[d]
+                                        if ub > ACTIVE:
+                                            num_b += 0.125 * ub
+                                            den_b += 0.125
+                            else:
+                                ub = u
+                                if two == 1:
+                                    ub = values_b[q]
+                                if u > ACTIVE or ub > ACTIVE:
+                                    g = tack.f32(1 << level[q])
+                                    ax = tents.sx / g
+                                    ay = tents.sy / g
+                                    az = tents.sz / g
+                                    # q's box from the cell's centre, which lies in it.
+                                    px = tents.ox + (tack.f32(ci + cx - 1 + sx) + 0.5) * hx
+                                    py = tents.oy + (tack.f32(cj + cy - 1 + sy) + 0.5) * hy
+                                    pz = tents.oz + (tack.f32(ck + cz - 1 + sz) + 0.5) * hz
+                                    lx = tents.ox + floor((px - tents.ox) / ax) * ax
+                                    ly = tents.oy + floor((py - tents.oy) / ay) * ay
+                                    lz = tents.oz + floor((pz - tents.oz) / az) * az
+                                    w = max(1.0 - abs(vx - lx - 0.5 * ax) / ax, 0.0) * \
+                                        max(1.0 - abs(vy - ly - 0.5 * ay) / ay, 0.0) * \
+                                        max(1.0 - abs(vz - lz - 0.5 * az) / az, 0.0)
+                                    if u > ACTIVE:
+                                        num += w * u
+                                        den += w
+                                    if two == 1 and ub > ACTIVE:
+                                        num_b += w * ub
+                                        den_b += w
+                value = 0.0
+                if den > 0.0:
+                    value = num / den
+                out_a[n * 8 + c] = value
+                if two == 1:
+                    value_b = 0.0
+                    if den_b > 0.0:
+                        value_b = num_b / den_b
+                    out_b[n * 8 + c] = value_b
+
+
+def corner_values(octree, name, second=None, chunk=None):
+    """Each leaf's eight corner values of field ``name`` (the sampler's for
+    ``blend=2``, a balanced octree) and, with ``second``, those of another field
+    in the same pass: each leaf's 27 neighbours found once, both fields' sums
+    from them (on an M1 Max, 78M nodes: 2.3 s for two fields, against 4.6 for
+    two passes of a corner at a time, eight descents a corner; a table of every
+    node's neighbours, ``octree_topology.neighbourhoods``, cost more to make,
+    2.9 s and 8.4 GB, than the descents it spared). ``chunk`` nodes a launch,
+    each waited for, so a viewer's frames are not held behind one launch of
+    seconds. Device f32 arrays of 8 a node, ``(a, b)`` with ``second``."""
+    exact = OctreeTents(octree, name, blend=1, balanced=1)
+    n = octree.num_nodes
+    with octree.device:
+        out_a = tack.empty((max(n, 1) * 8,), tack.f32)
+        out_b = tack.empty((max(n, 1) * 8,) if second is not None else (1,), tack.f32)
+        values_b = exact.values
+        if second is not None:
+            values_b = tack.empty((n,), tack.f32)
+            if n:
+                _node_values(octree._field(second), octree.marks, int(Ghosts.REFINEDCELL),
+                             int(Ghosts.HIDDENCELL), values_b)
+        step = max(n, 1) if chunk is None else max(int(chunk), 1)
+        for start in range(0, n, step):
+            _corner_leaves(exact, values_b, octree.tree, octree.level, octree.key, octree.marks,
+                           int(Ghosts.REFINEDCELL), exact.nx, exact.ny, start,
+                           min(step, n - start), int(second is not None), out_a, out_b)
+            if chunk is not None:
+                tack.sync()
+    return (out_a, out_b) if second is not None else out_a
 
 
 @tack.kernel
@@ -585,7 +632,7 @@ class OctreeRenderer:
     AMR volume modules (``tack_march``, ``tack_composite``, ``volume_tack``)."""
 
     def __init__(self, octree, name, amr_volume, blend=1, macrocells=64, divide=-1, balanced=0,
-                 chunk=None):
+                 chunk=None, corners=None):
         if str(amr_volume) not in sys.path:
             sys.path.insert(0, str(amr_volume))
         import tack_composite
@@ -597,7 +644,8 @@ class OctreeRenderer:
         # ``balanced``: the sampler for octrees whose neighbouring leaves differ by
         # at most a level (``OctreeTents``); made once here, as replacing it after
         # cost a second sampler (5 of a 94M-node octree's 9 s on Metal).
-        self.tents = OctreeTents(octree, name, blend, balanced=balanced, chunk=chunk)
+        self.tents = OctreeTents(octree, name, blend, balanced=balanced, chunk=chunk,
+                                 corners=corners)
         self.ranges = ranges(octree, name)
         self.grid, self.lows, self.highs, self.firsts, self.lasts = macro_ranges(
             octree, self.ranges, macrocells)
