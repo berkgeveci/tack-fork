@@ -28,7 +28,7 @@ start of its step and its mean at the end. A real leaf's upstream neighbour at
 its level always exists (balance and the interface layer see to it); a
 ghost's may lie in a coarser cell, whose virtual value is the cell's own at
 the first substep and, at the second, that of the cell two fine steps
-upstream, which is the parent's upstream neighbour (``_pull_ghosts``). The
+upstream, which is the parent's upstream neighbour (``_stream``). The
 octree's run matches that virtual grid to rounding, and mass and momentum are
 conserved to rounding (``test_octree_lbm.py``).
 
@@ -46,7 +46,7 @@ moves mass between cells, remove most of it:
   step whatever the collision, so nothing damps it), a checkerboard of 1-2 % of
   the flow speed in a Taylor-Green vortex. A ghost on the downstream side of
   a direction gains half a fine step's stress, one on the upstream side
-  loses it (``_half_step``, ``_explode``): 40 times less, and a refined mesh
+  loses it (``_collide``'s ``factor``, ``_explode``): 40 times less, and a refined mesh
   more accurate than the uniform coarse one. What is left of the mode is not
   damped either: once a decaying vortex has lost a hundredfold, it is most of
   the relative error. A filter of the staggered momentum would take it out.
@@ -318,11 +318,16 @@ def _feq(o, rho, ux, uy, uz, dim):
 
 
 @tack.kernel
-def _collide(nodes, f, omega, lat, regularized, px, sponge_from, sponge_to, sponge_tau):
+def _collide(nodes, f, omega, lat, regularized, px, sponge_from, sponge_to, sponge_tau, role, out,
+             factor):
     # BGK; ``regularized``: the non-equilibrium part first projected onto its
     # stress (the second Hermite moment), which keeps low ``tau`` stable. In
     # the sponge (x from ``sponge_from`` to ``sponge_to``) ``tau`` rises
     # linearly by up to ``sponge_tau``, damping what leaves by the outlet.
+    # With ``factor`` (1 / 4 tau; 0: none), an interface cell's
+    # non-equilibrium part before collision, times ``factor``, goes into its
+    # ``out`` row (free until the stream): half a fine step's stress, for the
+    # explosion.
     q = lat.Q
     dim = lat.DIM
     for k in range(nodes.shape[0]):
@@ -332,6 +337,9 @@ def _collide(nodes, f, omega, lat, regularized, px, sponge_from, sponge_to, spon
             ramp = min((px[n] - sponge_from) / (sponge_to - sponge_from), 1.0)
             rate = 1.0 / (1.0 / omega + sponge_tau * ramp)
         rho, ux, uy, uz = _moments_at(f, n * q, q, dim)
+        if factor != 0.0 and role[n] == 1:
+            for o in range(q):
+                out[n * q + o] = factor * (f[n * q + o] - _feq(o, rho, ux, uy, uz, dim))
         if regularized == 1:
             pxx = rho * 0.0
             pyy = pxx
@@ -499,44 +507,23 @@ def _wall(n, o, finest, rows, role, px, py, pz, side, lx, ly, lz, width, height,
 
 
 @tack.kernel
-def _pull(nodes, rows, role, finest, px, py, pz, side, lx, ly, lz, width, height, depth, lat,
-          f, grad, out, lid, inflow, speed):
-    # A real leaf's pull: from the node upstream at its level, bouncing back
-    # from a solid one, or from beyond the domain (``_wall``).
+def _stream(nodes, parent, rows, level, role, at, finest, second, px, py, pz, side, lx, ly, lz,
+            width, height, depth, lat, f, grad, out, lid, inflow, speed):
+    # The pull, a thread per value, over a level's real leaves, interface cells
+    # (skipped: ``_store`` averages their ghosts) and ghosts. A real leaf pulls
+    # from the node upstream at its level, bouncing back from a solid one, or
+    # from beyond the domain (``_wall``). A ghost pulls from the node upstream
+    # at its level; from a coarser cell upstream, that cell's value at the
+    # first substep and, at the second, the value of the cell two fine steps
+    # upstream, the parent's upstream neighbour (bouncing there where that is
+    # beyond a wall); a coarser cell's value is its own at the point, by its
+    # gradient.
     q = lat.Q
     dim = lat.DIM
-    for k in range(nodes.shape[0]):
+    for k, o in tack.ndindex(nodes.shape[0], q):
         n = nodes[k]
-        for o in range(q):
-            r = rows[n * q + q - 1 - o]
-            if r >= 0:
-                if role[r] == 4:
-                    out[n * q + o] = f[n * q + q - 1 - o]
-                else:
-                    out[n * q + o] = f[r * q + o]
-            else:
-                out[n * q + o] = _wall(n, o, finest, rows, role, px, py, pz, side, lx, ly, lz,
-                                       width, height, depth, q, dim, f, grad, out, lid, inflow,
-                                       speed)
-
-
-@tack.kernel
-def _pull_ghosts(nodes, parent, rows, level, role, at, finest, second, px, py, pz, side, lx, ly,
-                 lz, width, height, depth, lat, f, grad, out, lid, inflow, speed):
-    # A ghost's pull: from the node upstream at its level; from a coarser cell
-    # upstream, that cell's value at the first substep and, at the second, the
-    # value of the cell two fine steps upstream, the parent's upstream
-    # neighbour (bouncing there where that is beyond a wall); a coarser cell's
-    # value is its own at the point, by its gradient.
-    q = lat.Q
-    dim = lat.DIM
-    for k in range(nodes.shape[0]):
-        n = nodes[k]
-        h = side[n]
-        for o in range(q):
-            cx = _CX[o]
-            cy = _CY[o]
-            cz = _cz(o, dim)
+        kind = role[n]
+        if kind != 1:
             r = rows[n * q + q - 1 - o]
             if r < 0:
                 out[n * q + o] = _wall(n, o, finest, rows, role, px, py, pz, side, lx, ly, lz,
@@ -544,24 +531,31 @@ def _pull_ghosts(nodes, parent, rows, level, role, at, finest, second, px, py, p
                                        speed)
             elif role[r] == 4:
                 out[n * q + o] = f[n * q + q - 1 - o]
-            elif level[r] == at:
+            elif kind == 0 or level[r] == at:
                 out[n * q + o] = f[r * q + o]
-            elif second == 0:
-                out[n * q + o] = _value_at(r, o, px[n] - cx * h, py[n] - cy * h, pz[n] - cz * h,
-                                           px, py, pz, side, lx, ly, lz, q, dim, f, grad)
             else:
-                s = rows[parent[n] * q + q - 1 - o]
-                if s >= 0:
-                    out[n * q + o] = _value_at(s, o, px[n] - 2 * cx * h, py[n] - 2 * cy * h,
-                                               pz[n] - 2 * cz * h, px, py, pz, side, lx, ly, lz,
-                                               q, dim, f, grad)
+                h = side[n]
+                cx = _CX[o]
+                cy = _CY[o]
+                cz = _cz(o, dim)
+                if second == 0:
+                    out[n * q + o] = _value_at(r, o, px[n] - cx * h, py[n] - cy * h,
+                                               pz[n] - cz * h, px, py, pz, side, lx, ly, lz, q,
+                                               dim, f, grad)
                 else:
-                    # Bounced at the upstream point, in the coarser cell.
-                    v = _value_at(r, q - 1 - o, px[n] - cx * h, py[n] - cy * h, pz[n] - cz * h,
-                                  px, py, pz, side, lx, ly, lz, q, dim, f, grad)
-                    if cy == -1 and height > 0.0 and py[n] + h > height:
-                        v = v + 6.0 * _weight(cx, cy, cz, dim) * cx * lid
-                    out[n * q + o] = v
+                    s = rows[parent[n] * q + q - 1 - o]
+                    if s >= 0:
+                        out[n * q + o] = _value_at(s, o, px[n] - 2 * cx * h, py[n] - 2 * cy * h,
+                                                   pz[n] - 2 * cz * h, px, py, pz, side, lx, ly,
+                                                   lz, q, dim, f, grad)
+                    else:
+                        # Bounced at the upstream point, in the coarser cell.
+                        v = _value_at(r, q - 1 - o, px[n] - cx * h, py[n] - cy * h,
+                                      pz[n] - cz * h, px, py, pz, side, lx, ly, lz, q, dim, f,
+                                      grad)
+                        if cy == -1 and height > 0.0 and py[n] + h > height:
+                            v = v + 6.0 * _weight(cx, cy, cz, dim) * cx * lid
+                        out[n * q + o] = v
 
 
 @tack.func
@@ -608,32 +602,52 @@ def _gradients(nodes, rows, level, role, at, lat, f, grad):
 
 
 @tack.kernel
-def _half_step(nodes, f, out, factor, lat):
-    # An interface cell's non-equilibrium part before collision, times
-    # ``factor`` (1 / 4 tau), into its ``out`` row (free until the stream):
-    # half a fine step's stress, for the explosion.
+def _gradients_explode(nodes, rows, level, role, at, lat, f, grad, number, table, half):
+    # ``_gradients`` a thread per value, over a level's border cells, and an
+    # interface cell's values then into its ghosts, as ``_explode`` does.
     q = lat.Q
     dim = lat.DIM
-    for k in range(nodes.shape[0]):
+    for k, o in tack.ndindex(nodes.shape[0], q):
         n = nodes[k]
-        rho, ux, uy, uz = _moments_at(f, n * q, q, dim)
-        for o in range(q):
-            out[n * q + o] = factor * (f[n * q + o] - _feq(o, rho, ux, uy, uz, dim))
-
-
-@tack.kernel
-def _coalesce(nodes, number, table, f, out, lat):
-    q = lat.Q
-    dim = lat.DIM
-    for k in range(nodes.shape[0]):
-        n = nodes[k]
-        kids = 1 << dim
-        r = (number[n] - 1) * kids
-        for o in range(q):
-            s = f[table[r] * q + o]
-            for j in range(1, kids):
-                s = s + f[table[r + j] * q + o]
-            out[n * q + o] = s / kids
+        centre = (q - 1) // 2
+        c = f[n * q + o]
+        g = c * 0.0
+        gx = g
+        gy = g
+        gz = g
+        stride = 1
+        for axis in range(dim):
+            lo = rows[n * q + centre - stride]
+            hi = rows[n * q + centre + stride]
+            g = _slope(c, f[max(lo, 0) * q + o], f[max(hi, 0) * q + o],
+                       _usable(lo, level, role, at), _usable(hi, level, role, at))
+            grad[n * q * dim + axis * q + o] = g
+            if axis == 0:
+                gx = g
+            elif axis == 1:
+                gy = g
+            else:
+                gz = g
+            stride = stride * 3
+        if role[n] == 1:
+            kids = 1 << dim
+            r = (number[n] - 1) * kids
+            for j in range(kids):
+                sx = 2 * (j & 1) - 1
+                sy = 2 * ((j >> 1) & 1) - 1
+                sz = 0
+                if dim == 3:
+                    sz = 2 * ((j >> 2) & 1) - 1
+                along = sx * _CX[o] + sy * _CY[o] + sz * _cz(o, dim)
+                lead = 0
+                if along > 0:
+                    lead = 1
+                elif along < 0:
+                    lead = -1
+                v = c + 0.25 * sx * gx + 0.25 * sy * gy + lead * half[n * q + o]
+                if dim == 3:
+                    v = v + 0.25 * sz * gz
+                f[table[r + j] * q + o] = v
 
 
 @tack.kernel
@@ -641,7 +655,7 @@ def _explode(nodes, number, table, f, grad, half, lat):
     # An interface cell's values into its ghosts, linear in its gradient, and
     # time-centred: a ghost on the downstream side of a direction (whose packet
     # reaches the fine cells a substep early) gains half a fine step's stress
-    # (``half``, from ``_half_step``), one on the upstream side loses it. The
+    # (``half``, from ``_collide``), one on the upstream side loses it. The
     # 2^d shares of each cancel, so each direction's total is the cell's.
     q = lat.Q
     dim = lat.DIM
@@ -671,11 +685,22 @@ def _explode(nodes, number, table, f, grad, half, lat):
 
 
 @tack.kernel
-def _store(nodes, out, f, lat):
+def _store(nodes, role, number, table, out, f, lat):
+    # The stream's values into ``f``, a thread per value, over a level's real
+    # leaves, interface cells and ghosts; an interface cell takes the mean of
+    # its ghosts (a level finer, so none of these).
     q = lat.Q
-    for k in range(nodes.shape[0]):
+    dim = lat.DIM
+    for k, o in tack.ndindex(nodes.shape[0], q):
         n = nodes[k]
-        for o in range(q):
+        if role[n] == 1:
+            kids = 1 << dim
+            r = (number[n] - 1) * kids
+            s = f[table[r] * q + o]
+            for j in range(1, kids):
+                s = s + f[table[r + j] * q + o]
+            f[n * q + o] = s / kids
+        else:
             f[n * q + o] = out[n * q + o]
 
 
@@ -823,6 +848,7 @@ class LBM:
             self.ghosts = [run(lv, 3, 3) for lv in levels]
             self.computed = [run(lv, 0, 2) for lv in levels]
             self.border = [run(lv, 1, 2) for lv in levels]
+            self.streamed = [run(lv, 0, 3) for lv in levels]
             self.px, self.py, self.pz, self.side = (tack.empty((n,), self.dtype) for _ in range(4))
             if n:
                 _centres(corner, sides, d, self.px, self.py, self.pz, self.side)
@@ -921,39 +947,41 @@ class LBM:
         self.steps += count
 
     def _step(self, lv, second):
+        # Four launches a level's step: collide (and the interface cells' half
+        # step), gradients and the explosion, the pull, the store (and the
+        # interface cells' mean of their ghosts).
         f, out, lat = self.f, self.out, self.lattice
+        factor = 0.0
         if len(self.interface[lv]):
             if self.centred:
-                _half_step(self.interface[lv], f, out, 0.25 / self.taus[lv], lat)
+                factor = 0.25 / self.taus[lv]
             else:
                 out.fill(0.0)
         if len(self.computed[lv]):
             start, extra = self.sponge if self.sponge is not None else (0.0, 0.0)
             end = self.walls[0] if self.sponge is not None else 0.0
             _collide(self.computed[lv], f, self.omega[lv], lat, int(self.regularized), self.px,
-                     float(start), float(end), float(extra * (1 << lv)))
-        if self.linear and len(self.border[lv]):
+                     float(start), float(end), float(extra * (1 << lv)), self.role_array, out,
+                     factor)
+        if lv < self.finest and len(self.interface[lv]):
+            if self.linear:
+                _gradients_explode(self.border[lv], self.rows, self.octree.level,
+                                   self.role_array, lv, lat, f, self.grad, self.number,
+                                   self.table, out)
+            else:
+                _explode(self.interface[lv], self.number, self.table, f, self.grad, out, lat)
+        elif self.linear and len(self.border[lv]):
             _gradients(self.border[lv], self.rows, self.octree.level, self.role_array, lv, lat, f,
                        self.grad)
         if lv < self.finest:
-            if len(self.interface[lv]):
-                _explode(self.interface[lv], self.number, self.table, f, self.grad, out, lat)
             self._step(lv + 1, 0)
             self._step(lv + 1, 1)
         finest = int(lv == self.finest)
         geometry = (self.px, self.py, self.pz, self.side, *self.lengths, *self.walls, lat)
-        if len(self.real[lv]):
-            _pull(self.real[lv], self.rows, self.role_array, finest, *geometry, f, self.grad, out,
-                  self.lid, self.inflow, self.speed)
-        if len(self.ghosts[lv]):
-            _pull_ghosts(self.ghosts[lv], self.parent, self.rows, self.octree.level,
-                         self.role_array, lv, finest, second, *geometry, f, self.grad, out,
-                         self.lid, self.inflow, self.speed)
-        if len(self.interface[lv]):
-            _coalesce(self.interface[lv], self.number, self.table, f, out, lat)
-        for nodes in (self.real[lv], self.ghosts[lv], self.interface[lv]):
-            if len(nodes):
-                _store(nodes, out, f, lat)
-
+        if len(self.streamed[lv]):
+            _stream(self.streamed[lv], self.parent, self.rows, self.octree.level,
+                    self.role_array, lv, finest, second, *geometry, f, self.grad, out, self.lid,
+                    self.inflow, self.speed)
+            _store(self.streamed[lv], self.role_array, self.number, self.table, out, f, lat)
 
 LBM2D = LBM
