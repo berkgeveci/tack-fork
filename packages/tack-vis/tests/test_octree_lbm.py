@@ -8,15 +8,13 @@ fine cells, conservation, and accuracy against a Taylor-Green vortex."""
 import numpy as np
 import pytest
 
-import tack
 from tack.dataset import octree_lbm as lb
 
 
 @pytest.fixture(autouse=True)
-def cpu():
-    tack.set_default_device("cpu")
+def _device(f64_backend):
+    """Every device with f64 (the comparisons are to 1e-13 and closer)."""
     yield
-    tack.set_default_device("cpu")
 
 
 _O = np.arange(9)

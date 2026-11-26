@@ -8,16 +8,14 @@ conservation with three levels, walls and remeshes."""
 import numpy as np
 import pytest
 
-import tack
 from tack.dataset import octree_lbm as lb
 from tack.dataset.octree_lbm_adapt import adapt
 
 
 @pytest.fixture(autouse=True)
-def cpu():
-    tack.set_default_device("cpu")
+def _device(f64_backend):
+    """Every device with f64 (the comparisons are to 1e-13 and closer)."""
     yield
-    tack.set_default_device("cpu")
 
 
 _O = np.arange(27)
