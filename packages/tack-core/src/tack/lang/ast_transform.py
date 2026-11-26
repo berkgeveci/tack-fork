@@ -1002,21 +1002,64 @@ class KernelTransformer(
             defs = {}
             for k in range(0, len(arg.args), 3):
                 method, names, inner = arg.args[k].value, arg.args[k + 1].value, arg.args[k + 2]
-                value, statements = self._visit_expression(inner)
-                if isinstance(value, list):
-                    raise self._source_error(
-                        node, f"{extern.name}()", f"calls the method '{method}', which "
-                        "returns a vector; a method C++ calls returns one scalar")
-                define = ir.IRFunctionDef(
-                    name=self._fresh_name(f"__tack_cb_{method}__"),
-                    params=[n for n in names.split(",") if n], body=statements, result=value)
-                define.call, define.slot = call, (position, method)
+                define = self._callback(node, extern, call, position, method,
+                                        [n for n in names.split(",") if n], inner)
                 defs[method] = define.name
                 # After the arguments' own statements: they are typed first.
                 self._pre_stmts.append(define)
             objects.append((position, defs))
         call.extern_objects = tuple(objects)
         return call
+
+    def _callback(self, node, extern, call, position, method, params, inner):
+        """The `IRFunctionDef` of one method a C++ function calls: ``inner``, the
+        method's call on ``params`` (one name per scalar the callback takes),
+        inlined. A pointer parameter is an array to the body, of no known
+        extent (as a local array without a size). A vector result is stored
+        through a further pointer parameter."""
+        from tack.cpp import Pointer, Vector
+        from tack.lang.ir_traversal import walk_ir
+        result_type, declared = extern.args[position].methods[method]
+        pointers, names = {}, iter(params)
+        for p in declared:
+            if isinstance(p, Vector):
+                for _ in range(p.n):
+                    next(names)
+                continue
+            name = next(names)
+            if isinstance(p, Pointer):
+                pointers[name] = p.writes
+                self._shared_vars.add(name)
+        value, statements = self._visit_expression(inner)
+        where = f"{extern.name}()"
+        if isinstance(result_type, Vector):
+            if not isinstance(value, list) or len(value) != result_type.n:
+                raise self._source_error(
+                    node, where, f"calls the method '{method}', declared to return a "
+                    f"vector of {result_type.n}, which returns "
+                    + (f"{len(value)} values" if isinstance(value, list) else "a scalar"))
+            out = self._fresh_name(f"__tack_cb_{method}_out__")
+            statements += [ir.IRArrayStore(ir.IRName(out), ir.IRConstant(c), component)
+                           for c, component in enumerate(value)]
+            params, value = [*params, out], None
+            pointers[out] = True
+        elif result_type is None:
+            value = None
+        elif isinstance(value, list):
+            raise self._source_error(
+                node, where, f"calls the method '{method}', which returns a vector; "
+                "declare its result a tack.cpp.vec")
+        for n in walk_ir(statements):
+            if (isinstance(n, (ir.IRArrayStore, ir.IRAtomicOp))
+                    and isinstance(n.array, ir.IRName) and pointers.get(n.array.name) is False):
+                raise self._source_error(
+                    node, where, f"calls the method '{method}', which stores through a "
+                    "pointer its declaration makes read-only (tack.cpp.ptr without "
+                    "writes=True)")
+        define = ir.IRFunctionDef(name=self._fresh_name(f"__tack_cb_{method}__"),
+                                  params=params, body=statements, result=value)
+        define.call, define.slot, define.pointers = call, (position, method), pointers
+        return define
 
     def _math_call(self, node, func_name: str, args: list):
         """A math builtin on scalars, or on each component when given a vector."""

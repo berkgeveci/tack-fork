@@ -283,6 +283,7 @@ def verify_ir(function: ir.IRFunction, stage: str):
             buffers.add(node.name)
         elif isinstance(node, ir.IRFunctionDef):
             bound.update(node.params)
+            buffers.update(node.pointers)
     # Inlined array arguments can remain as pointer copies in the IR.
     changed = True
     while changed:

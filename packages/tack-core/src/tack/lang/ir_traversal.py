@@ -37,7 +37,7 @@ CHILD_FIELDS = {
     ir.IRName: (),
     ir.IRAttribute: (('obj', 'expr'),),
     ir.IRCall: (('args', 'exprs'),),
-    ir.IRFunctionDef: (('body', 'stmts'), ('result', 'expr')),
+    ir.IRFunctionDef: (('body', 'stmts'), ('result', 'optional_expr')),
     ir.IRAssign: (('value', 'expr'),),
     ir.IRReturn: (('value', 'optional_expr'),),
     ir.IRCast: (('value', 'expr'),),

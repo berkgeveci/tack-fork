@@ -14,7 +14,7 @@ import pytest
 import tack
 import tack.arrays
 import tack.cpp
-from tack.cpp import T, indexable, obj, ptr
+from tack.cpp import T, indexable, obj, ptr, vec
 
 _HEADER = """
 #pragma once
@@ -708,6 +708,149 @@ def test_a_missing_protocol_method_is_named(generic):
 
     with pytest.raises(Exception, match="has no @tack.func method '__len__'"):
         smooth(NoLength(), tack.zeros(4, tack.f64))
+
+
+_CALLBACKS = """
+namespace demo {
+// The work of a vector field along a segment, by the trapezoid rule: the
+// points are the C++'s, the field Tack's, taking and returning vectors.
+template <class F, class V> V work(const F& f, V x1, V y1, int n) {
+  V s = 0;
+  for (int k = 0; k < n; ++k) {
+    V t0 = V(k) / n, t1 = V(k + 1) / n;
+    std::array<V, 2> a{t0 * x1, t0 * y1}, b{t1 * x1, t1 * y1};
+    std::array<V, 2> fa = f.field(a), fb = f.field(b);
+    s += V(0.5) * ((fa[0] + fb[0]) * (b[0] - a[0]) + (fa[1] + fb[1]) * (b[1] - a[1]));
+  }
+  return s;
+}
+// Tack fills a buffer the C++ owns, then reads it back.
+template <class F, class V> V moments(const F& f, V x) {
+  V buffer[4];
+  f.fill(buffer, x);
+  return f.weigh(buffer);
+}
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def callbacks():
+    return tack.cpp.Library(source=_CALLBACKS)
+
+
+@pytest.mark.parametrize("dtype", [tack.f32, tack.f64])
+def test_methods_cpp_calls_take_and_return_vectors(callbacks, dtype):
+    work = callbacks.function(
+        "demo::work", result=T,
+        args=(obj(field=(vec(T, 2), (vec(T, 2),))), T, T, tack.i32))
+
+    @tack.device_class
+    class Gradient:
+        """The gradient of k x y: its work from the origin is k x1 y1."""
+
+        def __init__(self, k):
+            self.k = k
+
+        @tack.func
+        def field(self, p):
+            return tack.vec2(self.k * p[1], self.k * p[0])
+
+    @tack.kernel
+    def works(f, ends, out):
+        for i in range(out.shape[0]):
+            out[i] = work(f, ends[i], 1.5, 16)
+
+    ends = np.linspace(0.5, 2, 10).astype(dtype.numpy_dtype)
+    out = tack.zeros(10, dtype)
+    works(Gradient(3.0), tack.array(ends), out)
+    np.testing.assert_allclose(out.numpy(), 3.0 * ends * 1.5,
+                               rtol=50 * np.finfo(dtype.numpy_dtype).eps)
+
+
+def test_methods_cpp_calls_take_pointers_to_its_memory(callbacks):
+    moments = callbacks.function(
+        "demo::moments", result=T,
+        args=(obj(fill=(None, (ptr(T, writes=True), T)), weigh=(T, (ptr(T),))), T))
+
+    @tack.device_class
+    class Powers:
+        def __init__(self, weights):
+            self.w = weights
+
+        @tack.func
+        def fill(self, buffer, x):
+            v = 1.0 + 0.0 * x
+            for k in range(4):
+                buffer[k] = v
+                v = v * x
+
+        @tack.func
+        def weigh(self, buffer):
+            s = 0.0 * buffer[0]
+            for k in range(4):
+                s += self.w[k] * buffer[k]
+            return s
+
+    @tack.kernel
+    def polynomial(f, x, out):
+        for i in range(out.shape[0]):
+            out[i] = moments(f, x[i])
+
+    x = np.linspace(-1, 1, 10)
+    w = np.array([1.0, -2.0, 0.5, 3.0])
+    out = tack.zeros(10, tack.f64)
+    polynomial(Powers(tack.array(w)), tack.array(x), out)
+    np.testing.assert_allclose(out.numpy(), np.polyval(w[::-1], x), rtol=1e-14)
+    # Stores into C++ memory write none of the kernel's arrays: a read-only one works.
+    polynomial(Powers(tack.array_from_ptr(w.ctypes.data, (4,), tack.f64)),
+               tack.array(x), out)
+    np.testing.assert_allclose(out.numpy(), np.polyval(w[::-1], x), rtol=1e-14)
+
+
+def test_callback_declarations_are_held_to(callbacks):
+    moments = callbacks.function(
+        "demo::moments", result=T,
+        args=(obj(fill=(None, (ptr(T), T)), weigh=(T, (ptr(T),))), T))
+    work = callbacks.function(
+        "demo::work", result=T,
+        args=(obj(field=(vec(T, 3), (vec(T, 2),))), T, T, tack.i32))
+
+    @tack.device_class
+    class Writer:
+        def __init__(self):
+            self.k = 1.0
+
+        @tack.func
+        def fill(self, buffer, x):
+            buffer[0] = x
+
+        @tack.func
+        def weigh(self, buffer):
+            return buffer[0]
+
+        @tack.func
+        def field(self, p):
+            return p
+
+    @tack.kernel
+    def stores(f, out):
+        for i in range(out.shape[0]):
+            out[i] = moments(f, 1.0)
+
+    @tack.kernel
+    def short(f, out):
+        for i in range(out.shape[0]):
+            out[i] = work(f, 1.0, 1.0, 4)
+
+    out = tack.zeros(2, tack.f64)
+    with pytest.raises(Exception, match="stores through a pointer its declaration makes read-only"):
+        stores(Writer(), out)
+    with pytest.raises(Exception, match="declared to return a vector of 3, which returns 2"):
+        short(Writer(), out)
+    with pytest.raises(TypeError, match="returns a scalar, a tack.cpp.vec or None"):
+        callbacks.function("demo::work", result=T,
+                           args=(obj(field=(ptr(T), (T,))), T, T, tack.i32))
 
 
 def _eigen():

@@ -257,6 +257,8 @@ def written_array_params(ir_func):
     for node in _walk_ir(ir_func.body):
         if isinstance(node, (ir.IRSharedAlloc, ir.IRLocalAlloc)):
             local.add(node.name)
+        elif isinstance(node, ir.IRFunctionDef):
+            local.update(node.pointers)     # memory the C++ owns
         elif isinstance(node, ir.IRAssign) and isinstance(node.value, ir.IRName):
             copies.append((node.target, node.value.name))
         elif isinstance(node, (ir.IRArrayStore, ir.IRAtomicOp)):

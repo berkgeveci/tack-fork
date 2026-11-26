@@ -1244,7 +1244,8 @@ class LLVMCodeGen:
         along and the C++ struct holds. Always inlined once linked."""
         from tack.lang.ir_traversal import walk_ir
         bound, captured = set(node.params), []
-        for n in walk_ir([*node.body, node.result]):
+        body = [*node.body, *([node.result] if node.result is not None else [])]
+        for n in walk_ir(body):
             if isinstance(n, ir.IRAssign):
                 bound.add(n.target)
             elif isinstance(n, ir.IRSequentialFor):
@@ -1253,7 +1254,7 @@ class LLVMCodeGen:
                 bound.add(n.name)
             elif isinstance(n, ir.IRTextureSample):
                 raise NotImplementedError("a method C++ calls cannot sample a texture")
-        for n in walk_ir([*node.body, node.result]):
+        for n in walk_ir(body):
             if isinstance(n, ir.IRName) and n.name not in bound and n.name not in captured:
                 captured.append(n.name)
         # For their types; the call passes the values it finds there.
@@ -1266,9 +1267,14 @@ class LLVMCodeGen:
                 return f"int{t.width}_t"
             return "double" if isinstance(t, llvm_ir.DoubleType) else "float"
 
-        result = _llvm_type(node.result_type)
+        def param_type(t):
+            pointee = getattr(t, "writes", None) is not None
+            return _llvm_type(t.dtype).as_pointer() if pointee else _llvm_type(t)
+
+        result = (llvm_ir.VoidType() if node.result_type is None
+                  else _llvm_type(node.result_type))
         fn = llvm_ir.Function(self.module, llvm_ir.FunctionType(
-            result, [_llvm_type(t) for t in node.param_types] + [v.type for v in outer]),
+            result, [param_type(t) for t in node.param_types] + [v.type for v in outer]),
             name=f"tack_cb_{len(self._callbacks)}_{kernel_entry_name(self.ir_func.name)}")
         fn.attributes.add("alwaysinline")
         self._callbacks[node.name] = (fn.name, captured, [c_type(v.type) for v in outer])
@@ -1282,6 +1288,8 @@ class LLVMCodeGen:
                                            [None] * len(node.params) + outer):
             arg.name = name
             self._params[name] = arg
+            if name in node.pointers:
+                self._array_params.add(name)
             if dtype in UNSIGNED_TYPES or (value is not None
                                            and id(value) in self._unsigned_vals):
                 self._unsigned_vals.add(id(arg))
@@ -1289,9 +1297,11 @@ class LLVMCodeGen:
         self.builder = llvm_ir.IRBuilder(entry)
         self._func, self._entry_block = fn, entry
         self._emit_body(node.body)
-        value = self._coerce_to(self._emit_expr(node.result), result,
-                                target_unsigned=node.result_type in UNSIGNED_TYPES)
-        self.builder.ret(value)
+        if node.result is None:
+            self.builder.ret_void()
+        else:
+            self.builder.ret(self._coerce_to(self._emit_expr(node.result), result,
+                                             target_unsigned=node.result_type in UNSIGNED_TYPES))
         (self.builder, self._func, self._entry_block, self._locals, self._params,
          self._break_target, self._continue_target) = saved
 

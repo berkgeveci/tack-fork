@@ -1102,7 +1102,7 @@ class _Specializer:
         holding, per method the function's declaration names, that method's call
         on fresh argument names -- resolved as any method call is, so lowering
         inlines it as the body of the function C++ calls back."""
-        from tack.cpp import Object
+        from tack.cpp import Object, Vector
         args = list(call.args)
         for position in bound:
             spec = extern.args[position] if position < len(extern.args) else None
@@ -1113,13 +1113,21 @@ class _Specializer:
                     "its declaration does not make a tack.cpp.obj")
             parts = []
             for method, (_, params) in spec.methods.items():
-                names = []
-                for _ in params:
-                    names.append(fresh_name(f"__tack_cb_{method}", self.used_names))
+                # One name per scalar the callback takes: a vector argument is
+                # its components, given to the method as a vector.
+                names, given = [], []
+                for p in params:
+                    count = p.n if isinstance(p, Vector) else 1
+                    own = [fresh_name(f"__tack_cb_{method}", self.used_names)
+                           for _ in range(count)]
+                    names += own
+                    loads = [ast.Name(id=n, ctx=ast.Load()) for n in own]
+                    given.append(ast.List(elts=loads, ctx=ast.Load())
+                                 if isinstance(p, Vector) else loads[0])
                 inner = ast.Call(
                     func=ast.Attribute(value=copy_ast(args[position]), attr=method,
                                        ctx=ast.Load()),
-                    args=[ast.Name(id=n, ctx=ast.Load()) for n in names], keywords=[])
+                    args=given, keywords=[])
                 resolved = None
                 for root, owner in roots.items():
                     chain = _chain(inner.func, root)

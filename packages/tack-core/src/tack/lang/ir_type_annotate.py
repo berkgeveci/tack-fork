@@ -552,18 +552,32 @@ def _annotate_stmt(node, env, array_params, var_types=None, collected=None):
         # A method C++ calls back: typed by the C++ function's declaration, once
         # the call it serves has fixed that declaration's T. The call's own
         # arguments are evaluated before this statement, so they type here.
+        from tack.cpp import Pointer, Vector
         _type_extern_call(node.call, env, array_params)
         position, method = node.slot
         result, params = node.call.extern_types[1][position].methods[method]
-        if len(params) != len(node.params):
+        # One type per parameter of the function: a vector's components each,
+        # a pointer as a Pointer, and where a vector result goes.
+        flat = []
+        for t in params:
+            flat += [t.dtype] * t.n if isinstance(t, Vector) else [t]
+        if isinstance(result, Vector):
+            flat.append(Pointer(result.dtype, True))
+        if len(flat) != len(node.params):
             raise TypeError(f"{node.call.func_name}(): the method '{method}' takes "
-                            f"{len(node.params)} arguments, declared with {len(params)}")
-        for name, t in zip(node.params, params):
-            env[name] = t
+                            f"{len(node.params)} values, declared with {len(flat)}")
+        for name, t in zip(node.params, flat):
+            if isinstance(t, Pointer):
+                env[name] = t.dtype
+                array_params.add(name)
+            else:
+                env[name] = t
         _annotate_body(node.body, env, array_params, var_types, collected)
-        _annotate_expr(node.result, env, array_params)
-        _adopt(node.result, result)
-        node.param_types, node.result_type = tuple(params), result
+        if node.result is not None:
+            _annotate_expr(node.result, env, array_params)
+            _adopt(node.result, result)
+        node.param_types = tuple(flat)
+        node.result_type = result if isinstance(result, ScalarType) else None
         return
 
     if isinstance(node, (ir.IRBreak, ir.IRContinue, ir.IRBarrier)):

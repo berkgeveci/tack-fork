@@ -282,6 +282,10 @@ class IRFunctionDef(IRNode):
     #: The `IRCall` it serves, and ``(declared position, method name)`` there.
     call = None
     slot = None
+    #: Parameters that are pointers (a ``tack.cpp.ptr``, or where a vector result
+    #: goes): name -> whether the body may store through it. ``result`` is None
+    #: when the function returns nothing (a vector result is stored there).
+    pointers = {}
     #: Its types, from the C++ function's declaration (type annotation).
     param_types = None
     result_type = None

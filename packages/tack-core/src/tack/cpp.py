@@ -54,9 +54,13 @@ for a template parameter the C++ calls methods on::
         out[i] = integrate(field, a[i], b[i])     # field.value(x) is a @tack.func
 
 The C++ receives a struct Tack writes for the call, with one method per name
-declared, typed as declared (scalars), which calls the object's method;
-both are inlined, so the method's arithmetic ends up inside the C++ loop.
-The struct lasts for the call: the C++ must not keep it.
+declared, typed as declared, which calls the object's method; both are
+inlined, so the method's arithmetic ends up inside the C++ loop. The struct
+lasts for the call: the C++ must not keep it. A method takes scalars,
+``ptr(type)`` (a pointer the C++ passes, which the method indexes as an
+array, unchecked even in debug mode, and stores through only if
+``writes=True``) and ``vec(type, n)`` (``std::array<type, n>`` in C++, a
+vector in the method); it returns a scalar, a ``vec`` or nothing (None).
 
 The protocol methods take their C++ spellings: ``__getitem__`` is
 ``operator[]``, ``__len__`` is ``size()`` and ``__call__`` is ``operator()``,
@@ -79,7 +83,8 @@ from pathlib import Path
 
 from tack.lang.types import ScalarType, f32, f64
 
-__all__ = ["ExternFunc", "Library", "Object", "Pointer", "T", "indexable", "obj", "ptr"]
+__all__ = ["ExternFunc", "Library", "Object", "Pointer", "T", "Vector", "indexable", "obj",
+           "ptr", "vec"]
 
 
 class _TypeVariable:
@@ -131,6 +136,32 @@ def ptr(dtype, writes=False):
     return Pointer(dtype, writes)
 
 
+class Vector:
+    """A vector of ``n`` scalars of ``dtype`` (a scalar type or ``T``) that a
+    method C++ calls takes or returns: ``std::array<dtype, n>`` in C++."""
+
+    def __init__(self, dtype, n):
+        if not (isinstance(n, int) and 1 <= n <= 16):
+            raise ValueError(f"tack.cpp.vec takes 1 to 16 components, not {n!r}")
+        self.dtype = dtype
+        self.n = n
+
+    def __repr__(self):
+        return f"tack.cpp.vec({self.dtype!r}, {self.n})"
+
+    def __deepcopy__(self, memo):
+        return self
+
+    @property
+    def name(self):
+        return f"v{self.n}{self.dtype.name}"
+
+
+def vec(dtype, n):
+    """The type of a vector a method C++ calls takes or returns."""
+    return Vector(dtype, n)
+
+
 class Object:
     """A device-class argument: ``methods`` maps each method the C++ calls to
     its ``(result type, argument types)``, scalar types or ``T``."""
@@ -164,6 +195,8 @@ _CPP_METHODS = {"__getitem__": "operator[]", "__len__": "size", "__call__": "ope
 
 
 def _c_type(t):
+    if isinstance(t, Vector):
+        return f"std::array<{_C_TYPES[t.dtype.name]}, {t.n}>"
     if isinstance(t, Pointer):
         return ("" if t.writes else "const ") + _C_TYPES[t.dtype.name] + "*"
     return _C_TYPES[t.name]
@@ -252,9 +285,13 @@ class ExternFunc:
         for t in args:
             if isinstance(t, Object):
                 for method, (r, params) in t.methods.items():
-                    if not (scalar(r) and all(scalar(p) for p in params)):
-                        raise TypeError(f"{name}: the method '{method}' takes and "
-                                        "returns scalar types or tack.cpp.T")
+                    def held(p):
+                        return isinstance(p, (Vector, Pointer)) and scalar(p.dtype)
+                    if not ((r is None or scalar(r) or (held(r) and isinstance(r, Vector)))
+                            and all(scalar(p) or held(p) for p in params)):
+                        raise TypeError(
+                            f"{name}: the method '{method}' takes scalars, tack.cpp.ptr "
+                            "and tack.cpp.vec, and returns a scalar, a tack.cpp.vec or None")
             elif not (scalar(t) or (isinstance(t, Pointer) and scalar(t.dtype))):
                 raise TypeError(f"{name}: {t!r} is not a scalar type, tack.cpp.T, "
                                 "a tack.cpp.ptr of one or a tack.cpp.obj")
@@ -331,6 +368,8 @@ class ExternFunc:
         def concrete(t):
             if isinstance(t, Pointer):
                 return Pointer(concrete(t.dtype), t.writes)
+            if isinstance(t, Vector):
+                return Vector(concrete(t.dtype), t.n)
             if isinstance(t, Object):
                 return Object({name: (concrete(r), [concrete(p) for p in params])
                                for name, (r, params) in t.methods.items()})
@@ -376,18 +415,38 @@ class ExternFunc:
             struct, fields, given, methods = f"{symbol}_o{k}", [], [], []
             for m, (method, callback, captured) in enumerate(objects[k]):
                 r, takes = t.methods[method]
-                own = [f"{_c_type(p)} x{j}" for j, p in enumerate(takes)]
                 held = [f"m{m}c{j}" for j in range(len(captured))]
-                lines.append(f'extern "C" {_c_type(r)} {callback}('
-                             + ", ".join([*(_c_type(p) for p in takes), *captured]) + ");")
+                # The callback takes a vector as its components, returns one
+                # through a pointer to them, and then the values captured.
+                own, passes, arguments = [], [], []
+                for j, p in enumerate(takes):
+                    if isinstance(p, Vector):
+                        own.append(f"const {_c_type(p)}& x{j}")
+                        passes += [_C_TYPES[p.dtype.name]] * p.n
+                        arguments += [f"x{j}[{c}]" for c in range(p.n)]
+                    else:
+                        own.append(f"{_c_type(p)} x{j}")
+                        passes.append(_c_type(p))
+                        arguments.append(f"x{j}")
+                if isinstance(r, Vector):
+                    passes.append(_C_TYPES[r.dtype.name] + "*")
+                    returns, gives = "void", _c_type(r)
+                    body = (f"{gives} r; {callback}({', '.join([*arguments, 'r.data()', *held])});"
+                            " return r;")
+                elif r is None:
+                    returns = gives = "void"
+                    body = f"{callback}({', '.join([*arguments, *held])});"
+                else:
+                    returns = gives = _c_type(r)
+                    body = f"return {callback}({', '.join([*arguments, *held])});"
+                lines.append(f'extern "C" {returns} {callback}('
+                             + ", ".join([*passes, *captured]) + ");")
                 fields += [f"{c} {h};" for c, h in zip(captured, held)]
                 given += [f"o{k}{h}" for h in held]
                 captures += [f"{c} o{k}{h}" for c, h in zip(captured, held)]
                 methods.append(
-                    f"  __attribute__((always_inline)) {_c_type(r)} "
-                    f"{_CPP_METHODS.get(method, method)}("
-                    + ", ".join(own) + ") const { return " + callback + "("
-                    + ", ".join([*(f"x{j}" for j in range(len(takes))), *held]) + "); }")
+                    f"  __attribute__((always_inline)) {gives} "
+                    f"{_CPP_METHODS.get(method, method)}({', '.join(own)}) const {{ {body} }}")
             lines.append("namespace { struct " + struct + " {\n  " + " ".join(fields) + "\n"
                          + "\n".join(methods) + "\n}; }")
             setup.append(f"{struct} o{k}{{{', '.join(given)}}};")
@@ -425,7 +484,7 @@ def clang() -> str:
 def _prefix(library) -> str:
     """What every instantiation of ``library`` starts with: its headers and
     its own text. Parsed once per process (`_precompiled`)."""
-    lines = ["#include <cstdint>"]
+    lines = ["#include <array>", "#include <cstdint>"]
     lines += [f'#include "{h}"' for h in library.headers]
     lines.append(library.source)
     return "\n".join(lines) + "\n"
