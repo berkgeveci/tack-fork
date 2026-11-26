@@ -151,8 +151,13 @@ def read_octree(path, step=0, blocks=None, fields=None, device=None):
     # Whole trees in order: no two blocks share a tree, and each starts after the last.
     held = trees[:, 0] >= 0
     ordered = bool((trees[held, 0][1:] > trees[held, 1][:-1]).all()) if held.sum() > 1 else True
+    from tack.dataset.octree import _compute_type
+    from tack.runtime import dispatch
+
+    dtype = _compute_type(dispatch.as_device(dispatch.get_backend()) if device is None else device,
+                          tack.f32)                   # f64 where the device has it
     roots = rectilinear_grid(*axes[:dimension], *([(axes[2][0],)] if dimension == 2 else []),
-                             dtype=tack.f64, device=device)
+                             dtype=dtype, device=device)
     hidden = (arrays["marks"] & Ghosts.HIDDENCELL) != 0
     field_arrays = {name: arrays[name] for name in names}
     return OctreeDataSet(roots, arrays["tree"], arrays["level"].astype(np.int64), arrays["key"],
