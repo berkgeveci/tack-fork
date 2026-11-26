@@ -82,6 +82,14 @@ def _beside(r, at, level, role, number, table, q, dim, f):
 
 
 @tack.kernel
+def _wanted_refined(nodes, want, out):
+    # 1 where a leaf was marked to refine: `adapt`'s count of refined leaves, by
+    # a sum on the device rather than a read of every node's mark.
+    for k in range(nodes.shape[0]):
+        out[k] = 1 if want[nodes[k]] == 1 else 0
+
+
+@tack.kernel
 def _vorticity(nodes, rows, level, role, number, table, side, lat, f, out):
     # |vorticity| at a computational cell, by differences with its neighbours
     # at its level (a refined one by its children's mean).
@@ -453,8 +461,17 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
     # reads none before that, but whoever looks at the state does).
     new.fill_ghosts()
     new.steps = solver.steps
-    wanted = want.numpy()
-    stats = {"refined": int(((wanted == 1) & computational).sum()),
-             "merged": int(merge.numpy().sum()), "cells": int(new.computational().sum()),
+    # The counts by sums on the device, not reads of every node's marks; the
+    # computational cells are the new solver's computed runs (real and interface).
+    refined = merged = 0
+    with device:
+        if len(leaves):
+            marked = tack.empty((len(leaves),), tack.i32)
+            _wanted_refined(leaves_d, want, marked)
+            refined = int(marked.sum())
+        if len(refined_nodes):
+            merged = int(merge.sum())
+    stats = {"refined": refined, "merged": merged,
+             "cells": sum(len(nodes) for nodes in new.computed),
              "rounds": rounds, "ms": 1000 * (time.perf_counter() - begin)}
     return new, stats
