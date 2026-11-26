@@ -131,6 +131,47 @@ def test_a_vector_passes_its_components_and_a_name_may_fix_template_arguments(li
     np.testing.assert_allclose(out.numpy(), np.linalg.norm(vs, axis=1), rtol=1e-6)
 
 
+def test_literals_leave_t_to_the_kernel_and_t_can_be_fixed(lib):
+    """Float literals decide nothing, so a call given only literals for T takes
+    the kernel's float type; `of` and ``T=`` fix it."""
+    damped = lib.function("demo::damped", result=T, args=(T, T))
+
+    @tack.kernel
+    def constant(out):
+        for i in range(out.shape[0]):
+            out[i] = damped(0.1, 0.25)
+
+    damped32 = damped.of(tack.f32)
+
+    @tack.kernel
+    def narrow(out):
+        for i in range(out.shape[0]):
+            out[i] = damped32(0.1, 0.25)
+
+    exact = 0.1 * np.exp(-0.25 * 0.01)
+    out = tack.zeros(4, tack.f64)
+    constant(out)
+    assert out.numpy()[0] == pytest.approx(exact, rel=1e-15)     # f64: the kernel's
+    narrow(out)
+    assert out.numpy()[0] == np.float32(np.float32(0.1) * np.exp(np.float32(-0.0025)))
+    out32 = tack.zeros(4, tack.f32)
+    constant(out32)
+    assert out32.numpy()[0] == pytest.approx(exact, rel=1e-6)
+    wide = lib.function("demo::damped", result=T, args=(T, T), T=tack.f64)
+
+    @tack.kernel
+    def widened(x, out):
+        for i in range(out.shape[0]):
+            out[i] = wide(x[i], 0.25)        # f32 argument, f64 computation
+
+    wide_out = tack.zeros(1, tack.f64)
+    widened(tack.full(1, 0.1, tack.f32), wide_out)
+    x = float(np.float32(0.1))
+    assert wide_out.numpy()[0] == pytest.approx(x * np.exp(-0.25 * x * x), rel=1e-15)
+    with pytest.raises(TypeError, match="f32 or f64"):
+        damped.of(tack.i32)
+
+
 def test_integer_functions(lib):
     twice = lib.function("demo::twice", result=tack.i32, args=(tack.i32,))
 

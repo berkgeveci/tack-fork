@@ -62,7 +62,9 @@ def _type_extern_call(node, env, array_params):
             given.append(Pointer(env[arg.name]))
         else:
             given.append(_annotate_expr(arg, env, array_params))
-    result, declared = node.extern.bind(given)
+    weak = {k for k, arg in enumerate(node.args) if getattr(arg, '_weak', False)}
+    result, declared = node.extern.bind(
+        given, weak, getattr(array_params, 'float_context', f32))
     for arg, t in zip(node.args, node.extern.passed(declared)):
         if not isinstance(t, Pointer):
             _adopt(arg, t)
@@ -76,6 +78,8 @@ class _ArrayNames(set):
     allocates (``allocated``), which read as their element type elsewhere."""
 
     allocated = frozenset()
+    #: The kernel's float type: f64 if an array parameter is.
+    float_context = f32
 
 
 def annotate_types(ir_func: ir.IRFunction):
@@ -104,6 +108,7 @@ def annotate_types(ir_func: ir.IRFunction):
     # the literal, see ir_optimize), takes the kernel's float precision:
     # f64 when an array is f64, as float scalar arguments do.
     float_context = f64 if any(base_env[p] is f64 for p in array_params) else f32
+    array_params.float_context = float_context
     literal_only = (_literal_only_locals(ir_func.body) - pinned
                     if float_context is f64 else set())
 

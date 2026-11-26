@@ -27,9 +27,14 @@ clang is found as ``TACK_CLANG``, else ``clang++`` on the path, and is needed
 only where such a kernel is compiled. Its LLVM must not be newer than
 llvmlite's, which reads bitcode of its own version and older.
 
-``T`` is one floating type per call: f64 if an argument given for a ``T`` is
-f64, else f32, as the math builtins choose theirs. Any other entry is a Tack
-scalar type, to which the argument converts.
+``T`` is one floating type per call. An array given for a ``ptr(T)`` decides
+it; else the scalars given for a ``T``: f64 if one is, f32 if not, as the
+math builtins choose. Float literals do not decide, as they decide nothing
+elsewhere in Tack: where only they (or nothing) are given for ``T``, it is
+the kernel's float type, f64 if an array argument of the kernel is f64, else
+f32. ``function(..., T=tack.f64)``, or ``f.of(tack.f64)`` for a function
+already declared, fixes it instead. Any other entry is a Tack scalar type, to
+which the argument converts.
 
 ``ptr(type)`` takes an array: an array argument of the kernel (also one a
 device class holds) or a ``tack.local_array``, passed as the address of its
@@ -194,11 +199,12 @@ class Library:
         self._fingerprint = None
         self._base = None
 
-    def function(self, name, *, result, args):
+    def function(self, name, *, result, args, T=None):
         """The C++ function ``name`` (qualified; ``{T}`` in it is replaced by the
         call's floating type, as in ``"demo::norm<{T}, 3>"``), returning
-        ``result`` for arguments of types ``args``."""
-        return ExternFunc(self, name, result, tuple(args))
+        ``result`` for arguments of types ``args``. ``T``, f32 or f64, fixes
+        that type for every call instead."""
+        return ExternFunc(self, name, result, tuple(args), T)
 
     def __deepcopy__(self, memo):
         return self
@@ -233,7 +239,11 @@ class Library:
 class ExternFunc:
     """A C++ function a kernel calls; made by `Library.function`."""
 
-    def __init__(self, library, name, result, args):
+    def __init__(self, library, name, result, args, fixed=None):
+        if fixed is not None and fixed not in (f32, f64):
+            raise TypeError(f"{name}: T is f32 or f64, not {fixed!r}")
+        self.fixed = fixed
+
         def scalar(t):
             return t is T or (isinstance(t, ScalarType) and t.name in _C_TYPES)
         if result is not None and not scalar(result):
@@ -257,11 +267,15 @@ class ExternFunc:
         raise TypeError(f"the C++ function {self.name} is called in a kernel or a "
                         "@tack.func, not from Python")
 
+    def of(self, dtype):
+        """This function with ``T`` fixed to ``dtype`` (f32 or f64)."""
+        return ExternFunc(self.library, self.name, self.result, self.args, dtype)
+
     def __deepcopy__(self, memo):
         return self
 
     def fingerprint(self) -> tuple:
-        return ("cpp", self.name, repr(self.result), repr(self.args),
+        return ("cpp", self.name, repr(self.result), repr(self.args), repr(self.fixed),
                 self.library.fingerprint())
 
     @property
@@ -270,10 +284,12 @@ class ExternFunc:
         return tuple(k for k, t in enumerate(self.args)
                      if isinstance(t, Pointer) and t.writes)
 
-    def bind(self, arg_types):
+    def bind(self, arg_types, weak=(), default=f32):
         """``(result type, argument types)`` of a call given arguments of
         ``arg_types``: a scalar's type, or for an array a `Pointer` of its
-        element type. A function without a result gives i32 (always 0)."""
+        element type. ``weak`` holds the positions of float literal arguments,
+        which do not decide ``T``; ``default`` is ``T`` where nothing does (the
+        kernel's float type). A function without a result gives i32 (always 0)."""
         passed = self.passed(self.args)
         if len(arg_types) != len(passed):
             raise TypeError(f"{self.name}() takes {len(passed)} arguments "
@@ -298,11 +314,19 @@ class ExternFunc:
         if len(pointed) > 1:
             raise TypeError(f"{self.name}(): the arrays given for tack.cpp.T are of "
                             "f32 and f64; one call has one T")
-        if pointed:
+        deciding = [given for k, (given, declared) in enumerate(zip(arg_types, passed))
+                    if declared is T and k not in weak]
+        if self.fixed is not None:
+            floating = self.fixed
+            if pointed and pointed != {floating}:
+                raise TypeError(f"{self.name}(): T is fixed to {floating.name}, and an "
+                                f"array of {pointed.pop().name} is given for it")
+        elif pointed:
             floating = pointed.pop()    # a pointer cannot convert, so it decides
+        elif deciding:
+            floating = f64 if any(given is f64 for given in deciding) else f32
         else:
-            floating = f64 if any(given is f64 for given, declared
-                                  in zip(arg_types, passed) if declared is T) else f32
+            floating = default
 
         def concrete(t):
             if isinstance(t, Pointer):
