@@ -583,18 +583,22 @@ def _slope(c, lo, hi, use_lo, use_hi):
 @tack.kernel
 def _gradients(nodes, rows, level, role, at, lat, f, grad):
     # Each direction's change across a cell along each axis, central where both
-    # neighbours at the level hold values, one-sided where one does.
+    # neighbours at the level hold values, one-sided where one does. ``at`` is
+    # the nodes' level, or -1: each node's own (nodes of every level at once).
     q = lat.Q
     dim = lat.DIM
     for k in range(nodes.shape[0]):
         n = nodes[k]
+        here = at
+        if at < 0:
+            here = level[n]
         centre = (q - 1) // 2
         stride = 1
         for axis in range(dim):
             lo = rows[n * q + centre - stride]
             hi = rows[n * q + centre + stride]
-            use_lo = _usable(lo, level, role, at)
-            use_hi = _usable(hi, level, role, at)
+            use_lo = _usable(lo, level, role, here)
+            use_hi = _usable(hi, level, role, here)
             for o in range(q):
                 grad[n * q * dim + axis * q + o] = _slope(f[n * q + o], f[max(lo, 0) * q + o],
                                                           f[max(hi, 0) * q + o], use_lo, use_hi)
@@ -861,6 +865,7 @@ class LBM:
             self.out = tack.zeros((n * q,), self.dtype)
         self.steps = 0
         self._centres = None
+        self._valued = None
 
     # -- state ----------------------------------------------------------------
 
@@ -937,10 +942,29 @@ class LBM:
                 if not len(self.interface[lv]):
                     continue
                 if self.linear:
-                    _gradients(self.interface[lv], self.rows, self.octree.level,
-                               self.role_array, lv, self.lattice, self.f, self.grad)
-                _explode(self.interface[lv], self.number, self.table, self.f, self.grad,
-                         self.out, self.lattice)
+                    _gradients_explode(self.interface[lv], self.rows, self.octree.level,
+                                       self.role_array, lv, self.lattice, self.f, self.grad,
+                                       self.number, self.table, self.out)
+                else:
+                    _explode(self.interface[lv], self.number, self.table, self.f, self.grad,
+                             self.out, self.lattice)
+
+    def vorticity(self, out=None):
+        """``|vorticity|`` at every node that holds values (real leaves,
+        interface cells, ghosts; fill the ghosts first), in one launch, into
+        ``out`` (a device array of a value a node; made, zero elsewhere, if not
+        given)."""
+        from tack.dataset.octree_lbm_adapt import _vorticity
+
+        with self.octree.device:
+            if out is None:
+                out = tack.zeros((self.octree.num_nodes,), self.dtype)
+            if self._valued is None:
+                self._valued = tack.array(np.flatnonzero(self.role < REFINED).astype(np.int64))
+            if len(self._valued):
+                _vorticity(self._valued, self.rows, self.octree.level, self.role_array,
+                           self.number, self.table, self.side, self.lattice, self.f, out)
+        return out
 
     # -- stepping -------------------------------------------------------------
 

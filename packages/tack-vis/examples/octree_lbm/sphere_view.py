@@ -48,7 +48,7 @@ import tack
 from tack.algorithms import gather
 from tack.dataset import octree_contour
 from tack.dataset import octree_lbm as lb
-from tack.dataset.octree_lbm_adapt import _vorticity, adapt
+from tack.dataset.octree_lbm_adapt import adapt
 
 U = 0.1                                    # free-stream speed, lattice units of level 0
 
@@ -213,9 +213,7 @@ def main():
             probe_d = tack.array((probe * s.q + np.arange(s.q)).astype(np.int64))
         state.update(solver=s, plane=plane, values=values, cut=cut_d, probe=probe_d,
                      cells=int(s.computational().sum()),
-                     solid=s.role[cut] == lb.SOLID,
-                     nodes=[nodes for lv in range(s.finest + 1)
-                            for nodes in (s.computed[lv], s.ghosts[lv]) if len(nodes)])
+                     solid=s.role[cut] == lb.SOLID)
 
     def strouhal():
         p = np.array(state["trace"])
@@ -232,10 +230,7 @@ def main():
         s = state["solver"]
         s.fill_ghosts()           # ghosts from their parents, the same on every frame
         with s.octree.device:
-            w = tack.zeros((s.octree.num_nodes,), s.dtype)
-            for nodes in state["nodes"]:
-                _vorticity(nodes, s.rows, s.octree.level, s.role_array, s.number, s.table,
-                           s.side, s.lattice, s.f, w)
+            w = s.vorticity()
             s.octree.fields["w"] = w
             values = gather(w, state["cut"]).numpy() * d / U    # the plane's cells alone
         values[state["solid"]] = 0.0

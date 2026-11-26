@@ -375,13 +375,12 @@ def adapt(solver, refine_above, coarsen_below, finest=None, pinned=None, region=
         dtype = solver.dtype
         leaves_d = tack.array(leaves)
         measure = tack.zeros((n,), dtype)
-        for lv in range(octree.finest + 1):
-            if len(solver.computed[lv]):
-                _vorticity(solver.computed[lv], solver.rows, octree.level, solver.role_array,
-                           solver.number, solver.table, solver.side, solver.lattice, solver.f,
-                           measure)
-                _gradients(solver.computed[lv], solver.rows, octree.level, solver.role_array, lv,
-                           solver.lattice, solver.f, solver.grad)
+        if len(leaves):
+            # Every level's leaves at once: each node's level is its own.
+            _vorticity(leaves_d, solver.rows, octree.level, solver.role_array, solver.number,
+                       solver.table, solver.side, solver.lattice, solver.f, measure)
+            _gradients(leaves_d, solver.rows, octree.level, solver.role_array, -1,
+                       solver.lattice, solver.f, solver.grad)
         pin = np.zeros(n, np.int32)
         if pinned is not None:
             pin[np.asarray(pinned(*centre.T), bool)] = 1

@@ -173,3 +173,36 @@ def test_filling_ghosts_between_steps_changes_nothing_the_solver_computes():
     assert ghosts.any()
     for v, expected in ((rho, 1.0), (ux, 0.05), (uy, -0.02), (uz, 0.03)):
         assert np.abs(v[ghosts] - expected).max() < 1e-13
+
+
+def test_one_launch_over_every_level_is_the_launches_a_level():
+    # The vorticity and the gradients of nodes of every level at once (each
+    # node's level its own) are what a launch a level gives.
+    import tack
+    from tack.dataset.octree_lbm_adapt import _vorticity
+
+    s = _refined(_corner, 2, regularized=True)
+    c, _ = s.centres()
+    s.initialize(*_field(c))
+    s.step(2)
+    s.fill_ghosts()
+    n = s.octree.num_nodes
+    with s.octree.device:
+        each = tack.zeros((n,), s.dtype)
+        for lv in range(s.finest + 1):
+            for nodes in (s.computed[lv], s.ghosts[lv]):
+                if len(nodes):
+                    _vorticity(nodes, s.rows, s.octree.level, s.role_array, s.number, s.table,
+                               s.side, s.lattice, s.f, each)
+    assert np.array_equal(s.vorticity().numpy(), each.numpy())
+    assert np.abs(each.numpy()[s.role < lb.REFINED]).max() > 0
+    leaves = np.flatnonzero(s.computational())
+    with s.octree.device:
+        each, once = (tack.zeros((n * 27 * 3,), s.dtype) for _ in range(2))
+        for lv in range(s.finest + 1):
+            lb._gradients(s.computed[lv], s.rows, s.octree.level, s.role_array, lv, s.lattice,
+                          s.f, each)
+        lb._gradients(tack.array(leaves.astype(np.int64)), s.rows, s.octree.level,
+                      s.role_array, -1, s.lattice, s.f, once)
+    assert np.array_equal(once.numpy(), each.numpy())
+    assert np.abs(once.numpy()).max() > 0
