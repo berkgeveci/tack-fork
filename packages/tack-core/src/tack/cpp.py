@@ -31,6 +31,15 @@ llvmlite's, which reads bitcode of its own version and older.
 f64, else f32, as the math builtins choose theirs. Any other entry is a Tack
 scalar type, to which the argument converts.
 
+``ptr(type)`` takes an array: an array argument of the kernel (also one a
+device class holds) or a ``tack.local_array``, passed as the address of its
+first scalar (a vector array's first component). Its element type must be
+the declared one; ``ptr(T)`` fixes ``T`` for the call. The pointer is
+``const`` unless ``ptr(type, writes=True)``, which counts as a store to that
+array wherever Tack asks what a kernel writes. Offsets and lengths are
+scalars of their own. A function with ``result=None`` returns nothing and is
+called as a statement. Debug mode checks none of what the C++ reads or writes.
+
 The function is called from every worker thread, any number of times, so it
 must be safe to: no state of its own.
 """
@@ -45,7 +54,7 @@ from pathlib import Path
 
 from tack.lang.types import ScalarType, f32, f64
 
-__all__ = ["ExternFunc", "Library", "T"]
+__all__ = ["ExternFunc", "Library", "Pointer", "T", "ptr"]
 
 
 class _TypeVariable:
@@ -64,6 +73,43 @@ T = _TypeVariable()
 
 def _type_variable():
     return T
+
+
+class Pointer:
+    """An array argument: the address of its first scalar, of ``dtype`` (a
+    scalar type or ``T``), which the function stores through if ``writes``."""
+
+    def __init__(self, dtype, writes=False):
+        self.dtype = dtype
+        self.writes = bool(writes)
+
+    def __repr__(self):
+        return f"tack.cpp.ptr({self.dtype!r}, writes={self.writes})"
+
+    def __eq__(self, other):
+        return (isinstance(other, Pointer) and other.dtype is self.dtype
+                and other.writes == self.writes)
+
+    def __hash__(self):
+        return hash((id(self.dtype), self.writes))
+
+    def __deepcopy__(self, memo):
+        return self
+
+    @property
+    def name(self):
+        return ("w" if self.writes else "p") + self.dtype.name
+
+
+def ptr(dtype, writes=False):
+    """The type of an array argument; see the module's notes."""
+    return Pointer(dtype, writes)
+
+
+def _c_type(t):
+    if isinstance(t, Pointer):
+        return ("" if t.writes else "const ") + _C_TYPES[t.dtype.name] + "*"
+    return _C_TYPES[t.name]
 
 
 _C_TYPES = {"i8": "int8_t", "u8": "uint8_t", "i16": "int16_t", "u16": "uint16_t",
@@ -134,9 +180,15 @@ class ExternFunc:
     """A C++ function a kernel calls; made by `Library.function`."""
 
     def __init__(self, library, name, result, args):
-        for t in (result, *args):
-            if t is not T and not (isinstance(t, ScalarType) and t.name in _C_TYPES):
-                raise TypeError(f"{name}: {t!r} is not a scalar type or tack.cpp.T")
+        def scalar(t):
+            return t is T or (isinstance(t, ScalarType) and t.name in _C_TYPES)
+        if result is not None and not scalar(result):
+            raise TypeError(f"{name}: the result {result!r} is not a scalar type, "
+                            "tack.cpp.T or None")
+        for t in args:
+            if not (scalar(t) or (isinstance(t, Pointer) and scalar(t.dtype))):
+                raise TypeError(f"{name}: {t!r} is not a scalar type, tack.cpp.T or "
+                                "a tack.cpp.ptr of one")
         self.library = library
         self.name = name
         self.result = result
@@ -153,16 +205,52 @@ class ExternFunc:
         return ("cpp", self.name, repr(self.result), repr(self.args),
                 self.library.fingerprint())
 
+    @property
+    def writes(self) -> tuple:
+        """The positions of the arguments the function stores through."""
+        return tuple(k for k, t in enumerate(self.args)
+                     if isinstance(t, Pointer) and t.writes)
+
     def bind(self, arg_types):
         """``(result type, argument types)`` of a call given arguments of
-        ``arg_types``."""
+        ``arg_types``: a scalar's type, or for an array a `Pointer` of its
+        element type. A function without a result gives i32 (always 0)."""
         if len(arg_types) != len(self.args):
-            raise TypeError(f"{self.name}() takes {len(self.args)} scalar arguments "
-                            f"({len(arg_types)} given)")
-        floating = f64 if any(given is f64 for given, declared in zip(arg_types, self.args)
-                              if declared is T) else f32
-        args = tuple(floating if declared is T else declared for declared in self.args)
-        return (floating if self.result is T else self.result), args
+            raise TypeError(f"{self.name}() takes {len(self.args)} arguments "
+                            f"({len(arg_types)} given; a vector counts one per component)")
+        pointed = set()
+        for k, (given, declared) in enumerate(zip(arg_types, self.args)):
+            if isinstance(declared, Pointer) != isinstance(given, Pointer):
+                raise TypeError(
+                    f"{self.name}(): argument {k + 1} is "
+                    + ("an array, where a scalar is declared" if isinstance(given, Pointer)
+                       else "a scalar, where an array is declared (tack.cpp.ptr)"))
+            if not isinstance(declared, Pointer):
+                continue
+            if declared.dtype is T:
+                if given.dtype not in (f32, f64):
+                    raise TypeError(f"{self.name}(): argument {k + 1} is an array of "
+                                    f"{given.dtype.name}, where a floating type is declared")
+                pointed.add(given.dtype)
+            elif given.dtype is not declared.dtype:
+                raise TypeError(f"{self.name}(): argument {k + 1} is an array of "
+                                f"{given.dtype.name}, where {declared.dtype.name} is declared")
+        if len(pointed) > 1:
+            raise TypeError(f"{self.name}(): the arrays given for tack.cpp.T are of "
+                            "f32 and f64; one call has one T")
+        if pointed:
+            floating = pointed.pop()    # a pointer cannot convert, so it decides
+        else:
+            floating = f64 if any(given is f64 for given, declared
+                                  in zip(arg_types, self.args) if declared is T) else f32
+
+        def concrete(t):
+            if isinstance(t, Pointer):
+                return Pointer(concrete(t.dtype), t.writes)
+            return floating if t is T else t
+        from tack.lang.types import i32
+        return (i32 if self.result is None else concrete(self.result),
+                tuple(concrete(t) for t in self.args))
 
     def symbol(self, result, args) -> str:
         """The C symbol of the instantiation: by library content, so two
@@ -175,12 +263,15 @@ class ExternFunc:
     def shim(self, result, args) -> str:
         """The ``extern "C"`` function clang compiles: the instantiation."""
         floating = result if self.result is T else next(
-            (a for a, declared in zip(args, self.args) if declared is T), f32)
+            (getattr(a, "dtype", a) for a, declared in zip(args, self.args)
+             if getattr(declared, "dtype", declared) is T), f32)
         target = self.name.replace("{T}", _C_TYPES[floating.name])
-        params = ", ".join(f"{_C_TYPES[t.name]} a{k}" for k, t in enumerate(args))
+        params = ", ".join(f"{_c_type(t)} a{k}" for k, t in enumerate(args))
         names = ", ".join(f"a{k}" for k in range(len(args)))
+        body = (f"{target}({names}); return 0;" if self.result is None
+                else f"return {target}({names});")
         return (f"__attribute__((always_inline)) {_C_TYPES[result.name]} "
-                f"{self.symbol(result, args)}({params}) {{ return {target}({names}); }}")
+                f"{self.symbol(result, args)}({params}) {{ {body} }}")
 
 
 # ---------------------------------------------------------------------------

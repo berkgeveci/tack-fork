@@ -261,6 +261,9 @@ def written_array_params(ir_func):
             copies.append((node.target, node.value.name))
         elif isinstance(node, (ir.IRArrayStore, ir.IRAtomicOp)):
             stores.append(node.array)
+        elif isinstance(node, ir.IRCall) and node.extern is not None:
+            # A C++ function stores through the arrays it declares it does.
+            stores.extend(node.args[k] for k in node.extern.writes if k < len(node.args))
 
     # A name can be bound to different arrays on different paths, so each
     # one maps to every parameter it might stand for.

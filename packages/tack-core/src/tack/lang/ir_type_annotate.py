@@ -48,6 +48,13 @@ _FLOAT_TYPES = (f32, f64)
 _ROUNDS_PER_LOCAL = 4
 
 
+class _ArrayNames(set):
+    """The array parameters' names, with the names of the arrays the kernel
+    allocates (``allocated``), which read as their element type elsewhere."""
+
+    allocated = frozenset()
+
+
 def annotate_types(ir_func: ir.IRFunction):
     """Annotate all IR nodes with resolved types.
 
@@ -57,7 +64,9 @@ def annotate_types(ir_func: ir.IRFunction):
     """
     # Build initial type environment from parameters
     base_env = {}  # var_name → ScalarType
-    array_params = set()  # names of array (pointer) parameters
+    array_params = _ArrayNames()  # names of array (pointer) parameters
+    array_params.allocated = {node.name for node in walk_ir(ir_func.body)
+                              if isinstance(node, (ir.IRSharedAlloc, ir.IRLocalAlloc))}
     for param in ir_func.params:
         base_env[param.name] = param.type_annotation
         if param._is_array:
@@ -211,22 +220,33 @@ def _annotate_expr(node, env, array_params) -> ScalarType | None:
         return node.dtype
 
     if isinstance(node, ir.IRCall):
+        if node.extern is not None:
+            # A C++ function (tack.cpp): its declaration types the call. A scalar
+            # converts to its parameter's type (a weak literal directly); an
+            # array is passed as a pointer to its elements, of their type.
+            from tack.cpp import Pointer
+            given = []
+            for k, arg in enumerate(node.args):
+                if isinstance(arg, ir.IRName) and isinstance(env.get(arg.name), ScalarType) \
+                        and (arg.name in array_params
+                             or arg.name in getattr(array_params, 'allocated', ())):
+                    given.append(Pointer(env[arg.name]))
+                else:
+                    given.append(_annotate_expr(arg, env, array_params))
+            result, declared = node.extern.bind(given)
+            for arg, t in zip(node.args, declared):
+                if not isinstance(t, Pointer):
+                    _adopt(arg, t)
+            node.extern_types = (result, declared)
+            node.dtype = result
+            node._literal = node._weak = False
+            return node.dtype
         # Annotate arguments
         arg_types = []
         for arg in node.args:
             t = _annotate_expr(arg, env, array_params)
             if t is not None:
                 arg_types.append(t)
-        if node.extern is not None:
-            # A C++ function: its declaration types the call, and each argument
-            # converts to its parameter's type (a weak literal directly).
-            result, declared = node.extern.bind(arg_types)
-            for arg, t in zip(node.args, declared):
-                _adopt(arg, t)
-            node.extern_types = (result, declared)
-            node.dtype = result
-            node._literal = node._weak = False
-            return node.dtype
         # Math builtins (sqrt, sin, etc.) preserve float type
         # If any argument is f64, result is f64; otherwise f32
         if any(t is f64 for t in arg_types):
@@ -509,6 +529,11 @@ def _annotate_stmt(node, env, array_params, var_types=None, collected=None):
         _annotate_expr(node.size, env, array_params)
         if isinstance(node.dtype, ScalarType):
             env[node.name] = node.dtype
+        return
+
+    if isinstance(node, ir.IRCall):
+        # A call as a statement: a C++ function called for what it stores.
+        _annotate_expr(node, env, array_params)
         return
 
     if isinstance(node, (ir.IRBreak, ir.IRContinue, ir.IRBarrier)):

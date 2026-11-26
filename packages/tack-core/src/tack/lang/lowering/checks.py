@@ -25,6 +25,9 @@ def _effect_name(node) -> str | None:
         return "barrier()"
     if isinstance(node, ir.IRPrint):
         return "print()"
+    if isinstance(node, ir.IRCall) and node.extern is not None and (
+            node.extern.writes or node.extern.result is None):
+        return f"C++ call that may store ({node.extern.name})"
     return None
 
 

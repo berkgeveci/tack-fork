@@ -1236,14 +1236,27 @@ class LLVMCodeGen:
         args = [self._emit_expr(a) for a in node.args]
         if node.extern is not None:
             result, declared = node.extern_types
-            args = [self._coerce_to(a, _llvm_type(t), target_unsigned=t in UNSIGNED_TYPES)
-                    for a, t in zip(args, declared)]
+
+            def llvm_type(t):
+                # A tack.cpp.Pointer: the address of the array's first scalar.
+                scalar = getattr(t, "dtype", t)
+                return _llvm_type(scalar).as_pointer() if scalar is not t else _llvm_type(t)
+
+            for k, (a, t) in enumerate(zip(args, declared)):
+                if hasattr(t, "writes"):
+                    if not isinstance(a.type, llvm_ir.PointerType):
+                        raise TypeError(f"{node.func_name}(): argument {k + 1} must be "
+                                        "an array")
+                    args[k] = self.builder.bitcast(a, llvm_type(t))
+                else:
+                    args[k] = self._coerce_to(a, _llvm_type(t),
+                                              target_unsigned=t in UNSIGNED_TYPES)
             symbol = node.extern.symbol(result, declared)
             try:
                 fn = self.module.get_global(symbol)
             except KeyError:
                 fn = llvm_ir.Function(self.module, llvm_ir.FunctionType(
-                    _llvm_type(result), [_llvm_type(t) for t in declared]), name=symbol)
+                    _llvm_type(result), [llvm_type(t) for t in declared]), name=symbol)
             value = self.builder.call(fn, args, name="cpp")
             if result in UNSIGNED_TYPES:
                 self._unsigned_vals.add(id(value))

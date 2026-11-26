@@ -13,7 +13,7 @@ import pytest
 
 import tack
 import tack.cpp
-from tack.cpp import T
+from tack.cpp import T, ptr
 
 _HEADER = """
 #pragma once
@@ -166,7 +166,7 @@ def test_wrong_argument_count_and_python_calls_are_refused(lib):
             out[i] = damped(x[i])
 
     x = tack.zeros(4, tack.f32)
-    with pytest.raises(Exception, match="takes 2 scalar arguments"):
+    with pytest.raises(Exception, match="takes 2 arguments"):
         bad(x, x)
     with pytest.raises(TypeError, match="called in a kernel"):
         damped(1.0, 2.0)
@@ -183,6 +183,156 @@ def test_a_compile_error_shows_clangs_message():
 
     with pytest.raises(Exception, match="nope"):
         apply(tack.zeros(4, tack.f32))
+
+
+_MESH = """
+#include <cmath>
+namespace demo {
+// A class template over array data, with methods the functions call.
+template <class V, int N> struct Points {
+  const V* p;
+  V edge(int a, int b) const {
+    V s = 0;
+    for (int c = 0; c < 3; ++c) { V d = p[3 * a + c] - p[3 * b + c]; s += d * d; }
+    return std::sqrt(s);
+  }
+  V perimeter() const {
+    V s = 0;
+    for (int k = 0; k < N; ++k) s += edge(k, (k + 1) % N);
+    return s;
+  }
+};
+template <class V> V perimeter(const V* points, const long long* ids, long long cell) {
+  V local[9];
+  for (int k = 0; k < 3; ++k)
+    for (int c = 0; c < 3; ++c) local[3 * k + c] = points[3 * ids[3 * cell + k] + c];
+  return Points<V, 3>{local}.perimeter();
+}
+template <class V> V perimeter_of(const V* local) { return Points<V, 3>{local}.perimeter(); }
+template <class V>
+void centroid(const V* points, const long long* ids, long long cell, V* out) {
+  for (int c = 0; c < 3; ++c) {
+    V s = 0;
+    for (int k = 0; k < 3; ++k) s += points[3 * ids[3 * cell + k] + c];
+    out[3 * cell + c] = s / 3;
+  }
+}
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def mesh():
+    rng = np.random.default_rng(0)
+    points = rng.random((200, 3))
+    triangles = rng.integers(0, 200, (500, 3))
+
+    def edge(a, b):
+        return np.linalg.norm(points[triangles[:, a]] - points[triangles[:, b]], axis=1)
+    return (tack.cpp.Library(source=_MESH), points, triangles,
+            edge(0, 1) + edge(1, 2) + edge(2, 0))
+
+
+@pytest.mark.parametrize("dtype", [tack.f32, tack.f64])
+def test_arrays_pass_as_pointers_and_fix_the_template_type(mesh, dtype):
+    lib, pts, tri, want = mesh
+    perimeter = lib.function("demo::perimeter", result=T,
+                             args=(ptr(T), ptr(tack.i64), tack.i64))
+
+    @tack.kernel
+    def perimeters(points, ids, out):
+        for i in range(out.shape[0]):
+            out[i] = perimeter(points, ids, i)
+
+    points = tack.array(pts.astype(dtype.numpy_dtype), dtype=tack.vec(3, dtype))
+    out = tack.zeros(len(tri), dtype)
+    perimeters(points, tack.array(tri.ravel().astype(np.int64)), out)
+    np.testing.assert_allclose(out.numpy(), want, rtol=20 * np.finfo(dtype.numpy_dtype).eps)
+
+
+def test_a_local_array_passes_as_a_pointer(mesh):
+    lib, pts, tri, want = mesh
+    perimeter_of = lib.function("demo::perimeter_of", result=T, args=(ptr(T),))
+
+    @tack.kernel
+    def perimeters(points, ids, out):
+        for i in range(out.shape[0]):
+            local = tack.local_array(tack.f64, 9)
+            for k in range(3):
+                p = points[ids[3 * i + k]]
+                for c in range(3):
+                    local[3 * k + c] = p[c]
+            out[i] = perimeter_of(local)
+
+    out = tack.zeros(len(tri), tack.f64)
+    perimeters(tack.array(pts, dtype=tack.vec(3, tack.f64)),
+               tack.array(tri.ravel().astype(np.int64)), out)
+    np.testing.assert_allclose(out.numpy(), want, rtol=1e-14)
+
+
+def test_a_function_without_a_result_stores_through_a_pointer(mesh):
+    lib, pts, tri, _ = mesh
+    centroid = lib.function("demo::centroid", result=None,
+                            args=(ptr(T), ptr(tack.i64), tack.i64, ptr(T, writes=True)))
+
+    @tack.kernel
+    def centroids(points, ids, out):
+        for i in range(ids.shape[0] // 3):
+            centroid(points, ids, i, out)
+
+    points = tack.array(pts, dtype=tack.vec(3, tack.f64))
+    ids = tack.array(tri.ravel().astype(np.int64))
+    out = tack.zeros(len(tri), tack.vec(3, tack.f64))
+    centroids(points, ids, out)
+    np.testing.assert_allclose(out.numpy(), pts[tri].mean(axis=1), rtol=1e-14)
+
+    # Tack counts the pointer as a store: a read-only array is refused there,
+    # and accepted where the function only reads.
+    host = np.zeros(len(tri) * 3)
+    readonly = tack.array_from_ptr(host.ctypes.data, (len(tri) * 3,), tack.f64)
+    with pytest.raises(ValueError, match="parameter 'out'.*read-only"):
+        centroids(points, ids, readonly)
+    frozen = np.ascontiguousarray(pts).ravel()
+    centroids(tack.array_from_ptr(frozen.ctypes.data, (frozen.size,), tack.f64), ids, out)
+
+
+def test_array_arguments_are_checked(mesh):
+    lib, pts, tri, _ = mesh
+    perimeter = lib.function("demo::perimeter", result=T,
+                             args=(ptr(T), ptr(tack.i64), tack.i64))
+
+    @tack.kernel
+    def perimeters(points, ids, out):
+        for i in range(out.shape[0]):
+            out[i] = perimeter(points, ids, i)
+
+    @tack.kernel
+    def scalar_for_array(points, out):
+        for i in range(out.shape[0]):
+            out[i] = perimeter(points, i, i)
+
+    points = tack.array(pts, dtype=tack.vec(3, tack.f64))
+    out = tack.zeros(len(tri), tack.f64)
+    with pytest.raises(Exception, match="argument 2 is an array of i32, where i64"):
+        perimeters(points, tack.array(tri.ravel().astype(np.int32)), out)
+    with pytest.raises(Exception, match="argument 2 is a scalar, where an array"):
+        scalar_for_array(points, out)
+
+
+def test_a_storing_call_outside_the_parallel_loop_is_refused(mesh):
+    lib = mesh[0]
+    centroid = lib.function("demo::centroid", result=None,
+                            args=(ptr(T), ptr(tack.i64), tack.i64, ptr(T, writes=True)))
+
+    @tack.kernel
+    def outside(points, ids, out):
+        centroid(points, ids, 0, out)
+        for i in range(out.shape[0]):
+            out[i] = 0.0
+
+    a = tack.zeros(9, tack.f64)
+    with pytest.raises(Exception, match="C\\+\\+ call that may store"):
+        outside(a, tack.zeros(3, tack.i64), a)
 
 
 _SCRIPT = """

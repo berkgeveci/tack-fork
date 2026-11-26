@@ -60,6 +60,8 @@ def _literal(node, any_condition=False) -> tuple[bool, bool]:
     if isinstance(node, ir.IRBinOp) and node.op in _ARITHMETIC:
         parts = (_literal(node.left, any_condition), _literal(node.right, any_condition))
     elif isinstance(node, ir.IRCall):
+        if node.extern is not None:
+            return False, False     # a C++ function: not to be moved or repeated
         parts = tuple(_literal(arg, any_condition) for arg in node.args)
         if not parts:
             return False, False

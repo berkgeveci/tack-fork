@@ -1,7 +1,9 @@
 ### Added
 
 - `tack.cpp` (a prototype, CPU backend only): a kernel or `@tack.func` calls a
-  C++ function of a `tack.cpp.Library` (headers or source text) on scalars.
+  C++ function of a `tack.cpp.Library` (headers or source text) on scalars and
+  arrays (`tack.cpp.ptr`: an array or a `tack.local_array` as a pointer, `const`
+  unless `writes=True`, which Tack counts as a store).
   The call's types instantiate a template; clang (`TACK_CLANG`, else `clang++`
   on the path, needed only where such a kernel is compiled) writes LLVM bitcode
   that is linked into the kernel before it is optimized, so the library's code
