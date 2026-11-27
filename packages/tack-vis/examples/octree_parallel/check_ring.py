@@ -16,9 +16,9 @@ import time
 
 import numpy as np
 from check_fragments import AMR, ORIGIN, ROOTS, SIDE, piece_runs, rank_boxes, tev_functions
-from check_ranks import local_forest, rank_of_roots
+from check_ranks import rank_of_roots
 from fragments import bsp_order, composite
-from ring import ring, ringed_forest
+from ring import own_forest, ring, ringed_forest
 from vtkmodules.vtkRenderingCore import vtkRenderer
 
 import tack
@@ -64,19 +64,24 @@ def main():
         owner = rank_of_roots(firsts, lasts, n)
         boxes = rank_boxes(firsts, lasts, n)
         blocks = Blocks([device] * n)
+        with device:
+            owner_d = tack.array(owner.astype(np.int32), tack.i32)
+        own = {g: own_forest(octree, owner_d, g, args.field) for g in blocks.local}
+        tack.sync()
         t = time.perf_counter()
-        own = {g: local_forest(octree, np.flatnonzero(owner == g), args.field)
-               for g in blocks.local}
-        owns = {g: np.ones(own[g].num_nodes, bool) for g in blocks.local}
-        leaves, probes = ring(blocks, own, owns, owner, ROOTS, ORIGIN, SIDE, [args.field])
+        leaves, probes = ring(blocks, own, owner, owner_d, ROOTS, ORIGIN, SIDE, args.field)
+        tack.sync()
         t_ring = time.perf_counter() - t
-        fragments, held, equal, ring_count = [None] * len(boxes), 0, True, 0
+        fragments, held, equal, ring_count, t_forest = [None] * len(boxes), 0, True, 0, 0.0
         for g in blocks.local:
-            forest = ringed_forest(octree.roots, own[g], leaves[g], [args.field])
+            t = time.perf_counter()
+            forest, ring_leaves = ringed_forest(own[g], leaves[g], args.field)
+            tack.sync()
+            t_forest += time.perf_counter() - t
             renderer = ov.OctreeRenderer(forest, args.field, AMR, blend=2, macrocells=256,
                                          divide=-1, balanced=1)
             held += forest.num_nodes
-            ring_count += len(leaves[g][0])
+            ring_count += ring_leaves
             mine = owner[forest._tree] == g
             leaf = (np.asarray(forest.marks.numpy()) & Ghosts.REFINEDCELL) == 0
             positions = np.flatnonzero(owner[octree._tree] == g)
@@ -91,8 +96,9 @@ def main():
         picture = composite(fragments, bsp_order([box for _, box in boxes],
                                                  camera.GetPosition()))
         d = np.abs(picture - reference)
-        print(f"{n:3d} ranks: ring {ring_count} leaves from {sum(probes.values())} probes "
-              f"({t_ring:.1f} s); {held / octree.num_nodes:.3f}x the nodes held; own corners "
+        print(f"{n:3d} ranks: ring {ring_count} nodes from {sum(probes.values())} probes "
+              f"(ring {t_ring:.1f} s, forests {t_forest:.1f} s); "
+              f"{held / octree.num_nodes:.3f}x the nodes held; own corners "
               f"bit for bit: {equal}; against the whole: max {d.max():.4f}, over 8/255 "
               f"{int((d.max(axis=2) > 8 / 255).sum())}")
 
