@@ -671,16 +671,18 @@ class OctreeRenderer:
         return np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32)
 
     def render(self, camera, size, table, lo, hi, depth=None, sample_distance=0.5,
-               unit_distance=1.0, min_step=0.0, jitter=0.0, aspect=None, **_):
+               unit_distance=1.0, min_step=0.0, jitter=0.0, aspect=None, region=None, **_):
         """The volume seen by ``camera`` (a ``vtkCamera``) at ``size`` (w, h):
         ``(h, w, 4)`` f32, premultiplied, row 0 at the top; as
         ``tack_composite.TackRenderer.render`` (``aspect``: the viewport's width
-        over its height where ``size`` is a smaller picture of it). ``timings``
-        holds the parts."""
+        over its height where ``size`` is a smaller picture of it). ``region``
+        ``(x0, x1, y0, y1, z0, z1)``: only the part of the volume in that box,
+        the rays clipped to it (a fragment, for compositing pieces in order).
+        ``timings`` holds the parts."""
         import time
 
         out = self._march(camera, size, table, lo, hi, depth, sample_distance, unit_distance,
-                          min_step, jitter, aspect)
+                          min_step, jitter, aspect, region)
         t = time.perf_counter()
         with self.octree.device:
             picture = out.numpy().reshape(size[1], size[0], 4)
@@ -707,7 +709,7 @@ class OctreeRenderer:
         return picture
 
     def _march(self, camera, size, table, lo, hi, depth, sample_distance, unit_distance,
-               min_step, jitter, aspect=None):
+               min_step, jitter, aspect=None, region=None):
         """The march: the volume's premultiplied RGBA, a device array of ``w * h``."""
         import time
 
@@ -728,7 +730,11 @@ class OctreeRenderer:
             dirs = tack.empty((count,), tack.vec3(tack.f32))
             tmins = tack.empty((count,), tack.f32)
             tmaxs = tack.empty((count,), tack.f32)
-            tack_composite._rays(inverse, depths, ends, w, h, *self.bounds, starts, dirs, tmins,
+            box = self.bounds
+            if region is not None:
+                box = tuple(max(a, b) if i % 2 == 0 else min(a, b)
+                            for i, (a, b) in enumerate(zip(self.bounds, region)))
+            tack_composite._rays(inverse, depths, ends, w, h, *box, starts, dirs, tmins,
                                  tmaxs)
             key = (table.tobytes(), lo, hi)
             if self._seen[0] != key:
