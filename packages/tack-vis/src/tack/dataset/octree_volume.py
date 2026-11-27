@@ -223,7 +223,9 @@ class OctreeTents:
                 last = min(last, depth + 2)
         if self.blend == 2 and n >= 0:
             # Trilinear in the leaf's corner values (the tents, once, at its corners).
-            c = n * 8
+            # In 64 bits: n comes from the i32 tables, and n * 8 passes 2^31 past
+            # 268M nodes (the full-resolution yA31 steps have 320M).
+            c = tack.i64(n) * 8
             v00 = self.corners[c] * (1.0 - fx) + self.corners[c + 1] * fx
             v10 = self.corners[c + 2] * (1.0 - fx) + self.corners[c + 3] * fx
             v01 = self.corners[c + 4] * (1.0 - fx) + self.corners[c + 5] * fx
