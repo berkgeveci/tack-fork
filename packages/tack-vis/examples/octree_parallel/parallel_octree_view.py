@@ -23,6 +23,7 @@ still and a moving frame off screen and writes them."""
 
 import argparse
 import os
+import resource
 import sys
 import time
 
@@ -178,6 +179,13 @@ def main():
 
     # Setup, as mpi_render's: metadata, own trees, the ring, the forest, the renderer.
     t0 = time.perf_counter()
+    laps = {}
+
+    def lap(name, start):
+        tack.sync()
+        laps[name] = round(time.perf_counter() - start, 1)
+        return time.perf_counter()
+
     firsts, lasts = piece_runs(args.pieces)
     owner = rank_of_roots(firsts, lasts, n)
     boxes = rank_boxes(firsts, lasts, n)
@@ -187,16 +195,25 @@ def main():
         owner_d = tack.array(owner.astype(np.int32), tack.i32)
     own = own_forest(part, owner_d, g, args.field)
     del part
+    own_nodes = own.num_nodes
+    t = lap("load", t0)
     leaves, _ = ring(blocks, {g: own}, owner, owner_d, ROOTS, ORIGIN, SIDE, args.field)
+    t = lap("ring", t)
     forest, _ = ringed_forest(own, leaves[g], args.field)
+    del own, leaves
+    t = lap("forest", t)
     renderer = ov.OctreeRenderer(forest, args.field, AMR, blend=2, macrocells=256, divide=-1,
                                  balanced=1)
-    tack.sync()
+    t = lap("renderer", t)
     frames = Frames(blocks, renderer, boxes, unit_cell(blocks, renderer))
-    setup = blocks.all_gather({g: (round(time.perf_counter() - t0, 1), own.num_nodes,
-                                   forest.num_nodes, len(frames.mine))})
-    say(f"{n} ranks, Tack on {args.device} (one GPU for every rank); a rank's setup s, own "
-        f"nodes, held, boxes: {setup}")
+    laps["setup"] = round(time.perf_counter() - t0, 1)
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30   # bytes on macOS
+    setup = blocks.all_gather({g: (laps, own_nodes, forest.num_nodes, len(frames.mine), peak)})
+    say(f"{n} ranks, Tack on {args.device} (one GPU for every rank)")
+    for r in range(n):
+        lp, on, fn, bx, pk = setup[r]
+        say(f"  rank {r}: " + ", ".join(f"{k} {v} s" for k, v in lp.items()) +
+            f"; own nodes {on:,}, held {fn / on:.2f}x, boxes {bx}, peak RSS {pk:.1f} GB")
     if g != 0:
         serve(frames)
         return
