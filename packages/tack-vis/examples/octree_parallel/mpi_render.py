@@ -49,6 +49,58 @@ def _over(fragments, first, out):
         out[k] = out[k] + (1.0 - a) * fragments[first + k]
 
 
+def composite(blocks, fragments, boxes, eye, w, h):
+    """Direct send: the picture's rows cut into a band a rank, each band of this
+    rank's ``fragments`` (``{box index: (h, w, 4) premultiplied}``) that shows
+    anything sent to its rank, composited there front to back in the kd-tree's
+    order of every rank's ``boxes`` for ``eye`` (a Tack kernel a fragment), the
+    bands sent to rank 0. The picture there, ``(h, w, 4)``; None elsewhere."""
+    g = blocks.local[0]
+    n = blocks.count
+    device = blocks.device(g)
+    bands = np.linspace(0, h, n + 1).round().astype(int)
+    outgoing = {g: {}}
+    for r in range(n):
+        rows = slice(bands[r], bands[r + 1])
+        parts = [(i, f[rows]) for i, f in fragments.items() if f[rows][..., 3].max() > 0]
+        if parts:
+            with device:
+                outgoing[g][r] = {
+                    "ids": tack.array(np.array([i for i, _ in parts], np.int32), tack.i32),
+                    "rgba": tack.array(np.stack([p for _, p in parts]).reshape(-1, 4)
+                                       .astype(np.float32), tack.vec4(tack.f32))}
+    incoming = blocks.exchange(outgoing)
+    place = {i: k for k, i in enumerate(bsp_order([box for _, box in boxes], eye))}
+    rows = bands[g + 1] - bands[g]
+    got = []
+    for message in incoming[g].values():
+        for k, i in enumerate(message["ids"].numpy()):
+            got.append((place[int(i)], message["rgba"], k))
+    got.sort(key=lambda item: item[0])
+    with device:
+        band = tack.zeros((max(rows * w, 1),), tack.vec4(tack.f32))
+        for _, rgba, k in got:
+            _over(rgba, k * rows * w, band)
+        rank = tack.array(np.array([g], np.int32), tack.i32)
+    gathered = blocks.exchange({g: {0: {"band": band, "rank": rank}}})
+    if g != 0:
+        return None, len(got)
+    picture = np.zeros((h, w, 4), np.float32)
+    for message in gathered[0].values():
+        r = int(message["rank"].numpy()[0])
+        if bands[r + 1] > bands[r]:
+            picture[bands[r]:bands[r + 1]] = \
+                message["band"].numpy()[:(bands[r + 1] - bands[r]) * w].reshape(-1, w, 4)
+    return picture, len(got)
+
+
+def unit_cell(blocks, renderer):
+    """The opacity's unit length, the same on every rank: the finest cell of any
+    rank's forest (a rank's own finest may be coarser, where its region is)."""
+    g = blocks.local[0]
+    return min(blocks.all_gather({g: float(renderer.cell)}))
+
+
 def camera_for(bounds):
     view = vtkRenderer()
     camera = view.GetActiveCamera()
@@ -121,56 +173,25 @@ def main():
                                  balanced=1)
     t = lap("forest and renderer", t)
 
-    # 3. A fragment a box of this rank's.
+    # 3. A fragment a box of this rank's, the opacity's unit every rank's finest cell.
     lo, hi = args.range
     table = renderer.table(*tev_functions(lo, hi), lo, hi)
     _, camera = camera_for(renderer.bounds)
-    options = {"sample_distance": args.step, "unit_distance": 1.0, "aspect": w / h}
+    unit = unit_cell(blocks, renderer)
+    options = {"sample_distance": args.step, "unit_distance": unit / renderer.cell,
+               "aspect": w / h}
     mine = [i for i, (rank, _) in enumerate(boxes) if rank == g]
     fragments = {i: renderer.render(camera, (w, h), table, lo, hi, region=boxes[i][1], **options)
                  for i in mine}
     t = lap("march", t)
 
-    # 4. Direct send: a band of rows a rank; each band of a fragment that shows
-    # anything to its rank, composited there in the kd-tree's order.
-    bands = np.linspace(0, h, n + 1).round().astype(int)
-    outgoing = {g: {}}
-    for r in range(n):
-        rows = slice(bands[r], bands[r + 1])
-        parts = [(i, f[rows]) for i, f in fragments.items() if f[rows][..., 3].max() > 0]
-        if parts:
-            with device:
-                outgoing[g][r] = {
-                    "ids": tack.array(np.array([i for i, _ in parts], np.int32), tack.i32),
-                    "rgba": tack.array(np.stack([p for _, p in parts]).reshape(-1, 4)
-                                       .astype(np.float32), tack.vec4(tack.f32))}
-    incoming = blocks.exchange(outgoing)
-    order = bsp_order([box for _, box in boxes], camera.GetPosition())
-    place = {i: k for k, i in enumerate(order)}
-    rows = bands[g + 1] - bands[g]
-    got = []
-    for message in incoming[g].values():
-        ids = message["ids"].numpy()
-        rgba = message["rgba"]
-        for k, i in enumerate(ids):
-            got.append((place[int(i)], rgba, k))
-    got.sort(key=lambda item: item[0])
-    with device:
-        band = tack.zeros((rows * w,), tack.vec4(tack.f32))
-        for _, rgba, k in got:
-            _over(rgba, k * rows * w, band)
-    t = lap("composite", t)
-    gathered = blocks.exchange({g: {0: {"band": band, "rank": tack.array(np.array([g], np.int32),
-                                                                         tack.i32)}}})
-    t = lap("gather", t)
+    # 4. Direct send, the picture on rank 0.
+    picture, received = composite(blocks, fragments, boxes, camera.GetPosition(), w, h)
+    t = lap("composite and gather", t)
 
     every = blocks.all_gather({g: (times, sum(probes.values()), ring_nodes, own.num_nodes,
-                                   forest.num_nodes, len(mine), len(got))})
+                                   forest.num_nodes, len(mine), received)})
     if g == 0:
-        picture = np.zeros((h, w, 4), np.float32)
-        for message in gathered[0].values():
-            r = int(message["rank"].numpy()[0])
-            picture[bands[r]:bands[r + 1]] = message["band"].numpy().reshape(-1, w, 4)
         print(f"{n} ranks, {args.size}, step {args.step}, Tack on {args.device} (one GPU for "
               f"every rank)")
         names = list(times)
@@ -191,7 +212,7 @@ def main():
             whole = ov.OctreeRenderer(whole_tree, args.field, AMR, blend=2, macrocells=256,
                                       divide=-1, balanced=1)
             reference = whole.render(camera, (w, h), whole.table(*tev_functions(lo, hi), lo, hi),
-                                     lo, hi, **options)
+                                     lo, hi, **{**options, "unit_distance": unit / whole.cell})
             d = np.abs(picture - reference)
             print(f"  against one rank's picture of the whole: max {d.max():.4f}, pixels over "
                   f"8/255 {int((d.max(axis=2) > 8 / 255).sum())} of {w * h}")
